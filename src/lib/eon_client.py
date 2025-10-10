@@ -1,0 +1,330 @@
+"""Eon API client for authentication and API interactions."""
+
+import os
+import json
+import time
+from typing import Dict, Any, Optional, List
+import requests
+
+
+class EonClient:
+    """Client for interacting with the Eon REST API."""
+
+    def __init__(self, account_domain: str, client_id: str, client_secret: str, project_id: str):
+        """
+        Initialize Eon API client.
+
+        Args:
+            account_domain: Eon account domain (e.g., 'mycompany')
+            client_id: Eon API client ID
+            client_secret: Eon API client secret
+            project_id: Eon project ID
+        """
+        self.base_url = f"https://{account_domain}.console.eon.io/api/v1"
+        self.client_id = client_id
+        self.client_secret = client_secret
+        self.project_id = project_id
+        self.access_token: Optional[str] = None
+        self.token_expiry: Optional[float] = None
+
+    def _authenticate(self) -> None:
+        """Authenticate and retrieve access token."""
+        url = f"{self.base_url}/token"
+        payload = {
+            "clientId": self.client_id,
+            "clientSecret": self.client_secret
+        }
+
+        response = requests.post(url, json=payload)
+        response.raise_for_status()
+
+        data = response.json()
+        self.access_token = data["accessToken"]
+        # Set expiry to 11.5 hours to refresh before actual expiration
+        self.token_expiry = time.time() + data.get("expirationSeconds", 43200) - 1800
+
+    def _ensure_authenticated(self) -> None:
+        """Ensure we have a valid access token."""
+        if not self.access_token or not self.token_expiry or time.time() >= self.token_expiry:
+            self._authenticate()
+
+    def _get_headers(self) -> Dict[str, str]:
+        """Get headers with authentication token."""
+        self._ensure_authenticated()
+        return {
+            "Authorization": f"Bearer {self.access_token}",
+            "Content-Type": "application/json"
+        }
+
+    def connect_restore_account(
+        self,
+        name: str,
+        role_arn: str
+    ) -> Dict[str, Any]:
+        """
+        Connect a restore account to Eon.
+
+        Args:
+            name: Display name for the restore account
+            role_arn: ARN of the IAM role for Eon to assume
+
+        Returns:
+            Response containing restore account details
+        """
+        url = f"{self.base_url}/projects/{self.project_id}/restore-accounts"
+        payload = {
+            "name": name,
+            "restoreAccountAttributes": {
+                "cloudProvider": "AWS",
+                "aws": {
+                    "roleArn": role_arn
+                }
+            }
+        }
+
+        response = requests.post(url, json=payload, headers=self._get_headers())
+        response.raise_for_status()
+        return response.json()
+
+    def configure_vpc_connectivity(
+        self,
+        restore_account_id: str,
+        vpc_configs: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """
+        Configure VPC connectivity for a restore account.
+
+        Args:
+            restore_account_id: Eon-assigned restore account ID
+            vpc_configs: List of VPC configurations
+
+        Returns:
+            Response containing updated configuration
+        """
+        url = f"{self.base_url}/projects/{self.project_id}/restore-accounts/{restore_account_id}/connectivity-config"
+        payload = {
+            "aws": {
+                "vpcConfigs": vpc_configs
+            }
+        }
+
+        response = requests.put(url, json=payload, headers=self._get_headers())
+        response.raise_for_status()
+        return response.json()
+
+    def list_resources(
+        self,
+        source_account_id: str,
+        page_token: Optional[str] = None,
+        page_size: int = 100
+    ) -> Dict[str, Any]:
+        """
+        List protected resources from a source account.
+
+        Args:
+            source_account_id: AWS account ID to filter resources
+            page_token: Pagination token for next page
+            page_size: Number of resources per page
+
+        Returns:
+            Response containing resources list and pagination info
+        """
+        url = f"{self.base_url}/projects/{self.project_id}/resources"
+        params = {"pageSize": page_size}
+        if page_token:
+            params["pageToken"] = page_token
+
+        payload = {
+            "filters": {
+                "accountId": {
+                    "in": [source_account_id]
+                },
+                "backupStatus": {
+                    "in": ["PROTECTED"]
+                }
+            },
+            "sorts": [
+                {
+                    "field": "resourceName",
+                    "order": "ASC"
+                }
+            ]
+        }
+
+        response = requests.post(url, json=payload, params=params, headers=self._get_headers())
+        response.raise_for_status()
+        return response.json()
+
+    def list_snapshots(
+        self,
+        resource_id: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        page_size: int = 100
+    ) -> Dict[str, Any]:
+        """
+        List snapshots for a resource.
+
+        Args:
+            resource_id: Eon-assigned resource ID
+            start_date: Filter snapshots from this date (ISO 8601 YYYY-MM-DD)
+            end_date: Filter snapshots to this date (ISO 8601 YYYY-MM-DD)
+            page_size: Number of snapshots per page
+
+        Returns:
+            Response containing snapshots list
+        """
+        url = f"{self.base_url}/projects/{self.project_id}/resources/{resource_id}/snapshots"
+        params = {"pageSize": page_size}
+
+        payload = {
+            "sorts": [
+                {
+                    "field": "pointInTime",
+                    "order": "DESC"
+                }
+            ]
+        }
+
+        if start_date or end_date:
+            payload["filters"] = {"pointInTime": {}}
+            if start_date:
+                payload["filters"]["pointInTime"]["startDate"] = start_date
+            if end_date:
+                payload["filters"]["pointInTime"]["endDate"] = end_date
+
+        response = requests.post(url, json=payload, params=params, headers=self._get_headers())
+        response.raise_for_status()
+        return response.json()
+
+    def restore_ec2_instance(
+        self,
+        resource_id: str,
+        snapshot_id: str,
+        restore_account_id: str,
+        destination_config: Dict[str, Any]
+    ) -> str:
+        """
+        Restore an EC2 instance from a snapshot.
+
+        Args:
+            resource_id: Eon-assigned resource ID
+            snapshot_id: Snapshot ID to restore from
+            restore_account_id: Eon-assigned restore account ID
+            destination_config: EC2 restore configuration
+
+        Returns:
+            Job ID for the restore operation
+        """
+        url = f"{self.base_url}/projects/{self.project_id}/resources/{resource_id}/snapshots/{snapshot_id}/restore-ec2-instance"
+        payload = {
+            "restoreAccountId": restore_account_id,
+            "destination": destination_config
+        }
+
+        response = requests.post(url, json=payload, headers=self._get_headers())
+        response.raise_for_status()
+        return response.json().get("jobId")
+
+    def restore_rds_instance(
+        self,
+        resource_id: str,
+        snapshot_id: str,
+        restore_account_id: str,
+        destination_config: Dict[str, Any]
+    ) -> str:
+        """
+        Restore an RDS instance from a snapshot.
+
+        Args:
+            resource_id: Eon-assigned resource ID
+            snapshot_id: Snapshot ID to restore from
+            restore_account_id: Eon-assigned restore account ID
+            destination_config: RDS restore configuration
+
+        Returns:
+            Job ID for the restore operation
+        """
+        url = f"{self.base_url}/projects/{self.project_id}/resources/{resource_id}/snapshots/{snapshot_id}/restore-rds-instance"
+        payload = {
+            "restoreAccountId": restore_account_id,
+            "destination": destination_config
+        }
+
+        response = requests.post(url, json=payload, headers=self._get_headers())
+        response.raise_for_status()
+        return response.json().get("jobId")
+
+    def restore_s3_bucket(
+        self,
+        resource_id: str,
+        snapshot_id: str,
+        restore_account_id: str,
+        destination_config: Dict[str, Any]
+    ) -> str:
+        """
+        Restore an S3 bucket from a snapshot.
+
+        Args:
+            resource_id: Eon-assigned resource ID
+            snapshot_id: Snapshot ID to restore from
+            restore_account_id: Eon-assigned restore account ID
+            destination_config: S3 restore configuration
+
+        Returns:
+            Job ID for the restore operation
+        """
+        url = f"{self.base_url}/projects/{self.project_id}/resources/{resource_id}/snapshots/{snapshot_id}/restore-bucket"
+        payload = {
+            "restoreAccountId": restore_account_id,
+            "destination": destination_config
+        }
+
+        response = requests.post(url, json=payload, headers=self._get_headers())
+        response.raise_for_status()
+        return response.json().get("jobId")
+
+    def restore_dynamodb_table(
+        self,
+        resource_id: str,
+        snapshot_id: str,
+        restore_account_id: str,
+        destination_config: Dict[str, Any]
+    ) -> str:
+        """
+        Restore a DynamoDB table from a snapshot.
+
+        Args:
+            resource_id: Eon-assigned resource ID
+            snapshot_id: Snapshot ID to restore from
+            restore_account_id: Eon-assigned restore account ID
+            destination_config: DynamoDB restore configuration
+
+        Returns:
+            Job ID for the restore operation
+        """
+        url = f"{self.base_url}/projects/{self.project_id}/resources/{resource_id}/snapshots/{snapshot_id}/restore-dynamo-db-table"
+        payload = {
+            "restoreAccountId": restore_account_id,
+            "destination": destination_config
+        }
+
+        response = requests.post(url, json=payload, headers=self._get_headers())
+        response.raise_for_status()
+        return response.json().get("jobId")
+
+    def get_restore_job(self, job_id: str) -> Dict[str, Any]:
+        """
+        Get the status of a restore job.
+
+        Args:
+            job_id: Job ID to query
+
+        Returns:
+            Job details including status
+        """
+        url = f"{self.base_url}/projects/{self.project_id}/restore-jobs/{job_id}"
+
+        response = requests.get(url, headers=self._get_headers())
+        response.raise_for_status()
+        return response.json()
