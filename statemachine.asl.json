@@ -1,0 +1,271 @@
+{
+  "Comment": "Eon Bulk Recovery Workflow - Orchestrates the recovery of all resources from a source account to a restore account",
+  "StartAt": "Bootstrap Restore Account",
+  "States": {
+    "Bootstrap Restore Account": {
+      "Type": "Task",
+      "Resource": "${BootstrapFunctionArn}",
+      "Comment": "Deploy IAM permissions, create RDS subnet group, and create KMS key in the restore account",
+      "Parameters": {
+        "step": "bootstrap",
+        "restoreAccountId.$": "$.restoreAccountId",
+        "restoreRegion.$": "$.restoreRegion",
+        "vpcId.$": "$.vpcId",
+        "subnetIds.$": "$.subnetIds",
+        "crossAccountRoleArn.$": "$.crossAccountRoleArn"
+      },
+      "ResultPath": "$.bootstrapResult",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed", "States.Timeout"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "Bootstrap Failed"
+        }
+      ],
+      "Next": "Connect Restore Account"
+    },
+    "Bootstrap Failed": {
+      "Type": "Fail",
+      "Error": "BootstrapFailed",
+      "Cause": "Failed to bootstrap the restore account with required IAM permissions and resources"
+    },
+    "Connect Restore Account": {
+      "Type": "Task",
+      "Resource": "${ConnectAccountFunctionArn}",
+      "Comment": "Connect the restore account to Eon via the REST API",
+      "Parameters": {
+        "step": "connect_account",
+        "roleArn.$": "$.bootstrapResult.roleArn",
+        "restoreAccountName.$": "$.restoreAccountName",
+        "restoreAccountId.$": "$.restoreAccountId"
+      },
+      "ResultPath": "$.connectResult",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed", "States.Timeout"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "Connect Account Failed"
+        }
+      ],
+      "Next": "Configure VPC"
+    },
+    "Connect Account Failed": {
+      "Type": "Fail",
+      "Error": "ConnectAccountFailed",
+      "Cause": "Failed to connect the restore account to Eon"
+    },
+    "Configure VPC": {
+      "Type": "Task",
+      "Resource": "${ConfigureVpcFunctionArn}",
+      "Comment": "Configure VPC connectivity settings for the restore account in Eon",
+      "Parameters": {
+        "step": "configure_vpc",
+        "eonRestoreAccountId.$": "$.connectResult.eonRestoreAccountId",
+        "vpcConfigs.$": "$.vpcConfigs"
+      },
+      "ResultPath": "$.vpcConfigResult",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed", "States.Timeout"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "Configure VPC Failed"
+        }
+      ],
+      "Next": "List Resources"
+    },
+    "Configure VPC Failed": {
+      "Type": "Fail",
+      "Error": "ConfigureVpcFailed",
+      "Cause": "Failed to configure VPC connectivity for the restore account"
+    },
+    "List Resources": {
+      "Type": "Task",
+      "Resource": "${ListResourcesFunctionArn}",
+      "Comment": "List all protected resources from the source account",
+      "Parameters": {
+        "step": "list_resources",
+        "sourceAccountId.$": "$.sourceAccountId"
+      },
+      "ResultPath": "$.resourcesResult",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed", "States.Timeout"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "List Resources Failed"
+        }
+      ],
+      "Next": "Get Snapshots"
+    },
+    "List Resources Failed": {
+      "Type": "Fail",
+      "Error": "ListResourcesFailed",
+      "Cause": "Failed to list protected resources from the source account"
+    },
+    "Get Snapshots": {
+      "Type": "Task",
+      "Resource": "${GetSnapshotsFunctionArn}",
+      "Comment": "Retrieve snapshot IDs for all resources to restore",
+      "Parameters": {
+        "step": "get_snapshots",
+        "resources.$": "$.resourcesResult.resources",
+        "snapshotDate.$": "$.snapshotDate"
+      },
+      "ResultPath": "$.snapshotsResult",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed", "States.Timeout"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "Get Snapshots Failed"
+        }
+      ],
+      "Next": "Initiate Restores"
+    },
+    "Get Snapshots Failed": {
+      "Type": "Fail",
+      "Error": "GetSnapshotsFailed",
+      "Cause": "Failed to retrieve snapshots for resources"
+    },
+    "Initiate Restores": {
+      "Type": "Task",
+      "Resource": "${InitiateRestoresFunctionArn}",
+      "Comment": "Initiate restore jobs for all snapshots",
+      "Parameters": {
+        "step": "initiate_restores",
+        "resourceSnapshots.$": "$.snapshotsResult.resourceSnapshots",
+        "eonRestoreAccountId.$": "$.connectResult.eonRestoreAccountId",
+        "restoreAccountId.$": "$.restoreAccountId",
+        "restoreRegion.$": "$.restoreRegion",
+        "kmsKeyArn.$": "$.bootstrapResult.kmsKeyArn",
+        "rdsSubnetGroupName.$": "$.bootstrapResult.rdsSubnetGroupName",
+        "vpcConfigs.$": "$.vpcConfigs",
+        "crossAccountRoleArn.$": "$.crossAccountRoleArn"
+      },
+      "ResultPath": "$.restoreJobsResult",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed", "States.Timeout"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "Initiate Restores Failed"
+        }
+      ],
+      "Next": "Initialize Monitoring"
+    },
+    "Initiate Restores Failed": {
+      "Type": "Fail",
+      "Error": "InitiateRestoresFailed",
+      "Cause": "Failed to initiate restore jobs"
+    },
+    "Initialize Monitoring": {
+      "Type": "Pass",
+      "Comment": "Initialize the iteration counter for job monitoring",
+      "Parameters": {
+        "restoreJobs.$": "$.restoreJobsResult.restoreJobs",
+        "iteration": 0
+      },
+      "ResultPath": "$.monitoringState",
+      "Next": "Monitor Jobs"
+    },
+    "Monitor Jobs": {
+      "Type": "Task",
+      "Resource": "${MonitorJobsFunctionArn}",
+      "Comment": "Check the status of all restore jobs",
+      "Parameters": {
+        "step": "monitor_jobs",
+        "restoreJobs.$": "$.monitoringState.restoreJobs",
+        "iteration.$": "$.monitoringState.iteration"
+      },
+      "ResultPath": "$.monitoringState",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed", "States.Timeout"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "Monitor Jobs Failed"
+        }
+      ],
+      "Next": "Check If Complete"
+    },
+    "Monitor Jobs Failed": {
+      "Type": "Fail",
+      "Error": "MonitorJobsFailed",
+      "Cause": "Failed to monitor restore job status"
+    },
+    "Check If Complete": {
+      "Type": "Choice",
+      "Comment": "Determine if all jobs are complete or if we should continue monitoring",
+      "Choices": [
+        {
+          "Variable": "$.monitoringState.allComplete",
+          "BooleanEquals": true,
+          "Next": "All Jobs Complete"
+        }
+      ],
+      "Default": "Wait For Jobs"
+    },
+    "Wait For Jobs": {
+      "Type": "Wait",
+      "Comment": "Wait 5 minutes before checking job status again",
+      "Seconds": 300,
+      "Next": "Monitor Jobs"
+    },
+    "All Jobs Complete": {
+      "Type": "Succeed",
+      "Comment": "All restore jobs have completed (successfully or with failures)"
+    }
+  }
+}

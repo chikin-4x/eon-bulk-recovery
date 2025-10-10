@@ -1,0 +1,438 @@
+# Eon Bulk Recovery Application
+
+Automated AWS application for performing bulk recovery of cloud resources from Eon backups. This application orchestrates the complete recovery workflow from bootstrapping a restore account to monitoring restore job completion.
+
+## Overview
+
+This application uses AWS Step Functions to orchestrate a multi-step workflow that:
+
+1. **Bootstraps the restore account** - Deploys IAM permissions, creates RDS subnet groups, and creates KMS encryption keys
+2. **Connects the restore account to Eon** - Registers the restore account with Eon via REST API
+3. **Configures VPC connectivity** - Sets up networking for the Eon restore process
+4. **Lists protected resources** - Retrieves all backed-up resources from the source account
+5. **Retrieves snapshots** - Gets snapshot IDs for all resources to restore
+6. **Initiates restore jobs** - Starts restore operations for all snapshots
+7. **Monitors jobs** - Polls job status until all restores complete
+8. **Sends notifications** - Publishes completion status to SNS
+
+## Supported Resource Types
+
+- **AWS EC2** - EC2 instances with EBS volumes
+- **AWS RDS** - RDS database instances
+- **AWS S3** - S3 buckets with objects
+- **AWS DynamoDB** - DynamoDB tables
+
+## Prerequisites
+
+### 1. Eon Account Setup
+
+- Active Eon account with API access
+- API credentials (Client ID and Secret) with appropriate permissions
+- Project ID from your Eon account
+- Eon Account ID for IAM role external ID
+
+### 2. AWS Account Setup
+
+#### Management Account (where this app runs)
+- AWS CLI configured
+- AWS SAM CLI installed (`pip install aws-sam-cli`)
+- Appropriate IAM permissions to deploy CloudFormation stacks
+
+#### Restore Account (where resources will be restored)
+- AWS account where restored resources will be created
+- Must have a cross-account IAM role (see below)
+
+### 3. Cross-Account Role Setup
+
+Create an IAM role in the **restore account** that allows the bulk recovery application to deploy infrastructure and initiate restores.
+
+**Step 1: Create the IAM role**
+
+In the restore account's IAM console, create a new role with the following trust policy (replace `<MANAGEMENT_ACCOUNT_ID>` with your management account ID and `<STACK_NAME>` with your CloudFormation stack name):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::<MANAGEMENT_ACCOUNT_ID>:role/<STACK_NAME>-lambda-role"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+```
+
+**Step 2: Attach permissions policy**
+
+Attach the following IAM policy to the role (copy-paste ready):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CloudFormationPermissions",
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:CreateStack",
+        "cloudformation:DeleteStack",
+        "cloudformation:DescribeStacks",
+        "cloudformation:DescribeStackEvents",
+        "cloudformation:DescribeStackResources",
+        "cloudformation:GetTemplate",
+        "cloudformation:UpdateStack",
+        "cloudformation:ListStacks"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "IAMPermissions",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:GetRole",
+        "iam:PassRole",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:PutRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:CreateInstanceProfile",
+        "iam:DeleteInstanceProfile",
+        "iam:AddRoleToInstanceProfile",
+        "iam:RemoveRoleFromInstanceProfile",
+        "iam:TagRole"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "RDSPermissions",
+      "Effect": "Allow",
+      "Action": [
+        "rds:CreateDBSubnetGroup",
+        "rds:DeleteDBSubnetGroup",
+        "rds:DescribeDBSubnetGroups",
+        "rds:AddTagsToResource"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "KMSPermissions",
+      "Effect": "Allow",
+      "Action": [
+        "kms:CreateKey",
+        "kms:CreateAlias",
+        "kms:DeleteAlias",
+        "kms:DescribeKey",
+        "kms:GetKeyPolicy",
+        "kms:PutKeyPolicy",
+        "kms:TagResource",
+        "kms:ScheduleKeyDeletion"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "S3Permissions",
+      "Effect": "Allow",
+      "Action": [
+        "s3:CreateBucket",
+        "s3:DeleteBucket",
+        "s3:PutBucketEncryption",
+        "s3:PutBucketTagging",
+        "s3:PutBucketVersioning",
+        "s3:PutBucketPublicAccessBlock",
+        "s3:GetBucketLocation"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "EC2Permissions",
+      "Effect": "Allow",
+      "Action": [
+        "ec2:DescribeInstances",
+        "ec2:DescribeImages",
+        "ec2:DescribeVolumes",
+        "ec2:DescribeSnapshots",
+        "ec2:DescribeVpcs",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeAvailabilityZones"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+**Note:** This policy provides the minimum permissions needed for the bulk recovery workflow to function. For production environments, consider further restricting resource-level permissions based on your specific requirements.
+
+## Deployment
+
+### 1. Clone and prepare the repository
+
+```bash
+cd eon-bulk-recovery
+```
+
+### 2. Build and deploy using AWS SAM
+
+```bash
+sam build
+sam deploy --guided
+```
+
+### 3. Provide deployment parameters
+
+You will be prompted for:
+- **Stack Name**: Name for the CloudFormation stack (e.g., `eon-bulk-recovery`)
+- **EonAccountDomain**: Your Eon account domain (e.g., `mycompany` for mycompany.console.eon.io)
+- **EonProjectId**: Your Eon project ID (UUID format)
+- **EonAccountId**: Eon account ID for IAM external ID
+- **EonClientId**: Eon API client ID
+- **EonClientSecret**: Eon API client secret
+- **NotificationEmail**: (Optional) Email for SNS notifications
+
+### 4. Confirm the email subscription
+
+If you provided a notification email, check your inbox and confirm the SNS subscription.
+
+## Usage
+
+### Starting a Bulk Recovery
+
+Execute the Step Functions state machine with the following input:
+
+```json
+{
+  "sourceAccountId": "123456789012",
+  "restoreAccountId": "987654321098",
+  "restoreAccountName": "production-restore",
+  "restoreRegion": "us-east-1",
+  "snapshotDate": "2024-01-15",
+  "vpcId": "vpc-0123456789abcdef0",
+  "subnetIds": [
+    "subnet-0123456789abcdef0",
+    "subnet-0123456789abcdef1",
+    "subnet-0123456789abcdef2"
+  ],
+  "vpcConfigs": [
+    {
+      "region": "us-east-1",
+      "vpc": "vpc-0123456789abcdef0",
+      "subnetsPerAvailabilityZone": [
+        {
+          "availabilityZone": "us-east-1a",
+          "subnetId": "subnet-0123456789abcdef0"
+        },
+        {
+          "availabilityZone": "us-east-1b",
+          "subnetId": "subnet-0123456789abcdef1"
+        },
+        {
+          "availabilityZone": "us-east-1c",
+          "subnetId": "subnet-0123456789abcdef2"
+        }
+      ],
+      "securityGroups": {
+        "restoreServer": ["sg-0123456789abcdef0"],
+        "restoredRdsInstance": ["sg-0123456789abcdef1"]
+      }
+    }
+  ],
+  "crossAccountRoleArn": "arn:aws:iam::987654321098:role/EonBulkRecoveryCrossAccountRole"
+}
+```
+
+### Parameter Descriptions
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `sourceAccountId` | Yes | AWS account ID containing the backed-up resources |
+| `restoreAccountId` | Yes | AWS account ID where resources will be restored |
+| `restoreAccountName` | Yes | Display name for the restore account in Eon |
+| `restoreRegion` | Yes | Primary AWS region for restores (default: us-east-1) |
+| `snapshotDate` | No | Specific date for snapshot selection (YYYY-MM-DD). If omitted, uses latest snapshots |
+| `vpcId` | Yes* | VPC ID for RDS subnet group (*required if restoring RDS instances) |
+| `subnetIds` | Yes* | List of subnet IDs for RDS subnet group |
+| `vpcConfigs` | Yes | VPC connectivity configuration for Eon restore servers |
+| `crossAccountRoleArn` | Yes | ARN of the cross-account role in the restore account |
+
+### Via AWS Console
+
+1. Navigate to **Step Functions** in the AWS Console
+2. Select the `eon-bulk-recovery-workflow` state machine
+3. Click **Start Execution**
+4. Paste the JSON input
+5. Click **Start Execution**
+
+### Via AWS CLI
+
+```bash
+aws stepfunctions start-execution \
+  --state-machine-arn arn:aws:states:us-east-1:123456789012:stateMachine:eon-bulk-recovery-workflow \
+  --input file://execution-input.json
+```
+
+## Monitoring
+
+### Step Functions Console
+
+Monitor the execution progress in the AWS Step Functions console:
+- View the visual workflow
+- See current step and status
+- Review execution history and logs
+
+### CloudWatch Logs
+
+Lambda function logs are available in CloudWatch Logs:
+- Log group: `/aws/lambda/eon-bulk-recovery-handler`
+- Filter by execution ID or resource name
+
+### SNS Notifications
+
+Receive email notifications when the bulk recovery completes with:
+- Summary statistics (total, completed, failed)
+- Individual job statuses
+- Job IDs for tracking in Eon
+
+## Architecture Details
+
+### Lambda Handlers
+
+The application uses a single Lambda function with multiple handlers:
+
+- **bootstrap.py** - Bootstrap restore account infrastructure
+- **connect_account.py** - Connect restore account to Eon
+- **configure_vpc.py** - Configure VPC connectivity
+- **list_resources.py** - List protected resources
+- **get_snapshots.py** - Retrieve snapshot IDs
+- **initiate_restores.py** - Start restore jobs
+- **monitor_jobs.py** - Monitor job status and send notifications
+
+### Error Handling
+
+The Step Functions workflow includes:
+- **Automatic retries** - Each step retries up to 3 times with exponential backoff
+- **Error catching** - Failures are caught and reported clearly
+- **Timeout protection** - Maximum monitoring iterations prevent infinite loops
+
+### Job Monitoring
+
+- Jobs are polled every **5 minutes**
+- Maximum monitoring time: **30 hours** (360 iterations)
+- SNS notification sent when all jobs complete or timeout occurs
+
+## Customization
+
+### Instance Types
+
+EC2 and RDS restore operations automatically mirror the source resource's instance type. If the source instance type cannot be determined, the following defaults are used:
+
+```python
+# EC2 default fallback
+"instanceType": "t3.medium"
+
+# RDS default fallback
+"dbInstanceClass": "db.t3.micro"
+```
+
+You can modify these defaults in `src/handlers/initiate_restores.py` if needed.
+
+### DynamoDB Write Capacity
+
+Default write capacity for DynamoDB table restores is set to 40000 units. You can modify this in `src/handlers/initiate_restores.py`:
+
+```python
+"writeCapacityUnits": 40000
+```
+
+### Monitoring Timeout
+
+Adjust the maximum monitoring duration via environment variable in `template.yaml`:
+
+```yaml
+Environment:
+  Variables:
+    MAX_MONITORING_ITERATIONS: '360'  # 360 * 5min = 30 hours
+```
+
+## Troubleshooting
+
+### Common Issues
+
+#### 1. Bootstrap Fails - IAM Permission Denied
+
+**Cause**: Cross-account role doesn't have sufficient permissions
+
+**Solution**: Verify the cross-account role has CloudFormation, IAM, RDS, and KMS permissions
+
+#### 2. Connect Account Fails - 404 Not Found
+
+**Cause**: Invalid Eon project ID or authentication failure
+
+**Solution**: Verify `EonProjectId` and Eon API credentials in Secrets Manager
+
+#### 3. VPC Configuration Fails
+
+**Cause**: Invalid VPC, subnet, or security group IDs
+
+**Solution**: Verify all VPC configuration parameters are valid in the restore account
+
+#### 4. EC2 Restore Fails - Volume Parameters
+
+**Cause**: EC2 restores require detailed volume configuration
+
+**Solution**: The current implementation uses default volume parameters. For production use, extract actual volume metadata from snapshots
+
+#### 5. S3 Bucket Already Exists
+
+**Cause**: S3 bucket names must be globally unique
+
+**Solution**: The application generates unique bucket names using MD5 hashing, but conflicts can still occur. Modify the naming logic in `initiate_restores.py` if needed
+
+## Security Considerations
+
+1. **Secrets Management**: Eon API credentials are stored in AWS Secrets Manager
+2. **Encryption**: All restored resources use KMS encryption
+3. **IAM Least Privilege**: Lambda execution role has only necessary permissions
+4. **Cross-Account Access**: Uses STS AssumeRole for secure cross-account operations
+5. **Network Isolation**: Restore servers use configured security groups and VPCs
+
+## Cost Considerations
+
+- **Step Functions**: Standard workflow charges (~$0.025 per 1,000 state transitions)
+- **Lambda**: Execution time and memory costs (15 minutes max per invocation)
+- **Eon API**: API call costs (check your Eon pricing)
+- **Restored Resources**: Ongoing costs for EC2, RDS, S3, DynamoDB, etc.
+- **Data Transfer**: Cross-region or cross-AZ data transfer charges may apply
+
+## Limitations
+
+1. **EC2 Volume Metadata**: Current implementation uses default volume parameters. Production deployments should extract volume metadata from snapshot details for accurate volume configurations
+2. **Resource Naming**: Restored resources are prefixed with "restored-". Customize in handler code as needed
+3. **Regional Limitations**: All restores currently target a single region specified in input
+4. **Timeout**: State machine has AWS Step Functions maximum execution time of 1 year, but Lambda functions timeout after 15 minutes each
+5. **Instance Type Detection**: EC2 and RDS instance types are mirrored from source resources when available. If resourceProperties data is not available from the Eon API, fallback defaults are used
+
+## Contributing
+
+To extend or modify the application:
+
+1. **Add Resource Types**: Create new restore methods in `eon_client.py` and add logic to `initiate_restores.py`
+2. **Custom Naming**: Modify resource naming logic in `initiate_restores.py`
+3. **Enhanced Monitoring**: Add custom CloudWatch metrics in handler functions
+4. **Workflow Changes**: Update `statemachine.asl.json` for workflow modifications
+
+## License
+
+This project is provided as-is for use with Eon backup services.
+
+## Support
+
+For issues related to:
+- **Eon API**: Contact Eon support
+- **AWS Infrastructure**: Review AWS documentation or contact AWS support
+- **Application Code**: Review CloudWatch logs and Step Functions execution history

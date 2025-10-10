@@ -1,0 +1,211 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Eon Bulk Recovery Application - Orchestrates bulk recovery of AWS resources from Eon backups
+
+Parameters:
+  EonAccountDomain:
+    Type: String
+    Description: Eon account domain (e.g., 'mycompany' for mycompany.console.eon.io)
+
+  EonProjectId:
+    Type: String
+    Description: Eon project ID (UUID format)
+
+  EonAccountId:
+    Type: String
+    Description: Eon account ID for IAM role external ID
+
+  EonClientId:
+    Type: String
+    Description: Eon API client ID
+    NoEcho: true
+
+  EonClientSecret:
+    Type: String
+    Description: Eon API client secret
+    NoEcho: true
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for SNS notifications (optional)
+    Default: ''
+
+Conditions:
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+
+Resources:
+  # Secrets Manager secret for Eon API credentials
+  EonCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-eon-credentials'
+      Description: Eon API credentials for bulk recovery
+      SecretString: !Sub |
+        {
+          "clientId": "${EonClientId}",
+          "clientSecret": "${EonClientSecret}"
+        }
+      Tags:
+        - Key: Application
+          Value: EonBulkRecovery
+
+  # SNS Topic for notifications
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-notifications'
+      DisplayName: Eon Bulk Recovery Notifications
+      Tags:
+        - Key: Application
+          Value: EonBulkRecovery
+
+  NotificationEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      Protocol: email
+      TopicArn: !Ref NotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # IAM Role for Lambda functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EonBulkRecoveryPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Secrets Manager permissions
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref EonCredentialsSecret
+              # SNS permissions
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationTopic
+              # STS permissions for cross-account access
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                  - sts:GetCallerIdentity
+                Resource: '*'
+              # CloudFormation permissions (for bootstrap)
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                Resource: '*'
+              # RDS permissions (for creating subnet groups)
+              - Effect: Allow
+                Action:
+                  - rds:CreateDBSubnetGroup
+                  - rds:DescribeDBSubnetGroups
+                Resource: '*'
+              # KMS permissions (for creating encryption keys)
+              - Effect: Allow
+                Action:
+                  - kms:CreateKey
+                  - kms:CreateAlias
+                  - kms:DescribeKey
+                  - kms:TagResource
+                Resource: '*'
+              # S3 permissions (for creating restore buckets)
+              - Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:PutBucketEncryption
+                  - s3:PutBucketTagging
+                  - s3:PutBucketVersioning
+                Resource: '*'
+
+  # Lambda function with all handlers
+  BulkRecoveryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-handler'
+      CodeUri: ./src
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 900
+      MemorySize: 512
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          EON_ACCOUNT_DOMAIN: !Ref EonAccountDomain
+          EON_PROJECT_ID: !Ref EonProjectId
+          EON_ACCOUNT_ID: !Ref EonAccountId
+          EON_CREDENTIALS_SECRET_ARN: !Ref EonCredentialsSecret
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+          MAX_MONITORING_ITERATIONS: '360'
+
+  # IAM Role for Step Functions
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-stepfunctions-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt BulkRecoveryFunction.Arn
+
+  # Step Functions State Machine
+  BulkRecoveryStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub '${AWS::StackName}-workflow'
+      Type: STANDARD
+      Role: !GetAtt StepFunctionsExecutionRole.Arn
+      DefinitionUri: ./statemachine.asl.json
+      DefinitionSubstitutions:
+        BootstrapFunctionArn: !GetAtt BulkRecoveryFunction.Arn
+        ConnectAccountFunctionArn: !GetAtt BulkRecoveryFunction.Arn
+        ConfigureVpcFunctionArn: !GetAtt BulkRecoveryFunction.Arn
+        ListResourcesFunctionArn: !GetAtt BulkRecoveryFunction.Arn
+        GetSnapshotsFunctionArn: !GetAtt BulkRecoveryFunction.Arn
+        InitiateRestoresFunctionArn: !GetAtt BulkRecoveryFunction.Arn
+        MonitorJobsFunctionArn: !GetAtt BulkRecoveryFunction.Arn
+
+Outputs:
+  StateMachineArn:
+    Description: ARN of the Step Functions state machine
+    Value: !Ref BulkRecoveryStateMachine
+    Export:
+      Name: !Sub '${AWS::StackName}-StateMachine'
+
+  NotificationTopicArn:
+    Description: ARN of the SNS notification topic
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopic'
+
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt BulkRecoveryFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaFunction'
