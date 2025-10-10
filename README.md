@@ -42,9 +42,73 @@ This application uses AWS Step Functions to orchestrate a multi-step workflow th
 - AWS account where restored resources will be created
 - Must have a cross-account IAM role (see below)
 
-### 3. Cross-Account Role Setup
+### 3. Cross-Account Access
 
-Create an IAM role in the **restore account** that allows the bulk recovery application to deploy infrastructure and initiate restores.
+The application needs to deploy resources in the restore account. There are **three ways** to grant this access:
+
+#### Option A: AWS Organizations - Management Account Deployment (Recommended - Zero Setup)
+
+If you're using **AWS Organizations** and deploy this application in the **Organization Management Account**:
+
+**No setup required!** The application automatically uses the `OrganizationAccountAccessRole` that AWS creates by default in all member accounts.
+
+Just provide the restore account ID when executing the workflow - no manual IAM role creation needed.
+
+#### Option B: AWS Organizations - Non-Management Account Deployment (Role Chaining)
+
+If you're using **AWS Organizations** but want to deploy this application in a **different account** (not the management account), you can use role chaining:
+
+**Step 1: Deploy the role in the Organization Management Account**
+
+In the **AWS Organizations Management Account**, deploy the provided role template:
+
+```bash
+cd eon-bulk-recovery
+aws cloudformation deploy \
+  --template-file management-account-role.yaml \
+  --stack-name eon-bulk-recovery-chain-role \
+  --parameter-overrides \
+      BackupAccountId=<BACKUP_ACCOUNT_ID> \
+      StackName=<YOUR_STACK_NAME> \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --region us-east-1
+```
+
+Replace:
+- `<BACKUP_ACCOUNT_ID>`: The AWS account ID where you're deploying the Eon Bulk Recovery application
+- `<YOUR_STACK_NAME>`: The name you'll use for your main Eon Bulk Recovery stack (default: `eon-bulk-recovery`)
+
+This creates an `EonBulkRecoveryChainRole` that:
+- Trusts the Lambda execution role from your backup account
+- Can assume `OrganizationAccountAccessRole` in any organization member account
+
+**Step 2: Deploy the main application with ManagementAccountId**
+
+When deploying the main application (in your backup account), provide the `ManagementAccountId` parameter:
+
+```bash
+sam deploy --guided
+# When prompted for ManagementAccountId, enter your AWS Organizations management account ID
+```
+
+Or update the parameter in your `samconfig.toml`:
+
+```toml
+[default.deploy.parameters]
+parameter_overrides = "ManagementAccountId=111111111111 ..."
+```
+
+**How it works:**
+
+The application uses a two-step role chaining process:
+1. Lambda (in backup account) → Assumes `EonBulkRecoveryChainRole` (in management account)
+2. Chain role → Assumes `OrganizationAccountAccessRole` (in restore account)
+
+This allows you to centralize the Eon Bulk Recovery application in a dedicated backup/recovery account while maintaining secure access to all organization member accounts.
+
+#### Option C: Manual Cross-Account Role (For Non-Organization Scenarios)
+
+If the restore account is **not** in your AWS Organization, or you want to use **least-privilege permissions**, create a manual cross-account role:
 
 **Step 1: Create the IAM role**
 
@@ -193,6 +257,7 @@ You will be prompted for:
 - **EonAccountId**: Eon account ID for IAM external ID
 - **EonClientId**: Eon API client ID
 - **EonClientSecret**: Eon API client secret
+- **ManagementAccountId**: (Optional) AWS Organizations management account ID - only required if deploying outside the management account (see Option B in Cross-Account Access)
 - **NotificationEmail**: (Optional) Email for SNS notifications
 
 ### 4. Confirm the email subscription
@@ -203,12 +268,16 @@ If you provided a notification email, check your inbox and confirm the SNS subsc
 
 ### Starting a Bulk Recovery
 
-Execute the Step Functions state machine with the following input:
+Execute the Step Functions state machine with the following input.
+
+**Note:** The `ManagementAccountId` is configured at deployment time as a CloudFormation parameter (not in the execution input). It's only needed if you're using Option B (role chaining) - see the Cross-Account Access section above.
+
+**For AWS Organizations (automatic cross-account access):**
 
 ```json
 {
-  "sourceAccountId": "123456789012",
-  "restoreAccountId": "987654321098",
+  "sourceAccountId": "333333333333",
+  "restoreAccountId": "222222222222",
   "restoreAccountName": "production-restore",
   "restoreRegion": "us-east-1",
   "snapshotDate": "2024-01-15",
@@ -241,8 +310,23 @@ Execute the Step Functions state machine with the following input:
         "restoredRdsInstance": ["sg-0123456789abcdef1"]
       }
     }
-  ],
-  "crossAccountRoleArn": "arn:aws:iam::987654321098:role/EonBulkRecoveryCrossAccountRole"
+  ]
+}
+```
+
+**For manual cross-account role (add the crossAccountRoleArn parameter):**
+
+```json
+{
+  "sourceAccountId": "333333333333",
+  "restoreAccountId": "222222222222",
+  "restoreAccountName": "production-restore",
+  "restoreRegion": "us-east-1",
+  "snapshotDate": "2024-01-15",
+  "vpcId": "vpc-0123456789abcdef0",
+  "subnetIds": ["subnet-xxx", "subnet-yyy", "subnet-zzz"],
+  "vpcConfigs": [...],
+  "crossAccountRoleArn": "arn:aws:iam::222222222222:role/EonBulkRecoveryCrossAccountRole"
 }
 ```
 
@@ -258,7 +342,7 @@ Execute the Step Functions state machine with the following input:
 | `vpcId` | Yes* | VPC ID for RDS subnet group (*required if restoring RDS instances) |
 | `subnetIds` | Yes* | List of subnet IDs for RDS subnet group |
 | `vpcConfigs` | Yes | VPC connectivity configuration for Eon restore servers |
-| `crossAccountRoleArn` | Yes | ARN of the cross-account role in the restore account |
+| `crossAccountRoleArn` | No | ARN of a custom cross-account role. If omitted, automatically uses OrganizationAccountAccessRole (AWS Organizations only) |
 
 ### Via AWS Console
 
@@ -365,9 +449,12 @@ Environment:
 
 #### 1. Bootstrap Fails - IAM Permission Denied
 
-**Cause**: Cross-account role doesn't have sufficient permissions
+**Cause**: Cannot assume cross-account role in restore account
 
-**Solution**: Verify the cross-account role has CloudFormation, IAM, RDS, and KMS permissions
+**Solutions**:
+- **If using AWS Organizations**: Ensure the application is deployed in the Organization Management Account and the restore account is a member of the organization
+- **If using manual role**: Verify the cross-account role exists and has the correct trust policy allowing the Lambda execution role to assume it
+- Check CloudWatch Logs for the specific error message
 
 #### 2. Connect Account Fails - 404 Not Found
 

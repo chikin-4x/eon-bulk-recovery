@@ -1,6 +1,6 @@
 {
-  "sourceAccountId": "123456789012",
-  "restoreAccountId": "987654321098",
+  "sourceAccountId": "333333333333",
+  "restoreAccountId": "222222222222",
   "restoreAccountName": "production-restore",
   "restoreRegion": "us-east-1",
   "snapshotDate": "2024-01-15",
@@ -33,6 +33,5 @@
         "restoredRdsInstance": ["sg-0123456789abcdef1"]
       }
     }
-  ],
-  "crossAccountRoleArn": "arn:aws:iam::987654321098:role/EonBulkRecoveryCrossAccountRole"
+  ]
 }

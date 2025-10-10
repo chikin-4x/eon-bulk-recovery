@@ -25,6 +25,11 @@ Parameters:
     Description: Eon API client secret
     NoEcho: true
 
+  ManagementAccountId:
+    Type: String
+    Description: AWS Organization Management Account ID (optional - required only if deploying outside management account)
+    Default: ''
+
   NotificationEmail:
     Type: String
     Description: Email address for SNS notifications (optional)
@@ -150,6 +155,7 @@ Resources:
           EON_ACCOUNT_ID: !Ref EonAccountId
           EON_CREDENTIALS_SECRET_ARN: !Ref EonCredentialsSecret
           SNS_TOPIC_ARN: !Ref NotificationTopic
+          MANAGEMENT_ACCOUNT_ID: !Ref ManagementAccountId
           MAX_MONITORING_ITERATIONS: '360'
 
   # IAM Role for Step Functions

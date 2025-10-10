@@ -1,0 +1,55 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Management Account Role for Eon Bulk Recovery - Enables role chaining from backup account to restore accounts
+
+Parameters:
+  BackupAccountId:
+    Type: String
+    Description: AWS account ID where the Eon Bulk Recovery application is deployed
+    AllowedPattern: '^\d{12}$'
+    ConstraintDescription: Must be a valid 12-digit AWS account ID
+
+  StackName:
+    Type: String
+    Description: Name of the Eon Bulk Recovery CloudFormation stack in the backup account
+    Default: eon-bulk-recovery
+
+Resources:
+  EonBulkRecoveryChainRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EonBulkRecoveryChainRole
+      Description: Allows Eon Bulk Recovery application to chain through to restore accounts
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${BackupAccountId}:role/${StackName}-lambda-role'
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: OrganizationAccountAccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: 'arn:aws:iam::*:role/OrganizationAccountAccessRole'
+                Condition:
+                  StringEquals:
+                    'aws:PrincipalOrgID': !Ref 'AWS::OrganizationId'
+      Tags:
+        - Key: Application
+          Value: EonBulkRecovery
+        - Key: Purpose
+          Value: RoleChaining
+
+Outputs:
+  RoleArn:
+    Description: ARN of the EonBulkRecoveryChainRole
+    Value: !GetAtt EonBulkRecoveryChainRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ChainRole'
+
+  RoleName:
+    Description: Name of the EonBulkRecoveryChainRole
+    Value: !Ref EonBulkRecoveryChainRole
