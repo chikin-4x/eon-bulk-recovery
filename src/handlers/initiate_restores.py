@@ -3,7 +3,7 @@
 import os
 import sys
 import hashlib
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import boto3
 from botocore.exceptions import ClientError
 
@@ -11,101 +11,18 @@ from botocore.exceptions import ClientError
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from lib.eon_client import EonClient
-from lib.aws_utils import get_eon_credentials
-
-
-def get_cross_account_credentials(restore_account_id: str, cross_account_role_arn: str = None, management_account_id: str = None) -> Dict[str, str]:
-    """
-    Get credentials for the restore account with support for role chaining.
-
-    Tries in this order:
-    1. Provided cross-account role ARN (if given)
-    2. Role chaining through management account (if management_account_id provided)
-    3. Direct AWS Organizations OrganizationAccountAccessRole access
-
-    Args:
-        restore_account_id: AWS account ID of the restore account
-        cross_account_role_arn: Optional explicit role ARN to assume
-        management_account_id: Optional AWS Organizations management account ID for role chaining
-
-    Returns:
-        Dictionary with AccessKeyId, SecretAccessKey, and SessionToken, or None if all methods fail
-    """
-    sts_client = boto3.client("sts")
-
-    # If explicit role ARN provided, use it
-    if cross_account_role_arn:
-        print(f"Using provided cross-account role: {cross_account_role_arn}")
-        try:
-            response = sts_client.assume_role(
-                RoleArn=cross_account_role_arn,
-                RoleSessionName="EonBulkRecoveryS3"
-            )
-            return response["Credentials"]
-        except ClientError as e:
-            print(f"Failed to assume provided role: {str(e)}")
-            return None
-
-    # If management account ID provided, use role chaining
-    if management_account_id:
-        print(f"Using role chaining through management account: {management_account_id}")
-
-        # Step 1: Assume role in management account
-        mgmt_role_arn = f"arn:aws:iam::{management_account_id}:role/EonBulkRecoveryChainRole"
-        print(f"Step 1: Assuming role in management account: {mgmt_role_arn}")
-
-        try:
-            mgmt_response = sts_client.assume_role(
-                RoleArn=mgmt_role_arn,
-                RoleSessionName="EonBulkRecoveryChain"
-            )
-            mgmt_credentials = mgmt_response["Credentials"]
-            print("Successfully assumed management account role")
-
-            # Step 2: Use management account credentials to assume OrganizationAccountAccessRole
-            mgmt_sts_client = boto3.client(
-                "sts",
-                aws_access_key_id=mgmt_credentials["AccessKeyId"],
-                aws_secret_access_key=mgmt_credentials["SecretAccessKey"],
-                aws_session_token=mgmt_credentials["SessionToken"]
-            )
-
-            org_role_arn = f"arn:aws:iam::{restore_account_id}:role/OrganizationAccountAccessRole"
-            print(f"Step 2: Assuming OrganizationAccountAccessRole in restore account: {org_role_arn}")
-
-            org_response = mgmt_sts_client.assume_role(
-                RoleArn=org_role_arn,
-                RoleSessionName="EonBulkRecoveryS3"
-            )
-            print("Successfully assumed OrganizationAccountAccessRole via role chaining")
-            return org_response["Credentials"]
-
-        except ClientError as e:
-            print(f"Role chaining failed: {str(e)}")
-            return None
-
-    # Try direct OrganizationAccountAccessRole access (management account deployment)
-    org_role_arn = f"arn:aws:iam::{restore_account_id}:role/OrganizationAccountAccessRole"
-    print(f"No cross-account role or management account provided. Attempting direct access to: {org_role_arn}")
-
-    try:
-        response = sts_client.assume_role(
-            RoleArn=org_role_arn,
-            RoleSessionName="EonBulkRecoveryS3"
-        )
-        print("Successfully assumed OrganizationAccountAccessRole")
-        return response["Credentials"]
-    except ClientError as e:
-        print(f"Failed to assume OrganizationAccountAccessRole: {str(e)}")
-        # If OrganizationAccountAccessRole doesn't work, return None
-        # S3 bucket creation will use Lambda's default credentials
-        return None
+from lib.aws_utils import get_eon_credentials, get_cross_account_credentials
 
 
 def create_s3_bucket(bucket_name: str, region: str, kms_key_id: str, restore_account_id: str, cross_account_role_arn: str = None, management_account_id: str = None) -> None:
     """Create an S3 bucket in the restore account."""
     # Get credentials for restore account
-    credentials = get_cross_account_credentials(restore_account_id, cross_account_role_arn, management_account_id)
+    credentials = None
+    try:
+        credentials = get_cross_account_credentials(restore_account_id, cross_account_role_arn, management_account_id)
+    except (ValueError, ClientError) as e:
+        print(f"Could not get cross-account credentials for S3 bucket creation: {str(e)}")
+        print("Falling back to Lambda execution role credentials")
 
     if credentials:
         s3_client = boto3.client(

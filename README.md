@@ -44,19 +44,7 @@ This application uses AWS Step Functions to orchestrate a multi-step workflow th
 
 ### 3. Cross-Account Access
 
-The application needs to deploy resources in the restore account. There are **three ways** to grant this access:
-
-#### Option A: AWS Organizations - Management Account Deployment (Recommended - Zero Setup)
-
-If you're using **AWS Organizations** and deploy this application in the **Organization Management Account**:
-
-**No setup required!** The application automatically uses the `OrganizationAccountAccessRole` that AWS creates by default in all member accounts.
-
-Just provide the restore account ID when executing the workflow - no manual IAM role creation needed.
-
-#### Option B: AWS Organizations - Non-Management Account Deployment (Role Chaining)
-
-If you're using **AWS Organizations** but want to deploy this application in a **different account** (not the management account), you can use role chaining:
+The application needs to deploy resources in the restore account. If you're using **AWS Organizations** but want to deploy this application in a **different account** (not the management account), you can use role chaining:
 
 **Step 1: Deploy the role in the Organization Management Account**
 
