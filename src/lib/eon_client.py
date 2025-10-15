@@ -198,9 +198,10 @@ class EonClient:
                 "accountId": {
                     "in": [source_account_id]
                 },
-                "backupStatus": {
-                    "in": ["PROTECTED"]
-                }
+                # NOTE: Don't filter backup status, since resources can still contain snapshots even if their current status is not "PROTECTED"
+                # "backupStatus": {
+                #     "in": ["PROTECTED"]
+                # }
             },
             "sorts": [
                 {
