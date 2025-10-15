@@ -1,19 +1,14 @@
 {
-  "sourceAccountId": "333333333333",
+  "sourceAccountId": "444444444444",
   "restoreAccountId": "222222222222",
-  "restoreAccountName": "production-restore",
+  "restoreAccountName": null,
   "restoreRegion": "us-east-1",
-  "snapshotDate": "2024-01-15",
-  "vpcId": "vpc-0123456789abcdef0",
-  "subnetIds": [
-    "subnet-0123456789abcdef0",
-    "subnet-0123456789abcdef1",
-    "subnet-0123456789abcdef2"
-  ],
+  "snapshotDate": "2025-01-15",
+  "crossAccountRoleArn": null,
   "vpcConfigs": [
     {
       "region": "us-east-1",
-      "vpc": "vpc-0123456789abcdef0",
+      "vpc": "vpc-00000000000000001",
       "subnetsPerAvailabilityZone": [
         {
           "availabilityZone": "us-east-1a",

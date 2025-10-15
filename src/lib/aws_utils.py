@@ -104,38 +104,51 @@ def get_cross_account_credentials(restore_account_id: str, cross_account_role_ar
             )
             mgmt_credentials = mgmt_response["Credentials"]
             print("Successfully assumed management account role")
-
-            # Step 2: Use management account credentials to assume OrganizationAccountAccessRole
-            mgmt_sts_client = boto3.client(
-                "sts",
-                aws_access_key_id=mgmt_credentials["AccessKeyId"],
-                aws_secret_access_key=mgmt_credentials["SecretAccessKey"],
-                aws_session_token=mgmt_credentials["SessionToken"]
+        except ClientError as e:
+            raise ValueError(
+                f"Failed to assume EonBulkRecoveryChainRole in management account {management_account_id}. "
+                f"Please ensure the role exists and trusts this account. Error: {str(e)}"
             )
 
-            org_role_arn = f"arn:aws:iam::{restore_account_id}:role/OrganizationAccountAccessRole"
-            print(f"Step 2: Assuming OrganizationAccountAccessRole in restore account: {org_role_arn}")
+        # Step 2: Use management account credentials to assume role in restore account
+        # Try both Control Tower and standard Organizations roles
+        mgmt_sts_client = boto3.client(
+            "sts",
+            aws_access_key_id=mgmt_credentials["AccessKeyId"],
+            aws_secret_access_key=mgmt_credentials["SecretAccessKey"],
+            aws_session_token=mgmt_credentials["SessionToken"]
+        )
 
+        # Try Control Tower role first (more common)
+        control_tower_role_arn = f"arn:aws:iam::{restore_account_id}:role/AWSControlTowerExecution"
+        print(f"Step 2: Attempting to assume AWSControlTowerExecution in restore account: {control_tower_role_arn}")
+
+        try:
             org_response = mgmt_sts_client.assume_role(
-                RoleArn=org_role_arn,
+                RoleArn=control_tower_role_arn,
                 RoleSessionName="EonBulkRecoveryBootstrap"
             )
-            print("Successfully assumed OrganizationAccountAccessRole via role chaining")
+            print("Successfully assumed AWSControlTowerExecution via role chaining")
             return org_response["Credentials"]
+        except ClientError as control_tower_error:
+            # If Control Tower role doesn't exist, try standard Organizations role
+            org_role_arn = f"arn:aws:iam::{restore_account_id}:role/OrganizationAccountAccessRole"
+            print(f"AWSControlTowerExecution not found, trying OrganizationAccountAccessRole: {org_role_arn}")
 
-        except ClientError as e:
-            error_msg = str(e)
-            if "EonBulkRecoveryChainRole" in error_msg:
-                raise ValueError(
-                    f"Failed to assume EonBulkRecoveryChainRole in management account {management_account_id}. "
-                    f"Please ensure the role exists and trusts this account. See README for setup instructions."
+            try:
+                org_response = mgmt_sts_client.assume_role(
+                    RoleArn=org_role_arn,
+                    RoleSessionName="EonBulkRecoveryBootstrap"
                 )
-            elif "OrganizationAccountAccessRole" in error_msg:
+                print("Successfully assumed OrganizationAccountAccessRole via role chaining")
+                return org_response["Credentials"]
+            except ClientError as org_error:
                 raise ValueError(
-                    f"Failed to assume OrganizationAccountAccessRole in restore account {restore_account_id}. "
-                    f"Ensure the restore account is part of your AWS Organization."
+                    f"Failed to assume cross-account role in restore account {restore_account_id}. "
+                    f"Tried AWSControlTowerExecution and OrganizationAccountAccessRole. "
+                    f"Ensure the restore account is part of your AWS Organization. "
+                    f"Control Tower error: {str(control_tower_error)}. Organizations error: {str(org_error)}"
                 )
-            raise ValueError(f"Role chaining failed: {error_msg}")
 
     # Try direct OrganizationAccountAccessRole access (management account deployment)
     org_role_arn = f"arn:aws:iam::{restore_account_id}:role/OrganizationAccountAccessRole"

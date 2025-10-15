@@ -10,8 +10,7 @@
         "step": "bootstrap",
         "restoreAccountId.$": "$.restoreAccountId",
         "restoreRegion.$": "$.restoreRegion",
-        "vpcId.$": "$.vpcId",
-        "subnetIds.$": "$.subnetIds",
+        "vpcConfigs.$": "$.vpcConfigs",
         "crossAccountRoleArn.$": "$.crossAccountRoleArn"
       },
       "ResultPath": "$.bootstrapResult",
@@ -44,8 +43,8 @@
       "Parameters": {
         "step": "connect_account",
         "roleArn.$": "$.bootstrapResult.roleArn",
-        "restoreAccountName.$": "$.restoreAccountName",
-        "restoreAccountId.$": "$.restoreAccountId"
+        "restoreAccountId.$": "$.restoreAccountId",
+        "restoreAccountName.$": "$.restoreAccountName"
       },
       "ResultPath": "$.connectResult",
       "Retry": [

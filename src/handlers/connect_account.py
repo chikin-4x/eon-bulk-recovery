@@ -26,8 +26,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         roleArn: ARN of the IAM role
     """
     role_arn = event["roleArn"]
-    restore_account_name = event.get("restoreAccountName", f"restore-{event['restoreAccountId']}")
     restore_account_id = event["restoreAccountId"]
+    restore_account_name = event.get("restoreAccountName", f"bulk-recovery-{restore_account_id}")
 
     # Get Eon credentials
     credentials = get_eon_credentials()

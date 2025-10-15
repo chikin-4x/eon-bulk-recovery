@@ -5,6 +5,7 @@ import json
 import time
 from typing import Dict, Any, Optional, List
 import requests
+from requests import Response
 
 
 class EonClient:
@@ -32,11 +33,16 @@ class EonClient:
         url = f"{self.base_url}/token"
         payload = {
             "clientId": self.client_id,
+            "clientSecret": "***MASKED***"  # Mask secret in logs
+        }
+
+        actual_payload = {
+            "clientId": self.client_id,
             "clientSecret": self.client_secret
         }
 
-        response = requests.post(url, json=payload)
-        response.raise_for_status()
+        response = requests.post(url, json=actual_payload)
+        self._handle_response(response, "POST", url, payload)
 
         data = response.json()
         self.access_token = data["accessToken"]
@@ -55,6 +61,59 @@ class EonClient:
             "Authorization": f"Bearer {self.access_token}",
             "Content-Type": "application/json"
         }
+
+    def _handle_response(self, response: Response, method: str, url: str, payload: Any = None) -> None:
+        """
+        Handle API response and raise detailed error if request fails.
+
+        Args:
+            response: Response object from requests
+            method: HTTP method (GET, POST, PUT, etc.)
+            url: Request URL
+            payload: Request payload/body (will be masked for sensitive data)
+        """
+        if response.ok:
+            return
+
+        # Mask sensitive headers
+        headers = dict(response.request.headers)
+        if "Authorization" in headers:
+            headers["Authorization"] = "Bearer ***MASKED***"
+
+        # Build detailed error message
+        error_details = {
+            "method": method,
+            "url": url,
+            "status_code": response.status_code,
+            "request_headers": headers,
+        }
+
+        if payload is not None:
+            error_details["request_payload"] = payload
+
+        try:
+            error_details["response_body"] = response.json()
+        except Exception:
+            error_details["response_text"] = response.text
+
+        error_msg = (
+            f"Eon API request failed:\n"
+            f"Method: {method}\n"
+            f"URL: {url}\n"
+            f"Status Code: {response.status_code}\n"
+            f"Request Headers: {json.dumps(headers, indent=2)}\n"
+        )
+
+        if payload is not None:
+            error_msg += f"Request Payload: {json.dumps(payload, indent=2)}\n"
+
+        if "response_body" in error_details:
+            error_msg += f"Response Body: {json.dumps(error_details['response_body'], indent=2)}\n"
+        else:
+            error_msg += f"Response Text: {error_details['response_text']}\n"
+
+        print(error_msg)
+        response.raise_for_status()
 
     def connect_restore_account(
         self,
@@ -83,7 +142,7 @@ class EonClient:
         }
 
         response = requests.post(url, json=payload, headers=self._get_headers())
-        response.raise_for_status()
+        self._handle_response(response, "POST", url, payload)
         return response.json()
 
     def configure_vpc_connectivity(
@@ -109,7 +168,7 @@ class EonClient:
         }
 
         response = requests.put(url, json=payload, headers=self._get_headers())
-        response.raise_for_status()
+        self._handle_response(response, "PUT", url, payload)
         return response.json()
 
     def list_resources(
@@ -152,7 +211,7 @@ class EonClient:
         }
 
         response = requests.post(url, json=payload, params=params, headers=self._get_headers())
-        response.raise_for_status()
+        self._handle_response(response, "POST", url, payload)
         return response.json()
 
     def list_snapshots(
@@ -194,7 +253,7 @@ class EonClient:
                 payload["filters"]["pointInTime"]["endDate"] = end_date
 
         response = requests.post(url, json=payload, params=params, headers=self._get_headers())
-        response.raise_for_status()
+        self._handle_response(response, "POST", url, payload)
         return response.json()
 
     def restore_ec2_instance(
@@ -223,7 +282,7 @@ class EonClient:
         }
 
         response = requests.post(url, json=payload, headers=self._get_headers())
-        response.raise_for_status()
+        self._handle_response(response, "POST", url, payload)
         return response.json().get("jobId")
 
     def restore_rds_instance(
@@ -252,7 +311,7 @@ class EonClient:
         }
 
         response = requests.post(url, json=payload, headers=self._get_headers())
-        response.raise_for_status()
+        self._handle_response(response, "POST", url, payload)
         return response.json().get("jobId")
 
     def restore_s3_bucket(
@@ -281,7 +340,7 @@ class EonClient:
         }
 
         response = requests.post(url, json=payload, headers=self._get_headers())
-        response.raise_for_status()
+        self._handle_response(response, "POST", url, payload)
         return response.json().get("jobId")
 
     def restore_dynamodb_table(
@@ -310,7 +369,7 @@ class EonClient:
         }
 
         response = requests.post(url, json=payload, headers=self._get_headers())
-        response.raise_for_status()
+        self._handle_response(response, "POST", url, payload)
         return response.json().get("jobId")
 
     def get_restore_job(self, job_id: str) -> Dict[str, Any]:
@@ -326,5 +385,5 @@ class EonClient:
         url = f"{self.base_url}/projects/{self.project_id}/restore-jobs/{job_id}"
 
         response = requests.get(url, headers=self._get_headers())
-        response.raise_for_status()
+        self._handle_response(response, "GET", url)
         return response.json()

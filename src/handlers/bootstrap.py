@@ -20,22 +20,37 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     Input event:
         restoreAccountId: AWS account ID of the restore account
         restoreRegion: Primary region for the restore (default: us-east-1)
-        vpcId: VPC ID for RDS subnet group
-        subnetIds: List of subnet IDs for RDS subnet group
+        vpcConfigs: List of VPC configurations (optional)
+            Each config contains:
+                region: AWS region
+                vpc: VPC ID
+                subnetsPerAvailabilityZone: List of {availabilityZone, subnetId}
         crossAccountRoleArn: ARN of role to assume in restore account (optional)
 
     Returns:
         roleArn: ARN of the created Eon restore role
-        rdsSubnetGroupName: Name of the created RDS subnet group
+        rdsSubnetGroupName: Name of the created RDS subnet group (if VPC configs provided)
         kmsKeyArn: ARN of the created KMS key
     """
     restore_account_id = event["restoreAccountId"]
     restore_region = event.get("restoreRegion", "us-east-1")
-    vpc_id = event.get("vpcId")
-    subnet_ids = event.get("subnetIds", [])
+    vpc_configs = event.get("vpcConfigs", [])
     cross_account_role_arn = event.get("crossAccountRoleArn")
     eon_account_id = os.environ["EON_ACCOUNT_ID"]
     management_account_id = os.environ.get("MANAGEMENT_ACCOUNT_ID", "").strip()
+
+    # Extract VPC ID and subnet IDs from vpcConfigs for the restore region
+    vpc_id = None
+    subnet_ids = []
+    if vpc_configs:
+        # Find the VPC config that matches the restore region
+        for config in vpc_configs:
+            if config.get("region") == restore_region:
+                vpc_id = config.get("vpc")
+                # Extract all subnet IDs from subnetsPerAvailabilityZone
+                subnets_per_az = config.get("subnetsPerAvailabilityZone", [])
+                subnet_ids = [subnet["subnetId"] for subnet in subnets_per_az if "subnetId" in subnet]
+                break
 
     # Get credentials for restore account with role chaining support
     credentials = get_cross_account_credentials(

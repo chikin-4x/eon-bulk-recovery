@@ -31,9 +31,9 @@ This application uses AWS Step Functions to orchestrate a multi-step workflow th
 - Project ID from your Eon account
 - Eon Account ID for IAM role external ID
 
-### 2. AWS Account Setup
+### 2. AWS Setup
 
-#### Management Account (where this app runs)
+#### Workstation 
 - AWS CLI configured
 - AWS SAM CLI installed (`pip install aws-sam-cli`)
 - Appropriate IAM permissions to deploy CloudFormation stacks
@@ -46,35 +46,12 @@ This application uses AWS Step Functions to orchestrate a multi-step workflow th
 
 The application needs to deploy resources in the restore account. If you're using **AWS Organizations** but want to deploy this application in a **different account** (not the management account), you can use role chaining:
 
-**Step 1: Deploy the role in the Organization Management Account**
+**Step 1: Deploy the main application with ManagementAccountId**
 
-In the **AWS Organizations Management Account**, deploy the provided role template:
-
-```bash
-cd eon-bulk-recovery
-aws cloudformation deploy \
-  --template-file management-account-role.yaml \
-  --stack-name eon-bulk-recovery-chain-role \
-  --parameter-overrides \
-      BackupAccountId=<BACKUP_ACCOUNT_ID> \
-      StackName=<YOUR_STACK_NAME> \
-  --capabilities CAPABILITY_NAMED_IAM \
-  --region us-east-1
-```
-
-Replace:
-- `<BACKUP_ACCOUNT_ID>`: The AWS account ID where you're deploying the Eon Bulk Recovery application
-- `<YOUR_STACK_NAME>`: The name you'll use for your main Eon Bulk Recovery stack (default: `eon-bulk-recovery`)
-
-This creates an `EonBulkRecoveryChainRole` that:
-- Trusts the Lambda execution role from your backup account
-- Can assume `OrganizationAccountAccessRole` in any organization member account
-
-**Step 2: Deploy the main application with ManagementAccountId**
-
-When deploying the main application (in your backup account), provide the `ManagementAccountId` parameter:
+First, deploy the main application in your backup account with the `ManagementAccountId` parameter:
 
 ```bash
+sam build
 sam deploy --guided
 # When prompted for ManagementAccountId, enter your AWS Organizations management account ID
 ```
@@ -86,21 +63,46 @@ Or update the parameter in your `samconfig.toml`:
 parameter_overrides = "ManagementAccountId=111111111111 ..."
 ```
 
+This creates the Lambda execution role that will be referenced in the next step.
+
+**Step 2: Deploy the chaining role in the Management Account**
+
+Now that the Lambda execution role exists, deploy the chaining role in your **AWS Organizations Management Account**:
+
+```bash
+cd eon-bulk-recovery
+aws cloudformation deploy \
+  --template-file management-account-role.yaml \
+  --stack-name eon-bulk-recovery-chain-role \
+  --parameter-overrides \
+      BackupAccountId=<BACKUP_ACCOUNT_ID> \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --region us-east-1
+```
+
+Replace `<BACKUP_ACCOUNT_ID>` with the AWS account ID where you deployed the Eon Bulk Recovery application (from Step 1).
+
+This creates an `EonBulkRecoveryChainRole` that:
+- Trusts the `EonBulkRecoveryLambdaRole` from your backup account
+- Can assume either `AWSControlTowerExecution` (for Control Tower accounts) or `OrganizationAccountAccessRole` (for standard Organizations accounts) in any organization member account
+
 **How it works:**
 
 The application uses a two-step role chaining process:
 1. Lambda (in backup account) → Assumes `EonBulkRecoveryChainRole` (in management account)
-2. Chain role → Assumes `OrganizationAccountAccessRole` (in restore account)
+2. Chain role → Assumes `AWSControlTowerExecution` or `OrganizationAccountAccessRole` (in restore account)
+
+The application automatically detects whether the restore account is managed by Control Tower or standard AWS Organizations and uses the appropriate role.
 
 This allows you to centralize the Eon Bulk Recovery application in a dedicated backup/recovery account while maintaining secure access to all organization member accounts.
 
-#### Option C: Manual Cross-Account Role (For Non-Organization Scenarios)
+#### Alternative: Manual Cross-Account Role (For Non-Organization Scenarios)
 
 If the restore account is **not** in your AWS Organization, or you want to use **least-privilege permissions**, create a manual cross-account role:
 
 **Step 1: Create the IAM role**
 
-In the restore account's IAM console, create a new role with the following trust policy (replace `<MANAGEMENT_ACCOUNT_ID>` with your management account ID and `<STACK_NAME>` with your CloudFormation stack name):
+In the restore account's IAM console, create a new role with the following trust policy (replace `<MANAGEMENT_ACCOUNT_ID>` with your management account ID):
 
 ```json
 {
@@ -109,7 +111,7 @@ In the restore account's IAM console, create a new role with the following trust
     {
       "Effect": "Allow",
       "Principal": {
-        "AWS": "arn:aws:iam::<MANAGEMENT_ACCOUNT_ID>:role/<STACK_NAME>-lambda-role"
+        "AWS": "arn:aws:iam::<MANAGEMENT_ACCOUNT_ID>:role/EonBulkRecoveryLambdaRole"
       },
       "Action": "sts:AssumeRole"
     }
@@ -245,7 +247,7 @@ You will be prompted for:
 - **EonAccountId**: Eon account ID for IAM external ID
 - **EonClientId**: Eon API client ID
 - **EonClientSecret**: Eon API client secret
-- **ManagementAccountId**: (Optional) AWS Organizations management account ID - only required if deploying outside the management account (see Option B in Cross-Account Access)
+- **ManagementAccountId**: (Optional) AWS Organizations management account ID - only required if using role chaining (see Cross-Account Access section)
 - **NotificationEmail**: (Optional) Email for SNS notifications
 
 ### 4. Confirm the email subscription
@@ -258,23 +260,18 @@ If you provided a notification email, check your inbox and confirm the SNS subsc
 
 Execute the Step Functions state machine with the following input.
 
-**Note:** The `ManagementAccountId` is configured at deployment time as a CloudFormation parameter (not in the execution input). It's only needed if you're using Option B (role chaining) - see the Cross-Account Access section above.
+**Note:** The `ManagementAccountId` is configured at deployment time as a CloudFormation parameter (not in the execution input). The `crossAccountRoleArn` is a runtime parameter that must be included in the execution input - set it to `null` for AWS Organizations/role chaining, or provide a specific role ARN for manual cross-account scenarios.
 
-**For AWS Organizations (automatic cross-account access):**
+**For AWS Organizations or role chaining (set crossAccountRoleArn to null):**
 
 ```json
 {
   "sourceAccountId": "333333333333",
   "restoreAccountId": "222222222222",
-  "restoreAccountName": "production-restore",
+  "restoreAccountName": null,
   "restoreRegion": "us-east-1",
   "snapshotDate": "2024-01-15",
-  "vpcId": "vpc-0123456789abcdef0",
-  "subnetIds": [
-    "subnet-0123456789abcdef0",
-    "subnet-0123456789abcdef1",
-    "subnet-0123456789abcdef2"
-  ],
+  "crossAccountRoleArn": null,
   "vpcConfigs": [
     {
       "region": "us-east-1",
@@ -302,17 +299,15 @@ Execute the Step Functions state machine with the following input.
 }
 ```
 
-**For manual cross-account role (add the crossAccountRoleArn parameter):**
+**For manual cross-account role (provide a specific crossAccountRoleArn):**
 
 ```json
 {
   "sourceAccountId": "333333333333",
   "restoreAccountId": "222222222222",
-  "restoreAccountName": "production-restore",
+  "restoreAccountName": null,
   "restoreRegion": "us-east-1",
   "snapshotDate": "2024-01-15",
-  "vpcId": "vpc-0123456789abcdef0",
-  "subnetIds": ["subnet-xxx", "subnet-yyy", "subnet-zzz"],
   "vpcConfigs": [...],
   "crossAccountRoleArn": "arn:aws:iam::222222222222:role/EonBulkRecoveryCrossAccountRole"
 }
@@ -324,13 +319,11 @@ Execute the Step Functions state machine with the following input.
 |-----------|----------|-------------|
 | `sourceAccountId` | Yes | AWS account ID containing the backed-up resources |
 | `restoreAccountId` | Yes | AWS account ID where resources will be restored |
-| `restoreAccountName` | Yes | Display name for the restore account in Eon |
+| `restoreAccountName` | No | Display name for the restore account in Eon. Set to `null` to auto-generate as `bulk-recovery-{restoreAccountId}` |
 | `restoreRegion` | Yes | Primary AWS region for restores (default: us-east-1) |
 | `snapshotDate` | No | Specific date for snapshot selection (YYYY-MM-DD). If omitted, uses latest snapshots |
-| `vpcId` | Yes* | VPC ID for RDS subnet group (*required if restoring RDS instances) |
-| `subnetIds` | Yes* | List of subnet IDs for RDS subnet group |
-| `vpcConfigs` | Yes | VPC connectivity configuration for Eon restore servers |
-| `crossAccountRoleArn` | No | ARN of a custom cross-account role. If omitted, automatically uses OrganizationAccountAccessRole (AWS Organizations only) |
+| `vpcConfigs` | Yes | VPC connectivity configuration for Eon restore servers. Also used to create RDS subnet groups. Must include subnets for the restore region if restoring RDS instances. |
+| `crossAccountRoleArn` | Yes | ARN of a custom cross-account role for manual scenarios, or `null` for AWS Organizations/role chaining. When `null`, automatically uses OrganizationAccountAccessRole or EonBulkRecoveryChainRole depending on deployment configuration. |
 
 ### Via AWS Console
 
@@ -440,7 +433,8 @@ Environment:
 **Cause**: Cannot assume cross-account role in restore account
 
 **Solutions**:
-- **If using AWS Organizations**: Ensure the application is deployed in the Organization Management Account and the restore account is a member of the organization
+- **If using AWS Organizations**: Ensure the application is deployed in the Organization Management Account and the restore account is a member of the organization. The restore account must have either `OrganizationAccountAccessRole` or `AWSControlTowerExecution` role (automatically created by AWS Organizations/Control Tower).
+- **If using role chaining**: Ensure `EonBulkRecoveryChainRole` exists in the management account and the restore account has `AWSControlTowerExecution` (for Control Tower) or `OrganizationAccountAccessRole` (for standard Organizations).
 - **If using manual role**: Verify the cross-account role exists and has the correct trust policy allowing the Lambda execution role to assume it
 - Check CloudWatch Logs for the specific error message
 
