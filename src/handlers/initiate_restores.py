@@ -68,7 +68,8 @@ def create_s3_bucket(bucket_name: str, region: str, kms_key_id: str, restore_acc
             Tagging={
                 "TagSet": [
                     {"Key": "ManagedBy", "Value": "EonBulkRecovery"},
-                    {"Key": "Purpose", "Value": "RestoreDestination"}
+                    {"Key": "Purpose", "Value": "RestoreDestination"},
+                    {"Key": "eon:restore", "Value": "true"}
                 ]
             }
         )
@@ -174,10 +175,15 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 # Build volume restore parameters from snapshot volume data
                 volume_restore_params = []
                 for vol in volumes:
+                    # Preserve original volume tags and add eon:restore tag
+                    original_tags = vol.get("tags", {})
+                    volume_tags = {**original_tags, "eon:restore": "true"}
+
                     vol_param = {
                         "providerVolumeId": vol.get("providerVolumeId", "unknown"),
                         "volumeEncryptionKeyId": kms_key_arn,
-                        "volumeSettings": vol.get("volumeSettings", {})
+                        "volumeSettings": vol.get("volumeSettings", {}),
+                        "tags": volume_tags
                     }
                     volume_restore_params.append(vol_param)
 
@@ -193,7 +199,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                         "tags": {
                             "Name": f"restored-{resource_name}",
                             "RestoreSource": resource_snapshot.get("providerResourceId", ""),
-                            "ManagedBy": "EonBulkRecovery"
+                            "ManagedBy": "EonBulkRecovery",
+                            "eon:restore": "true"
                         },
                         "volumeRestoreParameters": volume_restore_params
                     }
@@ -226,7 +233,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                         "tags": {
                             "Name": f"restored-{resource_name}",
                             "RestoreSource": resource_snapshot.get("providerResourceId", ""),
-                            "ManagedBy": "EonBulkRecovery"
+                            "ManagedBy": "EonBulkRecovery",
+                            "eon:restore": "true"
                         }
                     }
                 }
@@ -280,7 +288,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                         "tags": {
                             "Name": f"restored-{resource_name}",
                             "RestoreSource": resource_snapshot.get("providerResourceId", ""),
-                            "ManagedBy": "EonBulkRecovery"
+                            "ManagedBy": "EonBulkRecovery",
+                            "eon:restore": "true"
                         }
                     }
                 }

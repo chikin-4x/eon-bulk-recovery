@@ -122,6 +122,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     print(f"Job summary: {completed_count} completed, {failed_count} failed, {partial_count} partial, {running_count} still running")
 
     result = {
+        "restoreJobs": restore_jobs,  # Pass through for next iteration
         "allComplete": all_complete,
         "jobStatuses": job_statuses,
         "completedJobs": completed_count,
