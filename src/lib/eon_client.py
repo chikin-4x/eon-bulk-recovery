@@ -372,6 +372,61 @@ class EonClient:
         self._handle_response(response, "POST", url, payload)
         return response.json().get("jobId")
 
+    def list_restore_accounts(
+        self,
+        provider_account_id: Optional[str] = None,
+        account_status: Optional[List[str]] = None,
+        page_size: int = 100
+    ) -> Dict[str, Any]:
+        """
+        List restore accounts in the project.
+
+        Args:
+            provider_account_id: Filter by cloud provider account ID (e.g., AWS account ID)
+            account_status: Filter by account status (e.g., ["CONNECTED", "DISCONNECTED"])
+            page_size: Number of accounts per page
+
+        Returns:
+            Response containing accounts list
+        """
+        url = f"{self.base_url}/projects/{self.project_id}/restore-accounts/list"
+        params = {"pageSize": page_size}
+
+        payload = {}
+
+        if provider_account_id or account_status:
+            payload["filters"] = {}
+
+            if provider_account_id:
+                payload["filters"]["providerAccountId"] = {
+                    "in": [provider_account_id]
+                }
+
+            if account_status:
+                payload["filters"]["accountStatus"] = {
+                    "in": account_status
+                }
+
+        response = requests.post(url, json=payload, params=params, headers=self._get_headers())
+        self._handle_response(response, "POST", url, payload)
+        return response.json()
+
+    def reconnect_restore_account(self, account_id: str) -> Dict[str, Any]:
+        """
+        Reconnect a disconnected restore account.
+
+        Args:
+            account_id: Eon-assigned restore account ID
+
+        Returns:
+            Response containing reconnected restore account details
+        """
+        url = f"{self.base_url}/projects/{self.project_id}/restore-accounts/{account_id}/reconnect"
+
+        response = requests.post(url, headers=self._get_headers())
+        self._handle_response(response, "POST", url)
+        return response.json()
+
     def get_restore_job(self, job_id: str) -> Dict[str, Any]:
         """
         Get the status of a restore job.
