@@ -181,7 +181,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
                     vol_param = {
                         "providerVolumeId": vol.get("providerVolumeId", "unknown"),
-                        "volumeEncryptionKeyId": kms_key_arn,
+                        "volumeEncryptionKeyId": kms_key_arn,  # Encrypt volume with KMS key from bootstrap
                         "volumeSettings": vol.get("volumeSettings", {}),
                         "tags": volume_tags
                     }
@@ -189,6 +189,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
                 print(f"EC2 restore config - instance_type: {instance_type}, subnet: {subnet_id}, "
                       f"security_groups: {len(security_group_ids)}, volumes: {len(volume_restore_params)}")
+                print(f"Volume encryption - using KMS key: {kms_key_arn}")
 
                 destination_config = {
                     "awsEc2": {
@@ -207,9 +208,10 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 }
 
                 # Add instance profile if present
-                if instance_profile_name:
-                    destination_config["awsEc2"]["instanceProfileName"] = instance_profile_name
-                    print(f"Including instance profile: {instance_profile_name}")
+                # NOTE: Temporarily commented out as Eon does not currently request permissions to be able to create instance profile in restore account
+                # if instance_profile_name:
+                #     destination_config["awsEc2"]["instanceProfileName"] = instance_profile_name
+                #     print(f"Including instance profile: {instance_profile_name}")
 
                 job_id = eon_client.restore_ec2_instance(
                     resource_id=resource_id,
