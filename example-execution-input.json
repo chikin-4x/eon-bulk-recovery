@@ -3,7 +3,7 @@
   "restoreAccountId": "222222222222",
   "restoreAccountName": null,
   "restoreRegion": "us-east-1",
-  "snapshotDate": "2025-01-15",
+  "snapshotDate": "2025-10-08",
   "crossAccountRoleArn": null,
   "vpcConfigs": [
     {
@@ -12,20 +12,24 @@
       "subnetsPerAvailabilityZone": [
         {
           "availabilityZone": "us-east-1a",
-          "subnetId": "subnet-0123456789abcdef0"
+          "subnetId": "subnet-0000000000000001a"
         },
         {
           "availabilityZone": "us-east-1b",
-          "subnetId": "subnet-0123456789abcdef1"
+          "subnetId": "subnet-0000000000000001b"
         },
         {
           "availabilityZone": "us-east-1c",
-          "subnetId": "subnet-0123456789abcdef2"
+          "subnetId": "subnet-0000000000000001c"
         }
       ],
       "securityGroups": {
-        "restoreServer": ["sg-0123456789abcdef0"],
-        "restoredRdsInstance": ["sg-0123456789abcdef1"]
+        "restoreServer": [
+          "sg-00000000000000001"
+        ],
+        "restoredRdsInstance": [
+          "sg-00000000000000001"
+        ]
       }
     }
   ]

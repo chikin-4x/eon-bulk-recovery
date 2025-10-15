@@ -3,6 +3,8 @@
 import os
 import sys
 import hashlib
+import time
+import random
 from typing import Dict, Any, List, Optional
 import boto3
 from botocore.exceptions import ClientError
@@ -125,16 +127,18 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     # Get default VPC config if available
     default_vpc_config = vpc_configs[0] if vpc_configs else {}
-    default_subnet = None
+    available_subnets = []
     default_security_groups = []
 
     if default_vpc_config:
         subnets_per_az = default_vpc_config.get("subnetsPerAvailabilityZone", [])
-        if subnets_per_az:
-            default_subnet = subnets_per_az[0].get("subnetId")
+        # Collect all available subnets for random selection
+        available_subnets = [subnet.get("subnetId") for subnet in subnets_per_az if subnet.get("subnetId")]
 
         security_groups = default_vpc_config.get("securityGroups", {})
         default_security_groups = security_groups.get("restoreServer", [])
+
+    print(f"Available subnets for EC2 restores: {len(available_subnets)}")
 
     for resource_snapshot in resource_snapshots:
         resource_id = resource_snapshot["resourceId"]
@@ -149,35 +153,56 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             job_id = None
 
             if resource_type == "AWS_EC2":
-                # Get instance type from source resource, fallback to default
+                # Get instance configuration from snapshot
                 instance_type = resource_snapshot.get("instanceType", "t3.medium")
+                instance_profile_name = resource_snapshot.get("instanceProfileName")
+                volumes = resource_snapshot.get("volumes", [])
+
+                # Networking config comes from VPC configuration (not from snapshot)
+                # Randomly select a subnet from available subnets for load distribution
+                subnet_id = random.choice(available_subnets) if available_subnets else None
+                security_group_ids = default_security_groups
+
+                if not subnet_id:
+                    raise ValueError(f"No subnets available for EC2 restore of {resource_name}")
+
+                # Volumes must be present - no volumes means no data to restore
+                if not volumes:
+                    print(f"ERROR: No volume configuration found for {resource_name}, cannot restore")
+                    raise ValueError(f"No volumes found for EC2 instance {resource_name}")
+
+                # Build volume restore parameters from snapshot volume data
+                volume_restore_params = []
+                for vol in volumes:
+                    vol_param = {
+                        "providerVolumeId": vol.get("providerVolumeId", "unknown"),
+                        "volumeEncryptionKeyId": kms_key_arn,
+                        "volumeSettings": vol.get("volumeSettings", {})
+                    }
+                    volume_restore_params.append(vol_param)
+
+                print(f"EC2 restore config - instance_type: {instance_type}, subnet: {subnet_id}, "
+                      f"security_groups: {len(security_group_ids)}, volumes: {len(volume_restore_params)}")
 
                 destination_config = {
                     "awsEc2": {
                         "region": resource_region,
                         "instanceType": instance_type,
-                        "subnetId": default_subnet or "subnet-default",
-                        "securityGroupIds": default_security_groups,
+                        "subnetId": subnet_id,
+                        "securityGroupIds": security_group_ids,
                         "tags": {
                             "Name": f"restored-{resource_name}",
                             "RestoreSource": resource_snapshot.get("providerResourceId", ""),
                             "ManagedBy": "EonBulkRecovery"
                         },
-                        "volumeRestoreParameters": [
-                            {
-                                "providerVolumeId": "vol-root",  # This should be extracted from snapshot metadata
-                                "description": "Root volume",
-                                "volumeEncryptionKeyId": kms_key_arn,
-                                "volumeSettings": {
-                                    "type": "gp3",
-                                    "sizeBytes": 10737418240,  # 10 GB default
-                                    "iops": 3000,
-                                    "throughput": 125
-                                }
-                            }
-                        ]
+                        "volumeRestoreParameters": volume_restore_params
                     }
                 }
+
+                # Add instance profile if present
+                if instance_profile_name:
+                    destination_config["awsEc2"]["instanceProfileName"] = instance_profile_name
+                    print(f"Including instance profile: {instance_profile_name}")
 
                 job_id = eon_client.restore_ec2_instance(
                     resource_id=resource_id,
@@ -277,6 +302,10 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     "status": "INITIATED"
                 })
                 print(f"Successfully initiated restore job {job_id} for {resource_name}")
+
+                # Pause 5 seconds between job initiations to avoid overloading the API
+                print("Pausing 5 seconds before next job...")
+                time.sleep(5)
             else:
                 print(f"WARNING: No job ID returned for {resource_name}")
 
