@@ -4,6 +4,7 @@ import os
 import sys
 import json
 from typing import Dict, Any, List
+from datetime import datetime
 import boto3
 
 # Add parent directory to path for imports
@@ -20,6 +21,11 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     Input event:
         restoreJobs: List of restore jobs with job IDs
         iteration: Current iteration count (for tracking polling attempts)
+        sourceAccountId: Source AWS account ID
+        restoreAccountId: Restore AWS account ID
+        restoreRegion: Restore region
+        vpcConfigs: VPC configurations used
+        startTime: ISO timestamp when monitoring started
 
     Returns:
         allComplete: Boolean indicating if all jobs are complete
@@ -31,6 +37,11 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
     restore_jobs = event["restoreJobs"]
     iteration = event.get("iteration", 0)
+    source_account_id = event.get("sourceAccountId")
+    restore_account_id = event.get("restoreAccountId")
+    restore_region = event.get("restoreRegion")
+    vpc_configs = event.get("vpcConfigs", [])
+    start_time = event.get("startTime")
     max_iterations = int(os.environ.get("MAX_MONITORING_ITERATIONS", "360"))  # 360 * 5min = 30 hours
 
     # Get Eon credentials
@@ -130,7 +141,13 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         "partialJobs": partial_count,
         "runningJobs": running_count,
         "totalJobs": len(restore_jobs),
-        "iteration": iteration + 1
+        "iteration": iteration + 1,
+        # Pass through context for next iteration and notification
+        "sourceAccountId": source_account_id,
+        "restoreAccountId": restore_account_id,
+        "restoreRegion": restore_region,
+        "vpcConfigs": vpc_configs,
+        "startTime": start_time
     }
 
     # If all jobs are complete or max iterations reached, send SNS notification
@@ -162,6 +179,27 @@ def send_completion_notification(job_summary: Dict[str, Any], timeout: bool) -> 
     partial_jobs = job_summary["partialJobs"]
     running_jobs = job_summary["runningJobs"]
 
+    # Extract context information
+    source_account_id = job_summary.get("sourceAccountId", "Unknown")
+    restore_account_id = job_summary.get("restoreAccountId", "Unknown")
+    restore_region = job_summary.get("restoreRegion", "Unknown")
+    vpc_configs = job_summary.get("vpcConfigs", [])
+    start_time_str = job_summary.get("startTime")
+
+    # Calculate duration
+    duration_str = "Unknown"
+    if start_time_str:
+        try:
+            start_time = datetime.fromisoformat(start_time_str.replace('Z', '+00:00'))
+            end_time = datetime.utcnow()
+            duration = end_time - start_time.replace(tzinfo=None)
+            hours = int(duration.total_seconds() // 3600)
+            minutes = int((duration.total_seconds() % 3600) // 60)
+            duration_str = f"{hours}h {minutes}m"
+        except Exception as e:
+            print(f"Error calculating duration: {e}")
+            duration_str = "Unknown"
+
     if timeout:
         subject = "Eon Bulk Recovery - TIMEOUT"
         status_summary = f"⚠️ Monitoring timed out after {job_summary['iteration']} iterations"
@@ -175,6 +213,15 @@ def send_completion_notification(job_summary: Dict[str, Any], timeout: bool) -> 
         subject = "Eon Bulk Recovery - FAILURE"
         status_summary = f"❌ All {total_jobs} restore jobs failed"
 
+    # Format VPC configuration summary
+    vpc_summary = "None"
+    if vpc_configs:
+        vpc_config = vpc_configs[0] if isinstance(vpc_configs, list) else vpc_configs
+        vpc_id = vpc_config.get("vpc", "Unknown")
+        region = vpc_config.get("region", restore_region)
+        subnet_count = len(vpc_config.get("subnetsPerAvailabilityZone", []))
+        vpc_summary = f"{vpc_id} in {region} ({subnet_count} subnets)"
+
     # Build detailed message
     message_lines = [
         "Eon Bulk Recovery Status Report",
@@ -182,6 +229,16 @@ def send_completion_notification(job_summary: Dict[str, Any], timeout: bool) -> 
         "",
         status_summary,
         "",
+        "Recovery Details:",
+        "-" * 50,
+        f"Source Account: {source_account_id}",
+        f"Restore Account: {restore_account_id}",
+        f"Default Restore Region: {restore_region} (resources restored to original regions)",
+        f"VPC Configuration: {vpc_summary}",
+        f"Total Duration: {duration_str}",
+        "",
+        "Job Summary:",
+        "-" * 50,
         f"Total Jobs: {total_jobs}",
         f"Completed: {completed_jobs}",
         f"Failed: {failed_jobs}",

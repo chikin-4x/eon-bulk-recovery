@@ -207,7 +207,12 @@
       "Comment": "Initialize the iteration counter for job monitoring",
       "Parameters": {
         "restoreJobs.$": "$.restoreJobsResult.restoreJobs",
-        "iteration": 0
+        "iteration": 0,
+        "sourceAccountId.$": "$.sourceAccountId",
+        "restoreAccountId.$": "$.restoreAccountId",
+        "restoreRegion.$": "$.restoreRegion",
+        "vpcConfigs.$": "$.vpcConfigs",
+        "startTime.$": "$$.State.EnteredTime"
       },
       "ResultPath": "$.monitoringState",
       "Next": "Monitor Jobs"
