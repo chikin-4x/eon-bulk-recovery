@@ -16,91 +16,98 @@ from lib.eon_client import EonClient
 from lib.aws_utils import get_eon_credentials, get_cross_account_credentials
 
 
-def calculate_dynamodb_wcu_allocation(
-    resource_snapshots: List[Dict[str, Any]],
-    account_wcu_quota: int,
-    per_table_wcu_quota: int,
-    utilization_percentage: float = 0.95
+def calculate_dynamodb_wcu_allocation_by_region(
+    dynamodb_tables_by_region: Dict[str, List[Dict[str, Any]]],
+    regional_wcu_capacity: int = 40000,
+    utilization_percentage: float = 0.95,
+    default_wcu_for_zero_size: int = 50
 ) -> Dict[str, int]:
     """
-    Calculate WCU allocation for DynamoDB tables based on their sizes.
+    Calculate WCU allocation for DynamoDB tables per-region based on their sizes.
 
     Args:
-        resource_snapshots: List of resource snapshots
-        account_wcu_quota: Account-level WCU quota
-        per_table_wcu_quota: Per-table WCU quota
-        utilization_percentage: Percentage of account quota to use (default 95%)
+        dynamodb_tables_by_region: Dictionary mapping region to list of tables
+        regional_wcu_capacity: WCU capacity per region (default 40000)
+        utilization_percentage: Percentage of capacity to use (default 95%)
+        default_wcu_for_zero_size: WCU for tables with 0 size (default 50)
 
     Returns:
         Dictionary mapping resource_id to allocated WCU
     """
-    # Filter for DynamoDB tables and extract their sizes
-    dynamodb_tables = []
-    for snapshot in resource_snapshots:
-        if snapshot.get("resourceType") == "AWS_DYNAMO_DB":
-            table_size = snapshot.get("tableSizeBytes", 0)
-            dynamodb_tables.append({
-                "resourceId": snapshot["resourceId"],
-                "resourceName": snapshot["resourceName"],
-                "sizeBytes": table_size
-            })
-
-    if not dynamodb_tables:
-        return {}
-
-    # Calculate total size across all tables
-    total_size = sum(table["sizeBytes"] for table in dynamodb_tables)
-
-    if total_size == 0:
-        # If no size information, distribute equally
-        print("WARNING: No table size information available, distributing WCUs equally")
-        tables_count = len(dynamodb_tables)
-        available_wcu = int(account_wcu_quota * utilization_percentage)
-        wcu_per_table = min(available_wcu // tables_count, per_table_wcu_quota)
-
-        return {
-            table["resourceId"]: wcu_per_table
-            for table in dynamodb_tables
-        }
-
-    # Calculate available WCUs (95% of account quota)
-    available_wcu = int(account_wcu_quota * utilization_percentage)
-
-    print(f"DynamoDB WCU Allocation:")
-    print(f"  Account quota: {account_wcu_quota:,} WCU")
-    print(f"  Per-table quota: {per_table_wcu_quota:,} WCU")
-    print(f"  Available for allocation ({utilization_percentage*100}%): {available_wcu:,} WCU")
-    print(f"  Tables to restore: {len(dynamodb_tables)}")
-    print(f"  Total data size: {total_size / (1024**3):.2f} GB")
-
-    # Allocate WCUs proportionally based on table size
     wcu_allocation = {}
-    allocated_total = 0
 
-    for table in dynamodb_tables:
-        # Calculate proportional WCU
-        proportion = table["sizeBytes"] / total_size
-        proportional_wcu = int(available_wcu * proportion)
+    print(f"\nDynamoDB WCU Allocation (per-region):")
+    print(f"  Regional capacity: {regional_wcu_capacity:,} WCU per region")
+    print(f"  Utilization: {utilization_percentage*100}%")
+    print(f"  Regions with DynamoDB tables: {len(dynamodb_tables_by_region)}")
 
-        # Cap at per-table quota
-        allocated_wcu = min(proportional_wcu, per_table_wcu_quota)
+    for region, all_tables in dynamodb_tables_by_region.items():
+        if not all_tables:
+            continue
 
-        # Ensure minimum of 1 WCU
-        allocated_wcu = max(allocated_wcu, 1)
+        # Separate tables by size
+        dynamodb_tables = []
+        zero_size_tables = []
 
-        wcu_allocation[table["resourceId"]] = allocated_wcu
-        allocated_total += allocated_wcu
+        for table in all_tables:
+            if table["sizeBytes"] == 0:
+                zero_size_tables.append(table)
+            else:
+                dynamodb_tables.append(table)
 
-        table_size_gb = table["sizeBytes"] / (1024**3)
-        print(f"  {table['resourceName']}: {table_size_gb:.2f} GB ({proportion*100:.1f}%) -> {allocated_wcu:,} WCU")
+        # Calculate available WCUs for this region (95% of regional capacity)
+        available_wcu = int(regional_wcu_capacity * utilization_percentage)
 
-    print(f"  Total allocated: {allocated_total:,} WCU ({allocated_total/account_wcu_quota*100:.1f}% of account quota)")
+        print(f"\n  Region {region}:")
+        print(f"    Available WCU: {available_wcu:,}")
+        print(f"    Tables with size data: {len(dynamodb_tables)}")
+        print(f"    Tables with zero size: {len(zero_size_tables)}")
+
+        # Allocate default WCU to zero-size tables
+        zero_size_total_wcu = len(zero_size_tables) * default_wcu_for_zero_size
+
+        for table in zero_size_tables:
+            wcu_allocation[table["resourceId"]] = default_wcu_for_zero_size
+            print(f"    {table['resourceName']}: 0 GB (no size data) -> {default_wcu_for_zero_size:,} WCU (default)")
+
+        # Remaining WCU for sized tables
+        remaining_wcu = available_wcu - zero_size_total_wcu
+
+        if dynamodb_tables and remaining_wcu > 0:
+            # Calculate total size across all sized tables in this region
+            total_size = sum(table["sizeBytes"] for table in dynamodb_tables)
+
+            print(f"    Total data size (sized tables): {total_size / (1024**3):.2f} GB")
+            print(f"    Remaining WCU for sized tables: {remaining_wcu:,}")
+
+            # Allocate WCUs proportionally based on table size
+            allocated_total = zero_size_total_wcu
+
+            for table in dynamodb_tables:
+                # Calculate proportional WCU
+                proportion = table["sizeBytes"] / total_size
+                proportional_wcu = int(remaining_wcu * proportion)
+
+                # Ensure minimum of 1 WCU
+                allocated_wcu = max(proportional_wcu, 1)
+
+                wcu_allocation[table["resourceId"]] = allocated_wcu
+                allocated_total += allocated_wcu
+
+                table_size_gb = table["sizeBytes"] / (1024**3)
+                print(f"    {table['resourceName']}: {table_size_gb:.2f} GB ({proportion*100:.1f}%) -> {allocated_wcu:,} WCU")
+
+            print(f"    Total allocated in {region}: {allocated_total:,} WCU ({allocated_total/regional_wcu_capacity*100:.1f}% of regional capacity)")
+        elif not dynamodb_tables:
+            print(f"    Total allocated in {region}: {zero_size_total_wcu:,} WCU (all tables have zero size)")
 
     return wcu_allocation
 
 
-def create_s3_bucket(bucket_name: str, region: str, kms_key_id: str, restore_account_id: str, snapshot_id: str, snapshot_point_in_time: str, cross_account_role_arn: str = None, management_account_id: str = None) -> None:
+def create_s3_bucket(bucket_name: str, region: str, kms_key_id: str, restore_account_id: str, snapshot_id: str, snapshot_point_in_time: str, original_tags: Dict[str, str] = None, cross_account_role_arn: str = None, management_account_id: str = None) -> None:
     """Create an S3 bucket in the restore account."""
+    if original_tags is None:
+        original_tags = {}
     # Get credentials for restore account
     credentials = None
     try:
@@ -145,18 +152,23 @@ def create_s3_bucket(bucket_name: str, region: str, kms_key_id: str, restore_acc
             }
         )
 
+        # Merge original tags with restore tags (restore tags take precedence)
+        s3_tags = {
+            **original_tags,
+            "ManagedBy": "EonBulkRecovery",
+            "Purpose": "RestoreDestination",
+            "eon:restore": "true",
+            "eon:snapshot_id": snapshot_id,
+            "eon:snapshot_time": snapshot_point_in_time
+        }
+
+        # Convert tags dict to AWS TagSet format
+        tag_set = [{"Key": k, "Value": v} for k, v in s3_tags.items()]
+
         # Add tags
         s3_client.put_bucket_tagging(
             Bucket=bucket_name,
-            Tagging={
-                "TagSet": [
-                    {"Key": "ManagedBy", "Value": "EonBulkRecovery"},
-                    {"Key": "Purpose", "Value": "RestoreDestination"},
-                    {"Key": "eon:restore", "Value": "true"},
-                    {"Key": "eon:snapshot_id", "Value": snapshot_id},
-                    {"Key": "eon:snapshot_time", "Value": snapshot_point_in_time}
-                ]
-            }
+            Tagging={"TagSet": tag_set}
         )
 
         print(f"Created S3 bucket: {bucket_name}")
@@ -179,8 +191,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         restoreRegion: Primary region for restores
         kmsKeyArnsByRegion: Dictionary mapping region to KMS key ARN for encryption
         rdsSubnetGroupsByRegion: Dictionary mapping region to RDS subnet group name
-        dynamodbAccountWcuQuota: Account-level DynamoDB WCU quota
-        dynamodbPerTableWcuQuota: Per-table DynamoDB WCU quota
+        dynamodbRegionalWcuLimit: Regional WCU limit for DynamoDB (default 40000)
         vpcConfigs: VPC configurations for the restore
         crossAccountRoleArn: ARN of cross-account role (optional)
 
@@ -194,22 +205,47 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     restore_region = event.get("restoreRegion", "us-east-1")
     kms_key_arns_by_region = event.get("kmsKeyArnsByRegion", {})
     rds_subnet_groups_by_region = event.get("rdsSubnetGroupsByRegion", {})
+    dynamodb_regional_wcu_limit = event.get("dynamodbRegionalWcuLimit") or 40000
     vpc_configs = event.get("vpcConfigs", [])
     cross_account_role_arn = event.get("crossAccountRoleArn")
     management_account_id = os.environ.get("MANAGEMENT_ACCOUNT_ID", "").strip() or None
 
-    # Get DynamoDB WCU quotas from bootstrap
-    account_wcu_quota = event.get("dynamodbAccountWcuQuota", 80000)
-    per_table_wcu_quota = event.get("dynamodbPerTableWcuQuota", 40000)
-
     print(f"KMS keys available in regions: {list(kms_key_arns_by_region.keys())}")
     print(f"RDS subnet groups available in regions: {list(rds_subnet_groups_by_region.keys())}")
+    print(f"DynamoDB regional WCU limit: {dynamodb_regional_wcu_limit:,}")
 
-    # Calculate WCU allocation for DynamoDB tables
-    dynamodb_wcu_allocation = calculate_dynamodb_wcu_allocation(
-        resource_snapshots=resource_snapshots,
-        account_wcu_quota=account_wcu_quota,
-        per_table_wcu_quota=per_table_wcu_quota
+    # Build VPC configs by region for region-specific resource restoration
+    vpc_configs_by_region = {}
+    for config in vpc_configs:
+        region = config.get("region", restore_region)
+        vpc_configs_by_region[region] = config
+
+    # Group DynamoDB tables by target region
+    dynamodb_tables_by_region = {}
+    for snapshot in resource_snapshots:
+        if snapshot.get("resourceType") == "AWS_DYNAMO_DB":
+            source_region = snapshot.get("region")
+            target_region = restore_region if restore_region else source_region
+
+            # Determine actual region (same logic as restore section)
+            actual_region = target_region if target_region in vpc_configs_by_region else list(vpc_configs_by_region.keys())[0] if vpc_configs_by_region else None
+
+            if actual_region:
+                if actual_region not in dynamodb_tables_by_region:
+                    dynamodb_tables_by_region[actual_region] = []
+
+                dynamodb_tables_by_region[actual_region].append({
+                    "resourceId": snapshot["resourceId"],
+                    "resourceName": snapshot["resourceName"],
+                    "sizeBytes": snapshot.get("tableSizeBytes", 0)
+                })
+
+    # Calculate WCU allocation per region (95% of regional capacity)
+    dynamodb_wcu_allocation = calculate_dynamodb_wcu_allocation_by_region(
+        dynamodb_tables_by_region=dynamodb_tables_by_region,
+        regional_wcu_capacity=dynamodb_regional_wcu_limit,
+        utilization_percentage=0.95,
+        default_wcu_for_zero_size=50
     )
 
     # Get Eon credentials
@@ -223,17 +259,10 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         project_id=os.environ["EON_PROJECT_ID"]
     )
 
-    print(f"Initiating restore jobs for {len(resource_snapshots)} snapshots")
+    print(f"\nInitiating restore jobs for {len(resource_snapshots)} snapshots")
+    print(f"VPC configurations available in regions: {list(vpc_configs_by_region.keys())}")
 
     restore_jobs = []
-
-    # Build VPC configs by region for region-specific resource restoration
-    vpc_configs_by_region = {}
-    for config in vpc_configs:
-        region = config.get("region", restore_region)
-        vpc_configs_by_region[region] = config
-
-    print(f"VPC configurations available in regions: {list(vpc_configs_by_region.keys())}")
 
     for resource_snapshot in resource_snapshots:
         resource_id = resource_snapshot["resourceId"]
@@ -321,20 +350,25 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                       f"security_groups: {len(security_group_ids)}, volumes: {len(volume_restore_params)}")
                 print(f"Volume encryption - using KMS key: {kms_key_arn}")
 
+                # Merge original tags with restore tags (restore tags take precedence)
+                original_tags = resource_snapshot.get("originalTags", {})
+                ec2_tags = {
+                    **original_tags,
+                    "Name": f"restored-{resource_name}",
+                    "RestoreSource": resource_snapshot.get("providerResourceId", ""),
+                    "ManagedBy": "EonBulkRecovery",
+                    "eon:restore": "true",
+                    "eon:snapshot_id": snapshot_id,
+                    "eon:snapshot_time": snapshot_point_in_time
+                }
+
                 destination_config = {
                     "awsEc2": {
                         "region": actual_region,
                         "instanceType": instance_type,
                         "subnetId": subnet_id,
                         "securityGroupIds": security_group_ids,
-                        "tags": {
-                            "Name": f"restored-{resource_name}",
-                            "RestoreSource": resource_snapshot.get("providerResourceId", ""),
-                            "ManagedBy": "EonBulkRecovery",
-                            "eon:restore": "true",
-                            "eon:snapshot_id": snapshot_id,
-                            "eon:snapshot_time": snapshot_point_in_time
-                        },
+                        "tags": ec2_tags,
                         "volumeRestoreParameters": volume_restore_params
                     }
                 }
@@ -381,6 +415,18 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 if not kms_key_arn:
                     raise ValueError(f"No KMS key available for region {actual_region}")
 
+                # Merge original tags with restore tags (restore tags take precedence)
+                original_tags = resource_snapshot.get("originalTags", {})
+                rds_tags = {
+                    **original_tags,
+                    "Name": f"restored-{resource_name}",
+                    "RestoreSource": resource_snapshot.get("providerResourceId", ""),
+                    "ManagedBy": "EonBulkRecovery",
+                    "eon:restore": "true",
+                    "eon:snapshot_id": snapshot_id,
+                    "eon:snapshot_time": snapshot_point_in_time
+                }
+
                 destination_config = {
                     "awsRds": {
                         "restoreRegion": actual_region,
@@ -389,14 +435,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                         "securityGroups": rds_security_groups,
                         "subnetGroup": rds_subnet_group_name,
                         "dbInstanceClass": db_instance_class,
-                        "tags": {
-                            "Name": f"restored-{resource_name}",
-                            "RestoreSource": resource_snapshot.get("providerResourceId", ""),
-                            "ManagedBy": "EonBulkRecovery",
-                            "eon:restore": "true",
-                            "eon:snapshot_id": snapshot_id,
-                            "eon:snapshot_time": snapshot_point_in_time
-                        }
+                        "tags": rds_tags
                     }
                 }
 
@@ -438,6 +477,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
                 print(f"S3 restore config - region: {actual_region}, bucket: {restored_bucket_name}")
 
+                # Get original tags
+                original_tags = resource_snapshot.get("originalTags", {})
+
                 # Create the S3 bucket first
                 create_s3_bucket(
                     bucket_name=restored_bucket_name,
@@ -446,6 +488,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     restore_account_id=restore_account_id,
                     snapshot_id=snapshot_id,
                     snapshot_point_in_time=snapshot_point_in_time,
+                    original_tags=original_tags,
                     cross_account_role_arn=cross_account_role_arn,
                     management_account_id=management_account_id
                 )
@@ -481,12 +524,22 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     raise ValueError(f"No VPC configurations available for restoring {resource_name}")
 
                 # Get allocated WCU for this table
-                allocated_wcu = dynamodb_wcu_allocation.get(resource_id, per_table_wcu_quota)
+                allocated_wcu = dynamodb_wcu_allocation.get(resource_id, 50)  # fallback to default
 
                 # Get KMS key for this region
                 kms_key_arn = kms_key_arns_by_region.get(actual_region)
                 if not kms_key_arn:
                     raise ValueError(f"No KMS key available for region {actual_region}")
+
+                # Merge original tags with restore tags (restore tags take precedence)
+                original_tags = resource_snapshot.get("originalTags", {})
+                dynamodb_tags = {
+                    **original_tags,
+                    "ManagedBy": "EonBulkRecovery",
+                    "eon:restore": "true",
+                    "eon:snapshot_id": snapshot_id,
+                    "eon:snapshot_time": snapshot_point_in_time
+                }
 
                 print(f"DynamoDB restore config - region: {actual_region}, table: restored-{resource_name}, WCU: {allocated_wcu:,}")
 
@@ -496,14 +549,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                         "encryptionKeyId": kms_key_arn,
                         "restoredName": f"restored-{resource_name}",
                         "writeCapacityUnits": allocated_wcu,
-                        "tags": {
-                            "Name": f"restored-{resource_name}",
-                            "RestoreSource": resource_snapshot.get("providerResourceId", ""),
-                            "ManagedBy": "EonBulkRecovery",
-                            "eon:restore": "true",
-                            "eon:snapshot_id": snapshot_id,
-                            "eon:snapshot_time": snapshot_point_in_time
-                        }
+                        "tags": dynamodb_tags
                     }
                 }
 

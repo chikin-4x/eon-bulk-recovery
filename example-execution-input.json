@@ -4,6 +4,7 @@
   "restoreAccountName": null,
   "restoreRegion": null,
   "snapshotDate": "2025-10-14",
+  "dynamodbRegionalWcuLimit": null,
   "crossAccountRoleArn": null,
   "vpcConfigs": [
     {

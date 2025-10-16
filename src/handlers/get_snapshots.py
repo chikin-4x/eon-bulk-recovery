@@ -79,6 +79,13 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             # Take the first snapshot (sorted by pointInTime DESC, so this is the latest)
             selected_snapshot = snapshots[0]
 
+            # Extract resource-specific properties from the snapshot
+            snapshot_resource = selected_snapshot.get("resource", {})
+            snapshot_properties = snapshot_resource.get("properties", {})
+
+            # Extract original tags from the snapshot resource
+            original_tags = snapshot_resource.get("tags", {})
+
             snapshot_data = {
                 "resourceId": resource_id,
                 "resourceName": resource_name,
@@ -88,14 +95,11 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 "vpc": resource.get("vpc"),
                 "subnets": resource.get("subnets", []),
                 "snapshotId": selected_snapshot["id"],
-                "snapshotPointInTime": selected_snapshot["pointInTime"]
+                "snapshotPointInTime": selected_snapshot["pointInTime"],
+                "originalTags": original_tags
             }
 
-            print(f"Resource {resource_name} region: {resource.get('region')}")
-
-            # Extract resource-specific properties from the snapshot
-            snapshot_resource = selected_snapshot.get("resource", {})
-            snapshot_properties = snapshot_resource.get("properties", {})
+            print(f"Resource {resource_name} region: {resource.get('region')}, tags: {len(original_tags)}")
 
             # For EC2 instances, extract configuration from snapshot (but NOT networking config)
             if resource_type == "AWS_EC2":
@@ -125,7 +129,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
             # For DynamoDB tables, extract table size from sourceStorage
             elif resource_type == "AWS_DYNAMO_DB":
-                source_storage = resource.get("sourceStorage", {})
+                source_storage = snapshot_resource.get("sourceStorage", {})
                 table_size_bytes = source_storage.get("sizeBytes", 0)
 
                 snapshot_data["tableSizeBytes"] = table_size_bytes
@@ -134,6 +138,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 table_size_gb = table_size_bytes / (1024 ** 3) if table_size_bytes > 0 else 0
 
                 print(f"Extracted DynamoDB table size: {table_size_gb:.2f} GB ({table_size_bytes:,} bytes)")
+
+                if table_size_bytes == 0:
+                    print(f"WARNING: No size information available for {resource_name}, will use equal WCU distribution")
 
             resource_snapshots.append(snapshot_data)
 

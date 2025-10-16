@@ -2,6 +2,7 @@
 
 import os
 import sys
+import json
 from typing import Dict, Any
 import boto3
 import requests
@@ -31,8 +32,6 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         roleArn: ARN of the created Eon restore role
         kmsKeyArnsByRegion: Dictionary mapping region to KMS key ARN
         rdsSubnetGroupsByRegion: Dictionary mapping region to RDS subnet group name
-        dynamodbAccountWcuQuota: Account-level DynamoDB WCU quota
-        dynamodbPerTableWcuQuota: Per-table DynamoDB WCU quota
     """
     restore_account_id = event["restoreAccountId"]
     restore_region = event.get("restoreRegion", "us-east-1")
@@ -51,20 +50,6 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     # Create AWS clients using the cross-account credentials
     cfn_client = boto3.client(
         "cloudformation",
-        region_name=restore_region,
-        aws_access_key_id=credentials["AccessKeyId"],
-        aws_secret_access_key=credentials["SecretAccessKey"],
-        aws_session_token=credentials["SessionToken"]
-    )
-    kms_client = boto3.client(
-        "kms",
-        region_name=restore_region,
-        aws_access_key_id=credentials["AccessKeyId"],
-        aws_secret_access_key=credentials["SecretAccessKey"],
-        aws_session_token=credentials["SessionToken"]
-    )
-    service_quotas_client = boto3.client(
-        "service-quotas",
         region_name=restore_region,
         aws_access_key_id=credentials["AccessKeyId"],
         aws_secret_access_key=credentials["SecretAccessKey"],
@@ -186,38 +171,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
             rds_subnet_groups_by_region[region] = subnet_group_name
 
-    # 3. Query DynamoDB WCU quotas
-    print("Querying DynamoDB write capacity unit (WCU) quotas")
-
-    # Default quotas if API calls fail
-    account_wcu_quota = 80000  # Default account-level WCU quota
-    per_table_wcu_quota = 40000  # Default per-table WCU quota
-
-    try:
-        # Query account-level WCU quota (L-F98FE922)
-        # This quota covers both RCU and WCU combined for provisioned mode
-        account_quota_response = service_quotas_client.get_service_quota(
-            ServiceCode='dynamodb',
-            QuotaCode='L-F98FE922'
-        )
-        # The quota value is for combined RCU+WCU, but we'll use it as WCU limit
-        account_wcu_quota = int(account_quota_response['Quota']['Value'])
-        print(f"Account-level DynamoDB WCU quota: {account_wcu_quota}")
-    except ClientError as e:
-        print(f"WARNING: Could not retrieve account-level WCU quota, using default {account_wcu_quota}: {str(e)}")
-
-    try:
-        # Query per-table WCU quota (L-1F83C0DA)
-        per_table_quota_response = service_quotas_client.get_service_quota(
-            ServiceCode='dynamodb',
-            QuotaCode='L-1F83C0DA'
-        )
-        per_table_wcu_quota = int(per_table_quota_response['Quota']['Value'])
-        print(f"Per-table DynamoDB WCU quota: {per_table_wcu_quota}")
-    except ClientError as e:
-        print(f"WARNING: Could not retrieve per-table WCU quota, using default {per_table_wcu_quota}: {str(e)}")
-
-    # 4. Create KMS keys for encryption in each region
+    # 3. Create KMS keys for encryption in each region
     kms_key_arns_by_region = {}
 
     # Collect all unique regions from VPC configs
@@ -233,7 +187,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     print(f"Creating KMS keys for encryption in {len(regions_to_setup)} region(s)")
 
     for region in regions_to_setup:
-        print(f"Creating KMS key in {region}")
+        print(f"Checking for existing KMS key in {region}")
 
         # Create KMS client for this region
         region_kms_client = boto3.client(
@@ -246,12 +200,101 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
         alias_name = f"alias/eon-restore-{restore_account_id}-{region}"
 
+        # First, check if a key with this alias already exists
+        existing_key_id = None
+        key_needs_replacement = False
+
+        try:
+            alias_response = region_kms_client.describe_key(KeyId=alias_name)
+            key_metadata = alias_response["KeyMetadata"]
+            kms_key_arn = key_metadata["Arn"]
+            existing_key_id = key_metadata["KeyId"]
+            key_state = key_metadata["KeyState"]
+
+            print(f"Found existing KMS key in {region}: {kms_key_arn}, state: {key_state}")
+
+            # Check if key is in usable state
+            # Key states: Enabled, Disabled, PendingDeletion, PendingImport, PendingReplicaDeletion, Unavailable
+            # Only "Enabled" keys can be used for encryption/decryption
+            if key_state == "Enabled":
+                print(f"Using existing enabled KMS key in {region}: {kms_key_arn}")
+                kms_key_arns_by_region[region] = kms_key_arn
+                continue  # Key exists and is enabled, move to next region
+            else:
+                print(f"WARNING: Existing KMS key is in state '{key_state}', will create new key and update alias")
+                key_needs_replacement = True
+
+        except ClientError as e:
+            if "NotFoundException" in str(e):
+                print(f"No existing KMS key found, creating new key in {region}")
+            else:
+                raise
+
+        # Key doesn't exist, create a new one with permissive policy
+        # Allow root account, Eon restore role, and AWS services to use the key
+        key_policy = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "Enable IAM User Permissions",
+                    "Effect": "Allow",
+                    "Principal": {"AWS": f"arn:aws:iam::{restore_account_id}:root"},
+                    "Action": "kms:*",
+                    "Resource": "*"
+                },
+                {
+                    "Sid": "Allow Eon Restore Role",
+                    "Effect": "Allow",
+                    "Principal": {"AWS": f"arn:aws:iam::{restore_account_id}:role/EonRestoreAccountRole"},
+                    "Action": [
+                        "kms:Decrypt",
+                        "kms:Encrypt",
+                        "kms:ReEncrypt*",
+                        "kms:GenerateDataKey*",
+                        "kms:CreateGrant",
+                        "kms:DescribeKey"
+                    ],
+                    "Resource": "*"
+                },
+                {
+                    "Sid": "Allow AWS Services",
+                    "Effect": "Allow",
+                    "Principal": {"Service": [
+                        "dynamodb.amazonaws.com",
+                        "rds.amazonaws.com",
+                        "ec2.amazonaws.com",
+                        "s3.amazonaws.com"
+                    ]},
+                    "Action": [
+                        "kms:Decrypt",
+                        "kms:Encrypt",
+                        "kms:ReEncrypt*",
+                        "kms:GenerateDataKey*",
+                        "kms:CreateGrant",
+                        "kms:DescribeKey"
+                    ],
+                    "Resource": "*",
+                    "Condition": {
+                        "StringEquals": {
+                            "kms:ViaService": [
+                                f"dynamodb.{region}.amazonaws.com",
+                                f"rds.{region}.amazonaws.com",
+                                f"ec2.{region}.amazonaws.com",
+                                f"s3.{region}.amazonaws.com"
+                            ]
+                        }
+                    }
+                }
+            ]
+        }
+
         try:
             key_response = region_kms_client.create_key(
                 Description=f"Eon bulk recovery encryption key for account {restore_account_id} in {region}",
                 KeyUsage="ENCRYPT_DECRYPT",
                 Origin="AWS_KMS",
                 MultiRegion=False,
+                Policy=json.dumps(key_policy),
                 Tags=[
                     {"TagKey": "ManagedBy", "TagValue": "EonBulkRecovery"},
                     {"TagKey": "RestoreAccountId", "TagValue": restore_account_id},
@@ -261,40 +304,35 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             kms_key_arn = key_response["KeyMetadata"]["Arn"]
             kms_key_id = key_response["KeyMetadata"]["KeyId"]
 
-            # Create alias for easier identification
-            try:
+            # Create or update alias for the new key
+            if key_needs_replacement:
+                # Update existing alias to point to new key
+                print(f"Updating alias {alias_name} to point to new key")
+                region_kms_client.update_alias(
+                    AliasName=alias_name,
+                    TargetKeyId=kms_key_id
+                )
+                print(f"Successfully replaced KMS key in {region}: {kms_key_arn}")
+            else:
+                # Create new alias
                 region_kms_client.create_alias(
                     AliasName=alias_name,
                     TargetKeyId=kms_key_id
                 )
                 print(f"Successfully created KMS key in {region}: {kms_key_arn}")
-            except ClientError as e:
-                if "AlreadyExistsException" in str(e):
-                    print(f"KMS alias {alias_name} already exists in {region}")
-                else:
-                    raise
 
             kms_key_arns_by_region[region] = kms_key_arn
 
         except ClientError as e:
-            # If we hit any error, try to find existing key by alias
-            try:
-                alias_response = region_kms_client.describe_key(KeyId=alias_name)
-                kms_key_arn = alias_response["KeyMetadata"]["Arn"]
-                print(f"Using existing KMS key in {region}: {kms_key_arn}")
-                kms_key_arns_by_region[region] = kms_key_arn
-            except:
-                print(f"ERROR: Failed to create or find KMS key in {region}: {str(e)}")
-                raise e
+            print(f"ERROR: Failed to create KMS key in {region}: {str(e)}")
+            raise
 
     result = {
         "roleArn": role_arn,
         "kmsKeyArnsByRegion": kms_key_arns_by_region,
         "restoreAccountId": restore_account_id,
         "restoreRegion": restore_region,
-        "rdsSubnetGroupsByRegion": rds_subnet_groups_by_region,
-        "dynamodbAccountWcuQuota": account_wcu_quota,
-        "dynamodbPerTableWcuQuota": per_table_wcu_quota
+        "rdsSubnetGroupsByRegion": rds_subnet_groups_by_region
     }
 
     print(f"Bootstrap complete. Created KMS keys in {len(kms_key_arns_by_region)} regions, RDS subnet groups in {len(rds_subnet_groups_by_region)} regions")
