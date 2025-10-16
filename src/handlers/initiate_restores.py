@@ -177,8 +177,10 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         eonRestoreAccountId: Eon-assigned restore account ID
         restoreAccountId: AWS account ID of restore account
         restoreRegion: Primary region for restores
-        kmsKeyArn: KMS key ARN for encryption
+        kmsKeyArnsByRegion: Dictionary mapping region to KMS key ARN for encryption
         rdsSubnetGroupsByRegion: Dictionary mapping region to RDS subnet group name
+        dynamodbAccountWcuQuota: Account-level DynamoDB WCU quota
+        dynamodbPerTableWcuQuota: Per-table DynamoDB WCU quota
         vpcConfigs: VPC configurations for the restore
         crossAccountRoleArn: ARN of cross-account role (optional)
 
@@ -190,7 +192,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     eon_restore_account_id = event["eonRestoreAccountId"]
     restore_account_id = event["restoreAccountId"]
     restore_region = event.get("restoreRegion", "us-east-1")
-    kms_key_arn = event.get("kmsKeyArn")
+    kms_key_arns_by_region = event.get("kmsKeyArnsByRegion", {})
     rds_subnet_groups_by_region = event.get("rdsSubnetGroupsByRegion", {})
     vpc_configs = event.get("vpcConfigs", [])
     cross_account_role_arn = event.get("crossAccountRoleArn")
@@ -200,6 +202,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     account_wcu_quota = event.get("dynamodbAccountWcuQuota", 80000)
     per_table_wcu_quota = event.get("dynamodbPerTableWcuQuota", 40000)
 
+    print(f"KMS keys available in regions: {list(kms_key_arns_by_region.keys())}")
     print(f"RDS subnet groups available in regions: {list(rds_subnet_groups_by_region.keys())}")
 
     # Calculate WCU allocation for DynamoDB tables
@@ -289,6 +292,11 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     print(f"ERROR: No volume configuration found for {resource_name}, cannot restore")
                     raise ValueError(f"No volumes found for EC2 instance {resource_name}")
 
+                # Get KMS key for this region
+                kms_key_arn = kms_key_arns_by_region.get(actual_region)
+                if not kms_key_arn:
+                    raise ValueError(f"No KMS key available for region {actual_region}")
+
                 # Build volume restore parameters from snapshot volume data
                 volume_restore_params = []
                 for vol in volumes:
@@ -303,7 +311,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
                     vol_param = {
                         "providerVolumeId": vol.get("providerVolumeId", "unknown"),
-                        "volumeEncryptionKeyId": kms_key_arn,  # Encrypt volume with KMS key from bootstrap
+                        "volumeEncryptionKeyId": kms_key_arn,  # Encrypt volume with region-specific KMS key
                         "volumeSettings": vol.get("volumeSettings", {}),
                         "tags": volume_tags
                     }
@@ -368,6 +376,11 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 security_groups_config = vpc_config.get("securityGroups", {})
                 rds_security_groups = security_groups_config.get("restoredRdsInstance", [])
 
+                # Get KMS key for this region
+                kms_key_arn = kms_key_arns_by_region.get(actual_region)
+                if not kms_key_arn:
+                    raise ValueError(f"No KMS key available for region {actual_region}")
+
                 destination_config = {
                     "awsRds": {
                         "restoreRegion": actual_region,
@@ -418,6 +431,11 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 hash_suffix = hashlib.md5(hash_input.encode()).hexdigest()[:8]
                 restored_bucket_name = f"restored-{original_bucket_name}-{hash_suffix}".lower()[:63]
 
+                # Get KMS key for this region
+                kms_key_arn = kms_key_arns_by_region.get(actual_region)
+                if not kms_key_arn:
+                    raise ValueError(f"No KMS key available for region {actual_region}")
+
                 print(f"S3 restore config - region: {actual_region}, bucket: {restored_bucket_name}")
 
                 # Create the S3 bucket first
@@ -464,6 +482,11 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
                 # Get allocated WCU for this table
                 allocated_wcu = dynamodb_wcu_allocation.get(resource_id, per_table_wcu_quota)
+
+                # Get KMS key for this region
+                kms_key_arn = kms_key_arns_by_region.get(actual_region)
+                if not kms_key_arn:
+                    raise ValueError(f"No KMS key available for region {actual_region}")
 
                 print(f"DynamoDB restore config - region: {actual_region}, table: restored-{resource_name}, WCU: {allocated_wcu:,}")
 

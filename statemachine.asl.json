@@ -174,7 +174,7 @@
         "eonRestoreAccountId.$": "$.connectResult.eonRestoreAccountId",
         "restoreAccountId.$": "$.restoreAccountId",
         "restoreRegion.$": "$.restoreRegion",
-        "kmsKeyArn.$": "$.bootstrapResult.kmsKeyArn",
+        "kmsKeyArnsByRegion.$": "$.bootstrapResult.kmsKeyArnsByRegion",
         "rdsSubnetGroupsByRegion.$": "$.bootstrapResult.rdsSubnetGroupsByRegion",
         "dynamodbAccountWcuQuota.$": "$.bootstrapResult.dynamodbAccountWcuQuota",
         "dynamodbPerTableWcuQuota.$": "$.bootstrapResult.dynamodbPerTableWcuQuota",
