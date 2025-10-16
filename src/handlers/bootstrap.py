@@ -61,6 +61,13 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         aws_secret_access_key=credentials["SecretAccessKey"],
         aws_session_token=credentials["SessionToken"]
     )
+    service_quotas_client = boto3.client(
+        "service-quotas",
+        region_name=restore_region,
+        aws_access_key_id=credentials["AccessKeyId"],
+        aws_secret_access_key=credentials["SecretAccessKey"],
+        aws_session_token=credentials["SessionToken"]
+    )
 
     # 1. Deploy IAM CloudFormation stack
     stack_name = f"eon-restore-account-{restore_account_id}"
@@ -177,7 +184,38 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
             rds_subnet_groups_by_region[region] = subnet_group_name
 
-    # 3. Create KMS key for encryption
+    # 3. Query DynamoDB WCU quotas
+    print("Querying DynamoDB write capacity unit (WCU) quotas")
+
+    # Default quotas if API calls fail
+    account_wcu_quota = 80000  # Default account-level WCU quota
+    per_table_wcu_quota = 40000  # Default per-table WCU quota
+
+    try:
+        # Query account-level WCU quota (L-F98FE922)
+        # This quota covers both RCU and WCU combined for provisioned mode
+        account_quota_response = service_quotas_client.get_service_quota(
+            ServiceCode='dynamodb',
+            QuotaCode='L-F98FE922'
+        )
+        # The quota value is for combined RCU+WCU, but we'll use it as WCU limit
+        account_wcu_quota = int(account_quota_response['Quota']['Value'])
+        print(f"Account-level DynamoDB WCU quota: {account_wcu_quota}")
+    except ClientError as e:
+        print(f"WARNING: Could not retrieve account-level WCU quota, using default {account_wcu_quota}: {str(e)}")
+
+    try:
+        # Query per-table WCU quota (L-1F83C0DA)
+        per_table_quota_response = service_quotas_client.get_service_quota(
+            ServiceCode='dynamodb',
+            QuotaCode='L-1F83C0DA'
+        )
+        per_table_wcu_quota = int(per_table_quota_response['Quota']['Value'])
+        print(f"Per-table DynamoDB WCU quota: {per_table_wcu_quota}")
+    except ClientError as e:
+        print(f"WARNING: Could not retrieve per-table WCU quota, using default {per_table_wcu_quota}: {str(e)}")
+
+    # 4. Create KMS key for encryption
     print("Creating KMS key for restored resources")
 
     try:
@@ -222,7 +260,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         "kmsKeyArn": kms_key_arn,
         "restoreAccountId": restore_account_id,
         "restoreRegion": restore_region,
-        "rdsSubnetGroupsByRegion": rds_subnet_groups_by_region
+        "rdsSubnetGroupsByRegion": rds_subnet_groups_by_region,
+        "dynamodbAccountWcuQuota": account_wcu_quota,
+        "dynamodbPerTableWcuQuota": per_table_wcu_quota
     }
 
     print(f"Bootstrap complete. Created RDS subnet groups in {len(rds_subnet_groups_by_region)} regions")

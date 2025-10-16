@@ -16,6 +16,89 @@ from lib.eon_client import EonClient
 from lib.aws_utils import get_eon_credentials, get_cross_account_credentials
 
 
+def calculate_dynamodb_wcu_allocation(
+    resource_snapshots: List[Dict[str, Any]],
+    account_wcu_quota: int,
+    per_table_wcu_quota: int,
+    utilization_percentage: float = 0.95
+) -> Dict[str, int]:
+    """
+    Calculate WCU allocation for DynamoDB tables based on their sizes.
+
+    Args:
+        resource_snapshots: List of resource snapshots
+        account_wcu_quota: Account-level WCU quota
+        per_table_wcu_quota: Per-table WCU quota
+        utilization_percentage: Percentage of account quota to use (default 95%)
+
+    Returns:
+        Dictionary mapping resource_id to allocated WCU
+    """
+    # Filter for DynamoDB tables and extract their sizes
+    dynamodb_tables = []
+    for snapshot in resource_snapshots:
+        if snapshot.get("resourceType") == "AWS_DYNAMO_DB":
+            table_size = snapshot.get("tableSizeBytes", 0)
+            dynamodb_tables.append({
+                "resourceId": snapshot["resourceId"],
+                "resourceName": snapshot["resourceName"],
+                "sizeBytes": table_size
+            })
+
+    if not dynamodb_tables:
+        return {}
+
+    # Calculate total size across all tables
+    total_size = sum(table["sizeBytes"] for table in dynamodb_tables)
+
+    if total_size == 0:
+        # If no size information, distribute equally
+        print("WARNING: No table size information available, distributing WCUs equally")
+        tables_count = len(dynamodb_tables)
+        available_wcu = int(account_wcu_quota * utilization_percentage)
+        wcu_per_table = min(available_wcu // tables_count, per_table_wcu_quota)
+
+        return {
+            table["resourceId"]: wcu_per_table
+            for table in dynamodb_tables
+        }
+
+    # Calculate available WCUs (95% of account quota)
+    available_wcu = int(account_wcu_quota * utilization_percentage)
+
+    print(f"DynamoDB WCU Allocation:")
+    print(f"  Account quota: {account_wcu_quota:,} WCU")
+    print(f"  Per-table quota: {per_table_wcu_quota:,} WCU")
+    print(f"  Available for allocation ({utilization_percentage*100}%): {available_wcu:,} WCU")
+    print(f"  Tables to restore: {len(dynamodb_tables)}")
+    print(f"  Total data size: {total_size / (1024**3):.2f} GB")
+
+    # Allocate WCUs proportionally based on table size
+    wcu_allocation = {}
+    allocated_total = 0
+
+    for table in dynamodb_tables:
+        # Calculate proportional WCU
+        proportion = table["sizeBytes"] / total_size
+        proportional_wcu = int(available_wcu * proportion)
+
+        # Cap at per-table quota
+        allocated_wcu = min(proportional_wcu, per_table_wcu_quota)
+
+        # Ensure minimum of 1 WCU
+        allocated_wcu = max(allocated_wcu, 1)
+
+        wcu_allocation[table["resourceId"]] = allocated_wcu
+        allocated_total += allocated_wcu
+
+        table_size_gb = table["sizeBytes"] / (1024**3)
+        print(f"  {table['resourceName']}: {table_size_gb:.2f} GB ({proportion*100:.1f}%) -> {allocated_wcu:,} WCU")
+
+    print(f"  Total allocated: {allocated_total:,} WCU ({allocated_total/account_wcu_quota*100:.1f}% of account quota)")
+
+    return wcu_allocation
+
+
 def create_s3_bucket(bucket_name: str, region: str, kms_key_id: str, restore_account_id: str, snapshot_id: str, snapshot_point_in_time: str, cross_account_role_arn: str = None, management_account_id: str = None) -> None:
     """Create an S3 bucket in the restore account."""
     # Get credentials for restore account
@@ -113,7 +196,18 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     cross_account_role_arn = event.get("crossAccountRoleArn")
     management_account_id = os.environ.get("MANAGEMENT_ACCOUNT_ID", "").strip() or None
 
+    # Get DynamoDB WCU quotas from bootstrap
+    account_wcu_quota = event.get("dynamodbAccountWcuQuota", 80000)
+    per_table_wcu_quota = event.get("dynamodbPerTableWcuQuota", 40000)
+
     print(f"RDS subnet groups available in regions: {list(rds_subnet_groups_by_region.keys())}")
+
+    # Calculate WCU allocation for DynamoDB tables
+    dynamodb_wcu_allocation = calculate_dynamodb_wcu_allocation(
+        resource_snapshots=resource_snapshots,
+        account_wcu_quota=account_wcu_quota,
+        per_table_wcu_quota=per_table_wcu_quota
+    )
 
     # Get Eon credentials
     credentials = get_eon_credentials()
@@ -368,14 +462,17 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 else:
                     raise ValueError(f"No VPC configurations available for restoring {resource_name}")
 
-                print(f"DynamoDB restore config - region: {actual_region}, table: restored-{resource_name}")
+                # Get allocated WCU for this table
+                allocated_wcu = dynamodb_wcu_allocation.get(resource_id, per_table_wcu_quota)
+
+                print(f"DynamoDB restore config - region: {actual_region}, table: restored-{resource_name}, WCU: {allocated_wcu:,}")
 
                 destination_config = {
                     "awsDynamodb": {
                         "restoreRegion": actual_region,
                         "encryptionKeyId": kms_key_arn,
                         "restoredName": f"restored-{resource_name}",
-                        "writeCapacityUnits": 40000,  # Default write capacity
+                        "writeCapacityUnits": allocated_wcu,
                         "tags": {
                             "Name": f"restored-{resource_name}",
                             "RestoreSource": resource_snapshot.get("providerResourceId", ""),

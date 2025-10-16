@@ -2,7 +2,7 @@
 
 import os
 import sys
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any
 from datetime import datetime, timedelta
 
 # Add parent directory to path for imports
@@ -122,6 +122,18 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             # For RDS instances, extract DB instance class
             elif resource_type == "AWS_RDS" and resource.get("dbInstanceClass"):
                 snapshot_data["dbInstanceClass"] = resource.get("dbInstanceClass")
+
+            # For DynamoDB tables, extract table size from sourceStorage
+            elif resource_type == "AWS_DYNAMO_DB":
+                source_storage = resource.get("sourceStorage", {})
+                table_size_bytes = source_storage.get("sizeBytes", 0)
+
+                snapshot_data["tableSizeBytes"] = table_size_bytes
+
+                # Convert bytes to GB for easier reading
+                table_size_gb = table_size_bytes / (1024 ** 3) if table_size_bytes > 0 else 0
+
+                print(f"Extracted DynamoDB table size: {table_size_gb:.2f} GB ({table_size_bytes:,} bytes)")
 
             resource_snapshots.append(snapshot_data)
 

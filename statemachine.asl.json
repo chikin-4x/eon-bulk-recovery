@@ -176,6 +176,8 @@
         "restoreRegion.$": "$.restoreRegion",
         "kmsKeyArn.$": "$.bootstrapResult.kmsKeyArn",
         "rdsSubnetGroupsByRegion.$": "$.bootstrapResult.rdsSubnetGroupsByRegion",
+        "dynamodbAccountWcuQuota.$": "$.bootstrapResult.dynamodbAccountWcuQuota",
+        "dynamodbPerTableWcuQuota.$": "$.bootstrapResult.dynamodbPerTableWcuQuota",
         "vpcConfigs.$": "$.vpcConfigs",
         "crossAccountRoleArn.$": "$.crossAccountRoleArn"
       },
