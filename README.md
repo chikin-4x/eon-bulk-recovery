@@ -323,9 +323,9 @@ Execute the Step Functions state machine with the following input.
 | `sourceAccountId` | Yes | AWS account ID containing the backed-up resources |
 | `restoreAccountId` | Yes | AWS account ID where resources will be restored |
 | `restoreAccountName` | No | Display name for the restore account in Eon. Set to `null` to auto-generate as `bulk-recovery-{restoreAccountId}` |
-| `restoreRegion` | Yes | Primary AWS region for restores (default: us-east-1) |
+| `restoreRegion` | No | **Region override**: Set to force ALL resources to restore to this specific region. Set to `null` to restore each resource to its original source region. If a target region (either forced or source) has no VPC configuration, falls back to any available region from vpcConfigs. |
 | `snapshotDate` | No | Specific date for snapshot selection (YYYY-MM-DD). If omitted, uses latest snapshots |
-| `vpcConfigs` | Yes | VPC connectivity configuration for Eon restore servers. Also used to create RDS subnet groups. Must include subnets for the restore region if restoring RDS instances. |
+| `vpcConfigs` | Yes | VPC connectivity configuration for Eon restore servers. Also used to create RDS subnet groups. Defines which regions are available for restoring resources. |
 | `crossAccountRoleArn` | Yes | ARN of a custom cross-account role for manual scenarios, or `null` for AWS Organizations/role chaining. When `null`, automatically uses OrganizationAccountAccessRole or EonBulkRecoveryChainRole depending on deployment configuration. |
 
 ### Via AWS Console

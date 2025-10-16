@@ -71,23 +71,28 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     # Extract relevant information for each resource
     resource_list = []
     for resource in filtered_resources:
+        # Extract resource properties first to get region from correct location
+        resource_properties = resource.get("resourceProperties", {})
+
         resource_data = {
             "id": resource.get("id"),
             "resourceName": resource.get("resourceName"),
             "resourceType": resource.get("resourceType"),
             "providerResourceId": resource.get("providerResourceId"),
-            "region": resource.get("region"),
+            "region": resource_properties.get("region") or resource.get("region"),
             "vpc": resource.get("vpc"),
             "subnets": resource.get("subnets", []),
             "latestSnapshotTime": resource.get("latestSnapshotTime")
         }
 
         # Extract instance type/class from resourceProperties for mirroring source configuration
-        resource_properties = resource.get("resourceProperties", {})
         if resource.get("resourceType") == "AWS_EC2":
             resource_data["instanceType"] = resource_properties.get("instanceType")
         elif resource.get("resourceType") == "AWS_RDS":
             resource_data["dbInstanceClass"] = resource_properties.get("dbInstanceClass")
+
+        # Debug: Log region extraction
+        print(f"Resource {resource_data['resourceName']} ({resource_data['resourceType']}) - region: {resource_data['region']}")
 
         resource_list.append(resource_data)
 

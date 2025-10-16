@@ -144,9 +144,15 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         resource_type = resource_snapshot["resourceType"]
         snapshot_id = resource_snapshot["snapshotId"]
         snapshot_point_in_time = resource_snapshot.get("snapshotPointInTime", "Unknown")
-        resource_region = resource_snapshot.get("region", restore_region)
+        source_region = resource_snapshot.get("region")
 
-        print(f"Initiating restore for {resource_type}: {resource_name}")
+        # Determine target region based on restoreRegion parameter:
+        # - If restoreRegion is set → force all resources to that region
+        # - If restoreRegion is null → restore to source region
+        # - If target region has no VPC config → fall back to any available region
+        target_region = restore_region if restore_region else source_region
+
+        print(f"Initiating restore for {resource_type}: {resource_name} (source region: {source_region}, target region: {target_region})")
 
         try:
             job_id = None
@@ -157,19 +163,20 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 instance_profile_name = resource_snapshot.get("instanceProfileName")
                 volumes = resource_snapshot.get("volumes", [])
 
-                # Get VPC config for the resource's region
-                vpc_config = vpc_configs_by_region.get(resource_region)
+                # Check if VPC config exists for target region, otherwise fall back to any available
+                vpc_config = None
+                actual_region = None
 
-                # If no VPC config for this region, try to find any available region
-                if not vpc_config:
-                    if vpc_configs_by_region:
-                        # Use any available region's VPC config
-                        fallback_region = list(vpc_configs_by_region.keys())[0]
-                        vpc_config = vpc_configs_by_region[fallback_region]
-                        print(f"WARNING: No VPC config for region {resource_region}, using {fallback_region} instead")
-                        resource_region = fallback_region
-                    else:
-                        raise ValueError(f"No VPC configurations available for restoring {resource_name}")
+                if target_region and target_region in vpc_configs_by_region:
+                    actual_region = target_region
+                    vpc_config = vpc_configs_by_region[target_region]
+                    print(f"Using VPC config for target region: {actual_region}")
+                elif vpc_configs_by_region:
+                    actual_region = list(vpc_configs_by_region.keys())[0]
+                    vpc_config = vpc_configs_by_region[actual_region]
+                    print(f"WARNING: No VPC config for target region {target_region}, falling back to: {actual_region}")
+                else:
+                    raise ValueError(f"No VPC configurations available for restoring {resource_name}")
 
                 # Extract subnets and security groups from the region-specific VPC config
                 subnets_per_az = vpc_config.get("subnetsPerAvailabilityZone", [])
@@ -178,7 +185,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 security_group_ids = security_groups.get("restoreServer", [])
 
                 if not available_subnets:
-                    raise ValueError(f"No subnets available in region {resource_region} for EC2 restore of {resource_name}")
+                    raise ValueError(f"No subnets available in region {actual_region} for EC2 restore of {resource_name}")
 
                 # Randomly select a subnet from available subnets in this region for load distribution
                 subnet_id = random.choice(available_subnets)
@@ -208,13 +215,13 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     }
                     volume_restore_params.append(vol_param)
 
-                print(f"EC2 restore config - region: {resource_region}, instance_type: {instance_type}, subnet: {subnet_id}, "
+                print(f"EC2 restore config - region: {actual_region}, instance_type: {instance_type}, subnet: {subnet_id}, "
                       f"security_groups: {len(security_group_ids)}, volumes: {len(volume_restore_params)}")
                 print(f"Volume encryption - using KMS key: {kms_key_arn}")
 
                 destination_config = {
                     "awsEc2": {
-                        "region": resource_region,
+                        "region": actual_region,
                         "instanceType": instance_type,
                         "subnetId": subnet_id,
                         "securityGroupIds": security_group_ids,
@@ -247,28 +254,29 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 # Get instance class from source resource, fallback to default
                 db_instance_class = resource_snapshot.get("dbInstanceClass", "db.t3.micro")
 
-                # Get RDS subnet group for the resource's region
-                rds_subnet_group_name = rds_subnet_groups_by_region.get(resource_region)
+                # Check if RDS subnet group exists for target region, otherwise fall back to any available
+                rds_subnet_group_name = None
+                actual_region = None
 
-                # If no subnet group for this region, try to find any available region
-                if not rds_subnet_group_name:
-                    if rds_subnet_groups_by_region:
-                        # Use any available region's subnet group
-                        fallback_region = list(rds_subnet_groups_by_region.keys())[0]
-                        rds_subnet_group_name = rds_subnet_groups_by_region[fallback_region]
-                        print(f"WARNING: No RDS subnet group for region {resource_region}, using {fallback_region} instead")
-                        resource_region = fallback_region
-                    else:
-                        raise ValueError(f"No RDS subnet groups available for restoring {resource_name}")
+                if target_region and target_region in rds_subnet_groups_by_region:
+                    actual_region = target_region
+                    rds_subnet_group_name = rds_subnet_groups_by_region[target_region]
+                    print(f"Using RDS subnet group for target region: {actual_region}")
+                elif rds_subnet_groups_by_region:
+                    actual_region = list(rds_subnet_groups_by_region.keys())[0]
+                    rds_subnet_group_name = rds_subnet_groups_by_region[actual_region]
+                    print(f"WARNING: No RDS subnet group for target region {target_region}, falling back to: {actual_region}")
+                else:
+                    raise ValueError(f"No RDS subnet groups available for restoring {resource_name}")
 
                 # Get security groups from the region-specific VPC config
-                vpc_config = vpc_configs_by_region.get(resource_region, {})
+                vpc_config = vpc_configs_by_region.get(actual_region, {})
                 security_groups_config = vpc_config.get("securityGroups", {})
                 rds_security_groups = security_groups_config.get("restoredRdsInstance", [])
 
                 destination_config = {
                     "awsRds": {
-                        "restoreRegion": resource_region,
+                        "restoreRegion": actual_region,
                         "encryptionKeyId": kms_key_arn,
                         "restoredName": f"restored-{resource_name}",
                         "securityGroups": rds_security_groups,
@@ -285,7 +293,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     }
                 }
 
-                print(f"RDS restore config - region: {resource_region}, subnet_group: {rds_subnet_group_name}, "
+                print(f"RDS restore config - region: {actual_region}, subnet_group: {rds_subnet_group_name}, "
                       f"security_groups: {len(rds_security_groups)}, instance_class: {db_instance_class}")
 
                 job_id = eon_client.restore_rds_instance(
@@ -296,16 +304,32 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 )
 
             elif resource_type == "AWS_S3":
+                # Check if VPC config exists for target region, otherwise fall back to any available
+                # VPC configs define which regions are allowed for restoration
+                actual_region = None
+
+                if target_region and target_region in vpc_configs_by_region:
+                    actual_region = target_region
+                    print(f"Restoring S3 to target region: {actual_region}")
+                elif vpc_configs_by_region:
+                    actual_region = list(vpc_configs_by_region.keys())[0]
+                    print(f"WARNING: No VPC config for target region {target_region}, falling back to: {actual_region}")
+                else:
+                    raise ValueError(f"No VPC configurations available for restoring {resource_name}")
+
                 # Create a bucket name (S3 bucket names must be globally unique)
+                # Include snapshot ID and region in the hash to ensure uniqueness across restores
                 original_bucket_name = resource_snapshot.get("providerResourceId", resource_name)
-                # Create unique bucket name by appending account ID and hash
-                hash_suffix = hashlib.md5(f"{original_bucket_name}-{restore_account_id}".encode()).hexdigest()[:8]
+                hash_input = f"{original_bucket_name}-{snapshot_id}-{actual_region}-{restore_account_id}"
+                hash_suffix = hashlib.md5(hash_input.encode()).hexdigest()[:8]
                 restored_bucket_name = f"restored-{original_bucket_name}-{hash_suffix}".lower()[:63]
+
+                print(f"S3 restore config - region: {actual_region}, bucket: {restored_bucket_name}")
 
                 # Create the S3 bucket first
                 create_s3_bucket(
                     bucket_name=restored_bucket_name,
-                    region=resource_region,
+                    region=actual_region,
                     kms_key_id=kms_key_arn,
                     restore_account_id=restore_account_id,
                     snapshot_id=snapshot_id,
@@ -316,6 +340,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
                 destination_config = {
                     "s3Bucket": {
+                        "region": actual_region,
                         "bucketName": restored_bucket_name,
                         "encryptionKeyId": kms_key_arn,
                         "prefix": ""
@@ -330,9 +355,24 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 )
 
             elif resource_type == "AWS_DYNAMO_DB":
+                # Check if VPC config exists for target region, otherwise fall back to any available
+                # VPC configs define which regions are allowed for restoration
+                actual_region = None
+
+                if target_region and target_region in vpc_configs_by_region:
+                    actual_region = target_region
+                    print(f"Restoring DynamoDB to target region: {actual_region}")
+                elif vpc_configs_by_region:
+                    actual_region = list(vpc_configs_by_region.keys())[0]
+                    print(f"WARNING: No VPC config for target region {target_region}, falling back to: {actual_region}")
+                else:
+                    raise ValueError(f"No VPC configurations available for restoring {resource_name}")
+
+                print(f"DynamoDB restore config - region: {actual_region}, table: restored-{resource_name}")
+
                 destination_config = {
                     "awsDynamodb": {
-                        "restoreRegion": resource_region,
+                        "restoreRegion": actual_region,
                         "encryptionKeyId": kms_key_arn,
                         "restoredName": f"restored-{resource_name}",
                         "writeCapacityUnits": 40000,  # Default write capacity

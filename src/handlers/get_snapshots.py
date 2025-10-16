@@ -91,6 +91,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 "snapshotPointInTime": selected_snapshot["pointInTime"]
             }
 
+            print(f"Resource {resource_name} region: {resource.get('region')}")
+
             # Extract resource-specific properties from the snapshot
             snapshot_resource = selected_snapshot.get("resource", {})
             snapshot_properties = snapshot_resource.get("properties", {})
