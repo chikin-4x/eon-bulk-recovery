@@ -213,14 +213,17 @@ def send_completion_notification(job_summary: Dict[str, Any], timeout: bool) -> 
         subject = "Eon Bulk Recovery - FAILURE"
         status_summary = f"❌ All {total_jobs} restore jobs failed"
 
-    # Format VPC configuration summary
-    vpc_summary = "None"
+    # Format VPC configuration summary (multi-region support)
+    vpc_summary_lines = []
     if vpc_configs:
-        vpc_config = vpc_configs[0] if isinstance(vpc_configs, list) else vpc_configs
-        vpc_id = vpc_config.get("vpc", "Unknown")
-        region = vpc_config.get("region", restore_region)
-        subnet_count = len(vpc_config.get("subnetsPerAvailabilityZone", []))
-        vpc_summary = f"{vpc_id} in {region} ({subnet_count} subnets)"
+        configs_list = vpc_configs if isinstance(vpc_configs, list) else [vpc_configs]
+        for vpc_config in configs_list:
+            vpc_id = vpc_config.get("vpc", "Unknown")
+            region = vpc_config.get("region", restore_region)
+            subnet_count = len(vpc_config.get("subnetsPerAvailabilityZone", []))
+            vpc_summary_lines.append(f"  - {vpc_id} in {region} ({subnet_count} subnets)")
+
+    vpc_summary = "\n".join(vpc_summary_lines) if vpc_summary_lines else "None"
 
     # Build detailed message
     message_lines = [
@@ -234,7 +237,8 @@ def send_completion_notification(job_summary: Dict[str, Any], timeout: bool) -> 
         f"Source Account: {source_account_id}",
         f"Restore Account: {restore_account_id}",
         f"Default Restore Region: {restore_region} (resources restored to original regions)",
-        f"VPC Configuration: {vpc_summary}",
+        f"VPC Configurations:",
+        vpc_summary,
         f"Total Duration: {duration_str}",
         "",
         "Job Summary:",

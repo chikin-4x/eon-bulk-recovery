@@ -3,6 +3,7 @@
 Automated AWS application for performing bulk recovery of cloud resources from Eon backups. This application orchestrates the complete recovery workflow from bootstrapping a restore account to monitoring restore job completion.
 
 ## Overview
+![Example workflow in AWS Step Functions](./screenshot_statemachine.png)
 
 This application uses AWS Step Functions to orchestrate a multi-step workflow that:
 
@@ -14,6 +15,8 @@ This application uses AWS Step Functions to orchestrate a multi-step workflow th
 6. **Initiates restore jobs** - Starts restore operations for all snapshots
 7. **Monitors jobs** - Polls job status until all restores complete
 8. **Sends notifications** - Publishes completion status to SNS
+
+![Example bulk restore notification](./screenshot_output.png)
 
 ## Supported Resource Types
 
