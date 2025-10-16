@@ -366,35 +366,6 @@ Receive email notifications when the bulk recovery completes with:
 - Individual job statuses
 - Job IDs for tracking in Eon
 
-## Architecture Details
-
-### Lambda Handlers
-
-The application uses a single Lambda function with multiple handlers:
-
-- **bootstrap.py** - Bootstrap restore account infrastructure
-- **connect_account.py** - Connect restore account to Eon
-- **configure_vpc.py** - Configure VPC connectivity
-- **list_resources.py** - List protected resources
-- **get_snapshots.py** - Retrieve snapshot IDs
-- **initiate_restores.py** - Start restore jobs
-- **monitor_jobs.py** - Monitor job status and send notifications
-
-### Error Handling
-
-The Step Functions workflow includes:
-- **Automatic retries** - Each step retries up to 3 times with exponential backoff
-- **Error catching** - Failures are caught and reported clearly
-- **Timeout protection** - Maximum monitoring iterations prevent infinite loops
-
-### Job Monitoring
-
-- Jobs are polled every **5 minutes**
-- Maximum monitoring time: **30 hours** (360 iterations)
-- SNS notification sent when all jobs complete or timeout occurs
-
-## Customization
-
 ### Instance Types
 
 EC2 and RDS restore operations automatically mirror the source resource's instance type. If the source instance type cannot be determined, the following defaults are used:
