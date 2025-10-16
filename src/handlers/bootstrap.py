@@ -29,7 +29,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     Returns:
         roleArn: ARN of the created Eon restore role
-        rdsSubnetGroupName: Name of the created RDS subnet group (if VPC configs provided)
+        rdsSubnetGroupsByRegion: Dictionary mapping region to RDS subnet group name
         kmsKeyArn: ARN of the created KMS key
     """
     restore_account_id = event["restoreAccountId"]
@@ -38,19 +38,6 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     cross_account_role_arn = event.get("crossAccountRoleArn")
     eon_account_id = os.environ["EON_ACCOUNT_ID"]
     management_account_id = os.environ.get("MANAGEMENT_ACCOUNT_ID", "").strip()
-
-    # Extract VPC ID and subnet IDs from vpcConfigs for the restore region
-    vpc_id = None
-    subnet_ids = []
-    if vpc_configs:
-        # Find the VPC config that matches the restore region
-        for config in vpc_configs:
-            if config.get("region") == restore_region:
-                vpc_id = config.get("vpc")
-                # Extract all subnet IDs from subnetsPerAvailabilityZone
-                subnets_per_az = config.get("subnetsPerAvailabilityZone", [])
-                subnet_ids = [subnet["subnetId"] for subnet in subnets_per_az if "subnetId" in subnet]
-                break
 
     # Get credentials for restore account with role chaining support
     credentials = get_cross_account_credentials(
@@ -62,13 +49,6 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     # Create AWS clients using the cross-account credentials
     cfn_client = boto3.client(
         "cloudformation",
-        region_name=restore_region,
-        aws_access_key_id=credentials["AccessKeyId"],
-        aws_secret_access_key=credentials["SecretAccessKey"],
-        aws_session_token=credentials["SessionToken"]
-    )
-    rds_client = boto3.client(
-        "rds",
         region_name=restore_region,
         aws_access_key_id=credentials["AccessKeyId"],
         aws_secret_access_key=credentials["SecretAccessKey"],
@@ -148,27 +128,54 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         else:
             raise
 
-    # 2. Create RDS subnet group (if VPC and subnets are provided)
-    rds_subnet_group_name = None
-    if vpc_id and subnet_ids:
-        rds_subnet_group_name = f"eon-restore-subnet-group-{restore_account_id}"
-        print(f"Creating RDS subnet group: {rds_subnet_group_name}")
+    # 2. Create RDS subnet groups for all regions in VPC configs
+    rds_subnet_groups_by_region = {}
 
-        try:
-            rds_client.create_db_subnet_group(
-                DBSubnetGroupName=rds_subnet_group_name,
-                DBSubnetGroupDescription=f"Eon bulk recovery subnet group for account {restore_account_id}",
-                SubnetIds=subnet_ids,
-                Tags=[
-                    {"Key": "ManagedBy", "Value": "EonBulkRecovery"},
-                    {"Key": "RestoreAccountId", "Value": restore_account_id}
-                ]
+    if vpc_configs:
+        print(f"Creating RDS subnet groups for {len(vpc_configs)} regions")
+
+        for config in vpc_configs:
+            region = config.get("region", restore_region)
+            vpc_id = config.get("vpc")
+            subnets_per_az = config.get("subnetsPerAvailabilityZone", [])
+            subnet_ids = [subnet["subnetId"] for subnet in subnets_per_az if "subnetId" in subnet]
+
+            if not subnet_ids:
+                print(f"WARNING: No subnets found for region {region}, skipping RDS subnet group creation")
+                continue
+
+            # Create RDS client for this region
+            rds_client = boto3.client(
+                "rds",
+                region_name=region,
+                aws_access_key_id=credentials["AccessKeyId"],
+                aws_secret_access_key=credentials["SecretAccessKey"],
+                aws_session_token=credentials["SessionToken"]
             )
-        except ClientError as e:
-            if "DBSubnetGroupAlreadyExists" in str(e):
-                print(f"RDS subnet group {rds_subnet_group_name} already exists")
-            else:
-                raise
+
+            subnet_group_name = f"eon-restore-{restore_account_id}-{region}"
+            print(f"Creating RDS subnet group in {region}: {subnet_group_name}")
+
+            try:
+                rds_client.create_db_subnet_group(
+                    DBSubnetGroupName=subnet_group_name,
+                    DBSubnetGroupDescription=f"Eon bulk recovery subnet group for account {restore_account_id} in {region}",
+                    SubnetIds=subnet_ids,
+                    Tags=[
+                        {"Key": "ManagedBy", "Value": "EonBulkRecovery"},
+                        {"Key": "RestoreAccountId", "Value": restore_account_id},
+                        {"Key": "Region", "Value": region}
+                    ]
+                )
+                print(f"Successfully created RDS subnet group in {region}")
+            except ClientError as e:
+                if "DBSubnetGroupAlreadyExists" in str(e):
+                    print(f"RDS subnet group {subnet_group_name} already exists in {region}")
+                else:
+                    print(f"ERROR: Failed to create RDS subnet group in {region}: {str(e)}")
+                    raise
+
+            rds_subnet_groups_by_region[region] = subnet_group_name
 
     # 3. Create KMS key for encryption
     print("Creating KMS key for restored resources")
@@ -214,10 +221,10 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         "roleArn": role_arn,
         "kmsKeyArn": kms_key_arn,
         "restoreAccountId": restore_account_id,
-        "restoreRegion": restore_region
+        "restoreRegion": restore_region,
+        "rdsSubnetGroupsByRegion": rds_subnet_groups_by_region
     }
 
-    if rds_subnet_group_name:
-        result["rdsSubnetGroupName"] = rds_subnet_group_name
+    print(f"Bootstrap complete. Created RDS subnet groups in {len(rds_subnet_groups_by_region)} regions")
 
     return result

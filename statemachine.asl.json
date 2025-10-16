@@ -175,7 +175,7 @@
         "restoreAccountId.$": "$.restoreAccountId",
         "restoreRegion.$": "$.restoreRegion",
         "kmsKeyArn.$": "$.bootstrapResult.kmsKeyArn",
-        "rdsSubnetGroupName.$": "$.bootstrapResult.rdsSubnetGroupName",
+        "rdsSubnetGroupsByRegion.$": "$.bootstrapResult.rdsSubnetGroupsByRegion",
         "vpcConfigs.$": "$.vpcConfigs",
         "crossAccountRoleArn.$": "$.crossAccountRoleArn"
       },
@@ -224,7 +224,12 @@
       "Parameters": {
         "step": "monitor_jobs",
         "restoreJobs.$": "$.monitoringState.restoreJobs",
-        "iteration.$": "$.monitoringState.iteration"
+        "iteration.$": "$.monitoringState.iteration",
+        "sourceAccountId.$": "$.monitoringState.sourceAccountId",
+        "restoreAccountId.$": "$.monitoringState.restoreAccountId",
+        "restoreRegion.$": "$.monitoringState.restoreRegion",
+        "vpcConfigs.$": "$.monitoringState.vpcConfigs",
+        "startTime.$": "$.monitoringState.startTime"
       },
       "ResultPath": "$.monitoringState",
       "Retry": [

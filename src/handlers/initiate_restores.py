@@ -93,7 +93,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         restoreAccountId: AWS account ID of restore account
         restoreRegion: Primary region for restores
         kmsKeyArn: KMS key ARN for encryption
-        rdsSubnetGroupName: RDS subnet group name (if applicable)
+        rdsSubnetGroupsByRegion: Dictionary mapping region to RDS subnet group name
         vpcConfigs: VPC configurations for the restore
         crossAccountRoleArn: ARN of cross-account role (optional)
 
@@ -106,10 +106,12 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     restore_account_id = event["restoreAccountId"]
     restore_region = event.get("restoreRegion", "us-east-1")
     kms_key_arn = event.get("kmsKeyArn")
-    rds_subnet_group_name = event.get("rdsSubnetGroupName")
+    rds_subnet_groups_by_region = event.get("rdsSubnetGroupsByRegion", {})
     vpc_configs = event.get("vpcConfigs", [])
     cross_account_role_arn = event.get("crossAccountRoleArn")
     management_account_id = os.environ.get("MANAGEMENT_ACCOUNT_ID", "").strip() or None
+
+    print(f"RDS subnet groups available in regions: {list(rds_subnet_groups_by_region.keys())}")
 
     # Get Eon credentials
     credentials = get_eon_credentials()
@@ -126,20 +128,13 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     restore_jobs = []
 
-    # Get default VPC config if available
-    default_vpc_config = vpc_configs[0] if vpc_configs else {}
-    available_subnets = []
-    default_security_groups = []
+    # Build VPC configs by region for region-specific resource restoration
+    vpc_configs_by_region = {}
+    for config in vpc_configs:
+        region = config.get("region", restore_region)
+        vpc_configs_by_region[region] = config
 
-    if default_vpc_config:
-        subnets_per_az = default_vpc_config.get("subnetsPerAvailabilityZone", [])
-        # Collect all available subnets for random selection
-        available_subnets = [subnet.get("subnetId") for subnet in subnets_per_az if subnet.get("subnetId")]
-
-        security_groups = default_vpc_config.get("securityGroups", {})
-        default_security_groups = security_groups.get("restoreServer", [])
-
-    print(f"Available subnets for EC2 restores: {len(available_subnets)}")
+    print(f"VPC configurations available in regions: {list(vpc_configs_by_region.keys())}")
 
     for resource_snapshot in resource_snapshots:
         resource_id = resource_snapshot["resourceId"]
@@ -159,13 +154,31 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 instance_profile_name = resource_snapshot.get("instanceProfileName")
                 volumes = resource_snapshot.get("volumes", [])
 
-                # Networking config comes from VPC configuration (not from snapshot)
-                # Randomly select a subnet from available subnets for load distribution
-                subnet_id = random.choice(available_subnets) if available_subnets else None
-                security_group_ids = default_security_groups
+                # Get VPC config for the resource's region
+                vpc_config = vpc_configs_by_region.get(resource_region)
 
-                if not subnet_id:
-                    raise ValueError(f"No subnets available for EC2 restore of {resource_name}")
+                # If no VPC config for this region, try to find any available region
+                if not vpc_config:
+                    if vpc_configs_by_region:
+                        # Use any available region's VPC config
+                        fallback_region = list(vpc_configs_by_region.keys())[0]
+                        vpc_config = vpc_configs_by_region[fallback_region]
+                        print(f"WARNING: No VPC config for region {resource_region}, using {fallback_region} instead")
+                        resource_region = fallback_region
+                    else:
+                        raise ValueError(f"No VPC configurations available for restoring {resource_name}")
+
+                # Extract subnets and security groups from the region-specific VPC config
+                subnets_per_az = vpc_config.get("subnetsPerAvailabilityZone", [])
+                available_subnets = [subnet.get("subnetId") for subnet in subnets_per_az if subnet.get("subnetId")]
+                security_groups = vpc_config.get("securityGroups", {})
+                security_group_ids = security_groups.get("restoreServer", [])
+
+                if not available_subnets:
+                    raise ValueError(f"No subnets available in region {resource_region} for EC2 restore of {resource_name}")
+
+                # Randomly select a subnet from available subnets in this region for load distribution
+                subnet_id = random.choice(available_subnets)
 
                 # Volumes must be present - no volumes means no data to restore
                 if not volumes:
@@ -187,7 +200,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     }
                     volume_restore_params.append(vol_param)
 
-                print(f"EC2 restore config - instance_type: {instance_type}, subnet: {subnet_id}, "
+                print(f"EC2 restore config - region: {resource_region}, instance_type: {instance_type}, subnet: {subnet_id}, "
                       f"security_groups: {len(security_group_ids)}, volumes: {len(volume_restore_params)}")
                 print(f"Volume encryption - using KMS key: {kms_key_arn}")
 
@@ -224,12 +237,31 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 # Get instance class from source resource, fallback to default
                 db_instance_class = resource_snapshot.get("dbInstanceClass", "db.t3.micro")
 
+                # Get RDS subnet group for the resource's region
+                rds_subnet_group_name = rds_subnet_groups_by_region.get(resource_region)
+
+                # If no subnet group for this region, try to find any available region
+                if not rds_subnet_group_name:
+                    if rds_subnet_groups_by_region:
+                        # Use any available region's subnet group
+                        fallback_region = list(rds_subnet_groups_by_region.keys())[0]
+                        rds_subnet_group_name = rds_subnet_groups_by_region[fallback_region]
+                        print(f"WARNING: No RDS subnet group for region {resource_region}, using {fallback_region} instead")
+                        resource_region = fallback_region
+                    else:
+                        raise ValueError(f"No RDS subnet groups available for restoring {resource_name}")
+
+                # Get security groups from the region-specific VPC config
+                vpc_config = vpc_configs_by_region.get(resource_region, {})
+                security_groups_config = vpc_config.get("securityGroups", {})
+                rds_security_groups = security_groups_config.get("restoredRdsInstance", [])
+
                 destination_config = {
                     "awsRds": {
                         "restoreRegion": resource_region,
                         "encryptionKeyId": kms_key_arn,
                         "restoredName": f"restored-{resource_name}",
-                        "securityGroups": default_security_groups,
+                        "securityGroups": rds_security_groups,
                         "subnetGroup": rds_subnet_group_name,
                         "dbInstanceClass": db_instance_class,
                         "tags": {
@@ -240,6 +272,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                         }
                     }
                 }
+
+                print(f"RDS restore config - region: {resource_region}, subnet_group: {rds_subnet_group_name}, "
+                      f"security_groups: {len(rds_security_groups)}, instance_class: {db_instance_class}")
 
                 job_id = eon_client.restore_rds_instance(
                     resource_id=resource_id,
