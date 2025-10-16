@@ -16,7 +16,7 @@ from lib.eon_client import EonClient
 from lib.aws_utils import get_eon_credentials, get_cross_account_credentials
 
 
-def create_s3_bucket(bucket_name: str, region: str, kms_key_id: str, restore_account_id: str, cross_account_role_arn: str = None, management_account_id: str = None) -> None:
+def create_s3_bucket(bucket_name: str, region: str, kms_key_id: str, restore_account_id: str, snapshot_id: str, snapshot_point_in_time: str, cross_account_role_arn: str = None, management_account_id: str = None) -> None:
     """Create an S3 bucket in the restore account."""
     # Get credentials for restore account
     credentials = None
@@ -69,7 +69,9 @@ def create_s3_bucket(bucket_name: str, region: str, kms_key_id: str, restore_acc
                 "TagSet": [
                     {"Key": "ManagedBy", "Value": "EonBulkRecovery"},
                     {"Key": "Purpose", "Value": "RestoreDestination"},
-                    {"Key": "eon:restore", "Value": "true"}
+                    {"Key": "eon:restore", "Value": "true"},
+                    {"Key": "eon:snapshot_id", "Value": snapshot_id},
+                    {"Key": "eon:snapshot_time", "Value": snapshot_point_in_time}
                 ]
             }
         )
@@ -141,6 +143,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         resource_name = resource_snapshot["resourceName"]
         resource_type = resource_snapshot["resourceType"]
         snapshot_id = resource_snapshot["snapshotId"]
+        snapshot_point_in_time = resource_snapshot.get("snapshotPointInTime", "Unknown")
         resource_region = resource_snapshot.get("region", restore_region)
 
         print(f"Initiating restore for {resource_type}: {resource_name}")
@@ -188,9 +191,14 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 # Build volume restore parameters from snapshot volume data
                 volume_restore_params = []
                 for vol in volumes:
-                    # Preserve original volume tags and add eon:restore tag
+                    # Preserve original volume tags and add eon tags
                     original_tags = vol.get("tags", {})
-                    volume_tags = {**original_tags, "eon:restore": "true"}
+                    volume_tags = {
+                        **original_tags,
+                        "eon:restore": "true",
+                        "eon:snapshot_id": snapshot_id,
+                        "eon:snapshot_time": snapshot_point_in_time
+                    }
 
                     vol_param = {
                         "providerVolumeId": vol.get("providerVolumeId", "unknown"),
@@ -214,7 +222,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                             "Name": f"restored-{resource_name}",
                             "RestoreSource": resource_snapshot.get("providerResourceId", ""),
                             "ManagedBy": "EonBulkRecovery",
-                            "eon:restore": "true"
+                            "eon:restore": "true",
+                            "eon:snapshot_id": snapshot_id,
+                            "eon:snapshot_time": snapshot_point_in_time
                         },
                         "volumeRestoreParameters": volume_restore_params
                     }
@@ -268,7 +278,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                             "Name": f"restored-{resource_name}",
                             "RestoreSource": resource_snapshot.get("providerResourceId", ""),
                             "ManagedBy": "EonBulkRecovery",
-                            "eon:restore": "true"
+                            "eon:restore": "true",
+                            "eon:snapshot_id": snapshot_id,
+                            "eon:snapshot_time": snapshot_point_in_time
                         }
                     }
                 }
@@ -296,6 +308,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     region=resource_region,
                     kms_key_id=kms_key_arn,
                     restore_account_id=restore_account_id,
+                    snapshot_id=snapshot_id,
+                    snapshot_point_in_time=snapshot_point_in_time,
                     cross_account_role_arn=cross_account_role_arn,
                     management_account_id=management_account_id
                 )
@@ -326,7 +340,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                             "Name": f"restored-{resource_name}",
                             "RestoreSource": resource_snapshot.get("providerResourceId", ""),
                             "ManagedBy": "EonBulkRecovery",
-                            "eon:restore": "true"
+                            "eon:restore": "true",
+                            "eon:snapshot_id": snapshot_id,
+                            "eon:snapshot_time": snapshot_point_in_time
                         }
                     }
                 }
