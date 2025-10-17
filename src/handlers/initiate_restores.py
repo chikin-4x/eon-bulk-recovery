@@ -104,25 +104,19 @@ def calculate_dynamodb_wcu_allocation_by_region(
     return wcu_allocation
 
 
-def create_s3_bucket(bucket_name: str, region: str, kms_key_id: str, restore_account_id: str, snapshot_id: str, snapshot_point_in_time: str, original_tags: Dict[str, str] = None, cross_account_role_arn: str = None, management_account_id: str = None) -> None:
+def create_s3_bucket(bucket_name: str, region: str, kms_key_id: str, restore_account_id: str, snapshot_id: str, snapshot_point_in_time: str, original_tags: Dict[str, str] = None, restore_account_credentials: Dict[str, str] = None) -> None:
     """Create an S3 bucket in the restore account."""
     if original_tags is None:
         original_tags = {}
-    # Get credentials for restore account
-    credentials = None
-    try:
-        credentials = get_cross_account_credentials(restore_account_id, cross_account_role_arn, management_account_id)
-    except (ValueError, ClientError) as e:
-        print(f"Could not get cross-account credentials for S3 bucket creation: {str(e)}")
-        print("Falling back to Lambda execution role credentials")
 
-    if credentials:
+    # Use provided credentials or fall back to Lambda execution role
+    if restore_account_credentials:
         s3_client = boto3.client(
             "s3",
             region_name=region,
-            aws_access_key_id=credentials["AccessKeyId"],
-            aws_secret_access_key=credentials["SecretAccessKey"],
-            aws_session_token=credentials["SessionToken"]
+            aws_access_key_id=restore_account_credentials["AccessKeyId"],
+            aws_secret_access_key=restore_account_credentials["SecretAccessKey"],
+            aws_session_token=restore_account_credentials["SessionToken"]
         )
     else:
         s3_client = boto3.client("s3", region_name=region)
@@ -213,6 +207,19 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     print(f"KMS keys available in regions: {list(kms_key_arns_by_region.keys())}")
     print(f"RDS subnet groups available in regions: {list(rds_subnet_groups_by_region.keys())}")
     print(f"DynamoDB regional WCU limit: {dynamodb_regional_wcu_limit:,}")
+
+    # Get credentials for restore account once (reused throughout)
+    restore_account_credentials = None
+    try:
+        restore_account_credentials = get_cross_account_credentials(
+            restore_account_id=restore_account_id,
+            cross_account_role_arn=cross_account_role_arn,
+            management_account_id=management_account_id
+        )
+        print(f"Successfully obtained cross-account credentials for restore account {restore_account_id}")
+    except Exception as e:
+        print(f"WARNING: Could not obtain cross-account credentials: {str(e)}")
+        print("Will attempt operations with Lambda execution role")
 
     # Build VPC configs by region for region-specific resource restoration
     vpc_configs_by_region = {}
@@ -306,15 +313,70 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
                 # Extract subnets and security groups from the region-specific VPC config
                 subnets_per_az = vpc_config.get("subnetsPerAvailabilityZone", [])
-                available_subnets = [subnet.get("subnetId") for subnet in subnets_per_az if subnet.get("subnetId")]
                 security_groups = vpc_config.get("securityGroups", {})
                 security_group_ids = security_groups.get("restoreServer", [])
 
-                if not available_subnets:
+                if not subnets_per_az:
                     raise ValueError(f"No subnets available in region {actual_region} for EC2 restore of {resource_name}")
 
-                # Randomly select a subnet from available subnets in this region for load distribution
-                subnet_id = random.choice(available_subnets)
+                # Create EC2 client for restore account to check instance type availability
+                if restore_account_credentials:
+                    ec2_client = boto3.client(
+                        "ec2",
+                        region_name=actual_region,
+                        aws_access_key_id=restore_account_credentials["AccessKeyId"],
+                        aws_secret_access_key=restore_account_credentials["SecretAccessKey"],
+                        aws_session_token=restore_account_credentials["SessionToken"]
+                    )
+                else:
+                    # Fallback to Lambda execution role if no cross-account credentials
+                    ec2_client = boto3.client("ec2", region_name=actual_region)
+
+                # Check which AZs support this instance type
+                print(f"Checking availability of instance type {instance_type} in region {actual_region}")
+                try:
+                    offerings_response = ec2_client.describe_instance_type_offerings(
+                        LocationType='availability-zone',
+                        Filters=[
+                            {'Name': 'instance-type', 'Values': [instance_type]}
+                        ]
+                    )
+
+                    available_azs = {offering['Location'] for offering in offerings_response.get('InstanceTypeOfferings', [])}
+                    print(f"Instance type {instance_type} is available in AZs: {sorted(available_azs)}")
+
+                except ClientError as e:
+                    print(f"WARNING: Could not check instance type availability: {str(e)}")
+                    # If we can't check, proceed with random selection
+                    available_azs = None
+
+                # Try to find a subnet in an AZ that supports the instance type
+                subnet_id = None
+                if available_azs:
+                    # Filter subnets to only those in AZs that support the instance type
+                    compatible_subnets = [
+                        subnet for subnet in subnets_per_az
+                        if subnet.get("availabilityZone") in available_azs and subnet.get("subnetId")
+                    ]
+
+                    if compatible_subnets:
+                        selected_subnet = random.choice(compatible_subnets)
+                        subnet_id = selected_subnet["subnetId"]
+                        selected_az = selected_subnet["availabilityZone"]
+                        print(f"Selected subnet {subnet_id} in AZ {selected_az} (supports {instance_type})")
+                    else:
+                        # No compatible subnets found
+                        configured_azs = {subnet.get("availabilityZone") for subnet in subnets_per_az if subnet.get("availabilityZone")}
+                        raise ValueError(
+                            f"Instance type {instance_type} is not available in any configured availability zones. "
+                            f"Instance type available in: {sorted(available_azs)}, "
+                            f"Configured subnets in: {sorted(configured_azs)}"
+                        )
+                else:
+                    # Couldn't check availability, use random selection as fallback
+                    available_subnets = [subnet.get("subnetId") for subnet in subnets_per_az if subnet.get("subnetId")]
+                    subnet_id = random.choice(available_subnets)
+                    print(f"Selected subnet {subnet_id} (could not verify instance type availability)")
 
                 # Volumes must be present - no volumes means no data to restore
                 if not volumes:
@@ -489,8 +551,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     snapshot_id=snapshot_id,
                     snapshot_point_in_time=snapshot_point_in_time,
                     original_tags=original_tags,
-                    cross_account_role_arn=cross_account_role_arn,
-                    management_account_id=management_account_id
+                    restore_account_credentials=restore_account_credentials
                 )
 
                 destination_config = {
