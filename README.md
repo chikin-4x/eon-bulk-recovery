@@ -95,6 +95,7 @@ aws stepfunctions start-execution \
   "snapshotDate": null,
   "dynamodbRegionalWcuLimit": 40000,
   "crossAccountRoleArn": null,
+  "excludeEC2TagKeys": [],
   "vpcConfigs": [{
     "region": "us-east-1",
     "vpc": "vpc-xxx",
@@ -110,6 +111,17 @@ aws stepfunctions start-execution \
 }
 ```
 
+**Example with tag exclusion:**
+```json
+{
+  "sourceAccountId": "333333333333",
+  "restoreAccountId": "222222222222",
+  "excludeEC2TagKeys": ["aws:autoscaling:groupName", "kubernetes.io/cluster/my-cluster"],
+  "vpcConfigs": [...]
+}
+```
+Note: Tag keys matching `excludeEC2TagKeys` will be filtered from restored EC2 instances and their volumes.
+
 **Parameter reference:**
 
 | Parameter | Required | Description |
@@ -122,6 +134,7 @@ aws stepfunctions start-execution \
 | `vpcConfigs` | Yes | Network configuration per region (creates KMS keys and RDS subnet groups automatically) |
 | `crossAccountRoleArn` | No | Custom role ARN or null for Organizations |
 | `restoreAccountName` | No | Display name in Eon (null = auto-generate) |
+| `excludeEC2TagKeys` | No | List of tag keys to exclude from restored EC2 instances and volumes (default: []) |
 
 ## How It Works
 

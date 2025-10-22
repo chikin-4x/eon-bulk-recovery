@@ -188,6 +188,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         dynamodbRegionalWcuLimit: Regional WCU limit for DynamoDB (default 40000)
         vpcConfigs: VPC configurations for the restore
         crossAccountRoleArn: ARN of cross-account role (optional)
+        excludeEC2TagKeys: List of tag keys to exclude from EC2 instance tags (optional)
 
     Returns:
         restoreJobs: List of initiated restore jobs with job IDs
@@ -203,10 +204,13 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     vpc_configs = event.get("vpcConfigs", [])
     cross_account_role_arn = event.get("crossAccountRoleArn")
     management_account_id = os.environ.get("MANAGEMENT_ACCOUNT_ID", "").strip() or None
+    exclude_ec2_tag_keys = event.get("excludeEC2TagKeys", [])
 
     print(f"KMS keys available in regions: {list(kms_key_arns_by_region.keys())}")
     print(f"RDS subnet groups available in regions: {list(rds_subnet_groups_by_region.keys())}")
     print(f"DynamoDB regional WCU limit: {dynamodb_regional_wcu_limit:,}")
+    if exclude_ec2_tag_keys:
+        print(f"EC2 tag keys to exclude: {exclude_ec2_tag_keys}")
 
     # Get credentials for restore account once (reused throughout)
     restore_account_credentials = None
@@ -391,10 +395,16 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 # Build volume restore parameters from snapshot volume data
                 volume_restore_params = []
                 for vol in volumes:
-                    # Preserve original volume tags and add eon tags
+                    # Get original volume tags and filter out excluded tag keys
                     original_tags = vol.get("tags", {})
+                    filtered_volume_tags = {
+                        k: v for k, v in original_tags.items()
+                        if k not in exclude_ec2_tag_keys
+                    }
+
+                    # Merge filtered original tags with restore tags
                     volume_tags = {
-                        **original_tags,
+                        **filtered_volume_tags,
                         "eon:restore": "true",
                         "eon:snapshot_id": snapshot_id,
                         "eon:snapshot_time": snapshot_point_in_time
@@ -412,10 +422,22 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                       f"security_groups: {len(security_group_ids)}, volumes: {len(volume_restore_params)}")
                 print(f"Volume encryption - using KMS key: {kms_key_arn}")
 
-                # Merge original tags with restore tags (restore tags take precedence)
+                # Get original tags and filter out excluded tag keys
                 original_tags = resource_snapshot.get("originalTags", {})
+                filtered_original_tags = {
+                    k: v for k, v in original_tags.items()
+                    if k not in exclude_ec2_tag_keys
+                }
+
+                # Log excluded tags if any were filtered
+                if exclude_ec2_tag_keys and original_tags:
+                    excluded_tags = [k for k in original_tags.keys() if k in exclude_ec2_tag_keys]
+                    if excluded_tags:
+                        print(f"Excluding EC2 tags for {resource_name}: {excluded_tags}")
+
+                # Merge filtered original tags with restore tags (restore tags take precedence)
                 ec2_tags = {
-                    **original_tags,
+                    **filtered_original_tags,
                     "Name": f"restored-{resource_name}",
                     "RestoreSource": resource_snapshot.get("providerResourceId", ""),
                     "ManagedBy": "EonBulkRecovery",

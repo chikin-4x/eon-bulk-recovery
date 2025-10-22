@@ -231,7 +231,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 raise
 
         # Key doesn't exist, create a new one with permissive policy
-        # Allow root account, Eon restore role, and AWS services to use the key
+        # Allow root account, Eon restore roles, and AWS services to use the key
         key_policy = {
             "Version": "2012-10-17",
             "Statement": [
@@ -243,9 +243,12 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     "Resource": "*"
                 },
                 {
-                    "Sid": "Allow Eon Restore Role",
+                    "Sid": "Allow Eon Restore Roles",
                     "Effect": "Allow",
-                    "Principal": {"AWS": f"arn:aws:iam::{restore_account_id}:role/EonRestoreAccountRole"},
+                    "Principal": {"AWS": [
+                        f"arn:aws:iam::{restore_account_id}:role/EonRestoreAccountRole",
+                        f"arn:aws:iam::{restore_account_id}:role/EonRestoreNodeRole"
+                    ]},
                     "Action": [
                         "kms:Decrypt",
                         "kms:Encrypt",

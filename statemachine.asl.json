@@ -178,7 +178,8 @@
         "rdsSubnetGroupsByRegion.$": "$.bootstrapResult.rdsSubnetGroupsByRegion",
         "dynamodbRegionalWcuLimit.$": "$.dynamodbRegionalWcuLimit",
         "vpcConfigs.$": "$.vpcConfigs",
-        "crossAccountRoleArn.$": "$.crossAccountRoleArn"
+        "crossAccountRoleArn.$": "$.crossAccountRoleArn",
+        "excludeEC2TagKeys.$": "$.excludeEC2TagKeys"
       },
       "ResultPath": "$.restoreJobsResult",
       "Retry": [
