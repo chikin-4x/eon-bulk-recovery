@@ -6,6 +6,7 @@
   "snapshotDate": "2025-10-14",
   "dynamodbRegionalWcuLimit": null,
   "crossAccountRoleArn": null,
+  "excludeEC2TagKeys": [],
   "vpcConfigs": [
     {
       "region": "us-east-1",
