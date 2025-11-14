@@ -72,7 +72,10 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         if not job_id:
             failed_count += 1
             job_statuses.append({
-                **job,
+                "jobId": None,
+                "resourceId": job.get("resourceId"),
+                "resourceName": job.get("resourceName"),
+                "resourceType": job.get("resourceType"),
                 "currentStatus": "FAILED_TO_INITIATE"
             })
             continue
@@ -88,6 +91,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
             job_status_record = {
                 "jobId": job_id,
+                "resourceId": job.get("resourceId"),
                 "resourceName": job.get("resourceName"),
                 "resourceType": job.get("resourceType"),
                 "currentStatus": status,
@@ -122,6 +126,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             running_count += 1
             job_statuses.append({
                 "jobId": job_id,
+                "resourceId": job.get("resourceId"),
                 "resourceName": job.get("resourceName"),
                 "resourceType": job.get("resourceType"),
                 "currentStatus": "ERROR_CHECKING_STATUS",
@@ -172,6 +177,9 @@ def send_completion_notification(job_summary: Dict[str, Any], timeout: bool) -> 
         return
 
     sns_client = boto3.client("sns")
+
+    # Get Eon console domain for job links
+    eon_account_domain = os.environ.get("EON_ACCOUNT_DOMAIN", "")
 
     total_jobs = job_summary["totalJobs"]
     completed_jobs = job_summary["completedJobs"]
@@ -225,6 +233,17 @@ def send_completion_notification(job_summary: Dict[str, Any], timeout: bool) -> 
 
     vpc_summary = "\n".join(vpc_summary_lines) if vpc_summary_lines else "None"
 
+    # Collect snapshot date information from restore jobs
+    snapshot_dates = set()
+    for job in job_summary["restoreJobs"]:
+        snapshot_time = job.get("snapshotPointInTime")
+        if snapshot_time and snapshot_time != "Unknown":
+            # Extract just the date part (YYYY-MM-DD)
+            snapshot_date = snapshot_time.split("T")[0] if "T" in snapshot_time else snapshot_time
+            snapshot_dates.add(snapshot_date)
+
+    snapshot_date_summary = ", ".join(sorted(snapshot_dates)) if snapshot_dates else "Not specified"
+
     # Build detailed message
     message_lines = [
         "Eon Bulk Recovery Status Report",
@@ -237,6 +256,7 @@ def send_completion_notification(job_summary: Dict[str, Any], timeout: bool) -> 
         f"Source Account: {source_account_id}",
         f"Restore Account: {restore_account_id}",
         f"Default Restore Region: {restore_region} (resources restored to original regions)",
+        f"Snapshot Date(s): {snapshot_date_summary}",
         f"VPC Configurations:",
         vpc_summary,
         f"Total Duration: {duration_str}",
@@ -254,6 +274,9 @@ def send_completion_notification(job_summary: Dict[str, Any], timeout: bool) -> 
     ]
 
     # Add individual job statuses
+    # Need to merge job_status with original restore job to get snapshot and region info
+    restore_jobs_map = {job.get("resourceId"): job for job in job_summary["restoreJobs"]}
+
     for job_status in job_summary["jobStatuses"]:
         resource_name = job_status.get("resourceName", "Unknown")
         resource_type = job_status.get("resourceType", "Unknown")
@@ -266,12 +289,79 @@ def send_completion_notification(job_summary: Dict[str, Any], timeout: bool) -> 
             "JOB_PARTIAL": "⚠️",
             "JOB_RUNNING": "🔄",
             "JOB_PENDING": "⏳",
-            "JOB_CANCELED": "🚫"
+            "JOB_CANCELED": "🚫",
+            "FAILED_TO_INITIATE": "❌"
         }.get(status, "❓")
 
         message_lines.append(f"{status_emoji} {resource_name} ({resource_type})")
         message_lines.append(f"   Status: {status}")
         message_lines.append(f"   Job ID: {job_id}")
+
+        # Add Eon console link if we have a valid job ID and domain
+        if job_id and job_id != "N/A" and eon_account_domain:
+            eon_job_url = f"https://{eon_account_domain}.console.eon.io/jobs/restore?pageIndex=0&pageSize=25&id={job_id}"
+            message_lines.append(f"   Job Link: {eon_job_url}")
+
+        # Get original restore job info for this resource
+        resource_id = job_status.get("resourceId")
+        if not resource_id:
+            # Try to find by matching job ID
+            for restore_job in job_summary["restoreJobs"]:
+                if restore_job.get("jobId") == job_id:
+                    resource_id = restore_job.get("resourceId")
+                    break
+
+        restore_job = restore_jobs_map.get(resource_id) if resource_id else None
+
+        # Add snapshot and region information
+        if restore_job:
+            snapshot_time = restore_job.get("snapshotPointInTime")
+            if snapshot_time and snapshot_time != "Unknown":
+                message_lines.append(f"   Snapshot Date: {snapshot_time}")
+
+            source_region = restore_job.get("sourceRegion")
+            restored_region = restore_job.get("restoredRegion")
+
+            if source_region and restored_region:
+                if source_region == restored_region:
+                    message_lines.append(f"   Region: {restored_region}")
+                else:
+                    message_lines.append(f"   Source Region: {source_region} → Restored Region: {restored_region}")
+            elif restored_region:
+                message_lines.append(f"   Restored Region: {restored_region}")
+
+            # Add resource-specific details
+            if resource_type == "AWS_EC2":
+                instance_type = restore_job.get("instanceType")
+                volume_count = restore_job.get("volumeCount")
+                if instance_type:
+                    message_lines.append(f"   Instance Type: {instance_type}")
+                if volume_count:
+                    message_lines.append(f"   Volumes: {volume_count}")
+
+            elif resource_type == "AWS_RDS":
+                db_instance_class = restore_job.get("dbInstanceClass")
+                restored_name = restore_job.get("restoredName")
+                if db_instance_class:
+                    message_lines.append(f"   Instance Class: {db_instance_class}")
+                if restored_name:
+                    message_lines.append(f"   Restored Name: {restored_name}")
+
+            elif resource_type == "AWS_S3":
+                restored_bucket_name = restore_job.get("restoredBucketName")
+                original_bucket_name = restore_job.get("originalBucketName")
+                if restored_bucket_name:
+                    message_lines.append(f"   Restored Bucket: {restored_bucket_name}")
+                if original_bucket_name and original_bucket_name != resource_name:
+                    message_lines.append(f"   Original Bucket: {original_bucket_name}")
+
+            elif resource_type == "AWS_DYNAMO_DB":
+                restored_name = restore_job.get("restoredName")
+                wcu = restore_job.get("writeCapacityUnits")
+                if restored_name:
+                    message_lines.append(f"   Restored Name: {restored_name}")
+                if wcu:
+                    message_lines.append(f"   Write Capacity Units: {wcu:,}")
 
         if job_status.get("statusMessage"):
             message_lines.append(f"   Message: {job_status['statusMessage']}")

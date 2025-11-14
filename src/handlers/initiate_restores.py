@@ -293,6 +293,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
         try:
             job_id = None
+            restored_resource_details = {}
 
             if resource_type == "AWS_EC2":
                 # Get instance configuration from snapshot
@@ -470,6 +471,14 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     destination_config=destination_config
                 )
 
+                # Capture restored resource details
+                restored_resource_details = {
+                    "restoredRegion": actual_region,
+                    "instanceType": instance_type,
+                    "volumeCount": len(volume_restore_params),
+                    "restoredName": f"restored-{resource_name}"
+                }
+
             elif resource_type == "AWS_RDS":
                 # Get instance class from source resource, fallback to default
                 db_instance_class = resource_snapshot.get("dbInstanceClass", "db.t3.micro")
@@ -533,6 +542,14 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     destination_config=destination_config
                 )
 
+                # Capture restored resource details
+                restored_resource_details = {
+                    "restoredRegion": actual_region,
+                    "dbInstanceClass": db_instance_class,
+                    "restoredName": f"restored-{resource_name}",
+                    "subnetGroup": rds_subnet_group_name
+                }
+
             elif resource_type == "AWS_S3":
                 # Check if VPC config exists for target region, otherwise fall back to any available
                 # VPC configs define which regions are allowed for restoration
@@ -592,6 +609,13 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     destination_config=destination_config
                 )
 
+                # Capture restored resource details
+                restored_resource_details = {
+                    "restoredRegion": actual_region,
+                    "restoredBucketName": restored_bucket_name,
+                    "originalBucketName": original_bucket_name
+                }
+
             elif resource_type == "AWS_DYNAMO_DB":
                 # Check if VPC config exists for target region, otherwise fall back to any available
                 # VPC configs define which regions are allowed for restoration
@@ -643,6 +667,13 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     destination_config=destination_config
                 )
 
+                # Capture restored resource details
+                restored_resource_details = {
+                    "restoredRegion": actual_region,
+                    "restoredName": f"restored-{resource_name}",
+                    "writeCapacityUnits": allocated_wcu
+                }
+
             if job_id:
                 restore_jobs.append({
                     "jobId": job_id,
@@ -650,7 +681,10 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     "resourceName": resource_name,
                     "resourceType": resource_type,
                     "snapshotId": snapshot_id,
-                    "status": "INITIATED"
+                    "snapshotPointInTime": snapshot_point_in_time,
+                    "sourceRegion": source_region,
+                    "status": "INITIATED",
+                    **restored_resource_details  # Include region and resource-specific details
                 })
                 print(f"Successfully initiated restore job {job_id} for {resource_name}")
 
@@ -669,6 +703,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 "resourceName": resource_name,
                 "resourceType": resource_type,
                 "snapshotId": snapshot_id,
+                "snapshotPointInTime": snapshot_point_in_time,
+                "sourceRegion": source_region,
                 "status": "FAILED_TO_INITIATE",
                 "error": str(e)
             })
