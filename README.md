@@ -122,6 +122,17 @@ aws stepfunctions start-execution \
 ```
 Note: Tag keys matching `excludeEC2TagKeys` will be filtered from restored EC2 instances and their volumes.
 
+**Example with pre-created DynamoDB tables (CDK/CloudFormation stacks):**
+```json
+{
+  "sourceAccountId": "333333333333",
+  "restoreAccountId": "222222222222",
+  "recoveryStackNames": ["OrdersServiceStack", "UserDataStack"],
+  "vpcConfigs": [...]
+}
+```
+Note: When `recoveryStackNames` is provided, the workflow will scan the specified CloudFormation stacks in the restore account for DynamoDB tables (via stack outputs containing `TableName` and `TableRegion`). If a table matching the source table name AND source region is found, an **in-place restore** is performed to that existing table instead of creating a new table.
+
 **Parameter reference:**
 
 | Parameter | Required | Description |
@@ -135,6 +146,7 @@ Note: Tag keys matching `excludeEC2TagKeys` will be filtered from restored EC2 i
 | `crossAccountRoleArn` | No | Custom role ARN or null for Organizations |
 | `restoreAccountName` | No | Display name in Eon (null = auto-generate) |
 | `excludeEC2TagKeys` | No | List of tag keys to exclude from restored EC2 instances and volumes (default: []) |
+| `recoveryStackNames` | No | List of CloudFormation stack names to scan for pre-created DynamoDB tables (default: []) |
 
 ## How It Works
 
@@ -142,7 +154,9 @@ Note: Tag keys matching `excludeEC2TagKeys` will be filtered from restored EC2 i
 2. **Connect** - Registers restore account with Eon
 3. **Configure** - Sets up VPC connectivity
 4. **List Snapshots** - Retrieves resources and their snapshots, extracts table sizes
-5. **Initiate Restores** - Allocates WCUs per-region (38k per region = 95% of 40k, proportional to table sizes, 50 WCU default for zero-size tables)
+5. **Initiate Restores** - For DynamoDB:
+   - If `recoveryStackNames` provided: Scans CloudFormation stacks for pre-created tables, uses in-place restore for matches (by name + source region)
+   - Otherwise: Creates new tables with allocated WCUs (38k per region = 95% of 40k, proportional to table sizes, 50 WCU default for zero-size tables)
 6. **Monitor** - Polls until completion (default: 30 hours max)
 
 ![Notification example](./screenshot_output.png)

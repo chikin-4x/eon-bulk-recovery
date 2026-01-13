@@ -179,7 +179,8 @@
         "dynamodbRegionalWcuLimit.$": "$.dynamodbRegionalWcuLimit",
         "vpcConfigs.$": "$.vpcConfigs",
         "crossAccountRoleArn.$": "$.crossAccountRoleArn",
-        "excludeEC2TagKeys.$": "$.excludeEC2TagKeys"
+        "excludeEC2TagKeys.$": "$.excludeEC2TagKeys",
+        "recoveryStackNames.$": "$.recoveryStackNames"
       },
       "ResultPath": "$.restoreJobsResult",
       "Retry": [

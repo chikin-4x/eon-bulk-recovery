@@ -7,6 +7,7 @@
   "dynamodbRegionalWcuLimit": null,
   "crossAccountRoleArn": null,
   "excludeEC2TagKeys": [],
+  "recoveryStackNames": [],
   "vpcConfigs": [
     {
       "region": "us-east-1",

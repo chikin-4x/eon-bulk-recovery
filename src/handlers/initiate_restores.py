@@ -104,6 +104,106 @@ def calculate_dynamodb_wcu_allocation_by_region(
     return wcu_allocation
 
 
+def discover_dynamodb_tables_from_stacks(
+    stack_names: List[str],
+    restore_account_credentials: Optional[Dict[str, str]] = None,
+    regions: Optional[List[str]] = None
+) -> Dict[str, Dict[str, str]]:
+    """
+    Discover DynamoDB tables from CloudFormation stack outputs.
+
+    Scans CloudFormation stack outputs for DynamoDB table name and region pairs.
+    Looks for outputs with keys containing 'TableName' and 'TableRegion'.
+    Works with any CloudFormation stack (CDK, SAM, plain CFN, etc.).
+
+    Args:
+        stack_names: List of CloudFormation stack names to scan
+        restore_account_credentials: Cross-account credentials for restore account
+        regions: List of regions to check for stacks (defaults to us-east-1)
+
+    Returns:
+        Dictionary mapping table names to their configuration:
+        {
+            "MyTable": {"tableName": "MyTable", "region": "us-east-1", "stackName": "MyStack"},
+            ...
+        }
+    """
+    if not stack_names:
+        return {}
+
+    if not regions:
+        regions = ["us-east-1"]
+
+    cdk_tables = {}
+
+    for region in regions:
+        # Create CloudFormation client
+        if restore_account_credentials:
+            cfn_client = boto3.client(
+                "cloudformation",
+                region_name=region,
+                aws_access_key_id=restore_account_credentials["AccessKeyId"],
+                aws_secret_access_key=restore_account_credentials["SecretAccessKey"],
+                aws_session_token=restore_account_credentials["SessionToken"]
+            )
+        else:
+            cfn_client = boto3.client("cloudformation", region_name=region)
+
+        for stack_name in stack_names:
+            try:
+                response = cfn_client.describe_stacks(StackName=stack_name)
+                stacks = response.get("Stacks", [])
+
+                if not stacks:
+                    print(f"CloudFormation stack '{stack_name}' not found in region {region}")
+                    continue
+
+                stack = stacks[0]
+                outputs = stack.get("Outputs", [])
+
+                # Parse outputs to find table name and region pairs
+                table_name = None
+                table_region = None
+
+                for output in outputs:
+                    output_key = output.get("OutputKey", "")
+                    output_value = output.get("OutputValue", "")
+
+                    if "TableName" in output_key:
+                        table_name = output_value
+                    elif "TableRegion" in output_key:
+                        table_region = output_value
+
+                # If we found both table name and region, add to our mapping
+                if table_name and table_region:
+                    cdk_tables[table_name] = {
+                        "tableName": table_name,
+                        "region": table_region,
+                        "stackName": stack_name
+                    }
+                    print(f"Discovered DynamoDB table from stack: {table_name} in {table_region} (stack: {stack_name})")
+                elif table_name:
+                    # If only table name found, use the region where stack was found
+                    cdk_tables[table_name] = {
+                        "tableName": table_name,
+                        "region": region,
+                        "stackName": stack_name
+                    }
+                    print(f"Discovered DynamoDB table from stack: {table_name} in {region} (stack: {stack_name}, region from stack location)")
+
+            except ClientError as e:
+                error_code = e.response.get("Error", {}).get("Code", "")
+                if error_code == "ValidationError" and "does not exist" in str(e):
+                    print(f"CloudFormation stack '{stack_name}' not found in region {region}")
+                else:
+                    print(f"Error checking CloudFormation stack '{stack_name}' in {region}: {str(e)}")
+            except Exception as e:
+                print(f"Unexpected error checking CloudFormation stack '{stack_name}' in {region}: {str(e)}")
+
+    print(f"\nDiscovered {len(cdk_tables)} DynamoDB table from stack(s) for in-place restore")
+    return cdk_tables
+
+
 def create_s3_bucket(bucket_name: str, region: str, kms_key_id: str, restore_account_id: str, snapshot_id: str, snapshot_point_in_time: str, original_tags: Dict[str, str] = None, restore_account_credentials: Dict[str, str] = None) -> None:
     """Create an S3 bucket in the restore account."""
     if original_tags is None:
@@ -189,6 +289,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         vpcConfigs: VPC configurations for the restore
         crossAccountRoleArn: ARN of cross-account role (optional)
         excludeEC2TagKeys: List of tag keys to exclude from EC2 instance tags (optional)
+        recoveryStackNames: List of CloudFormation stack names to check for pre-created DynamoDB tables (optional)
 
     Returns:
         restoreJobs: List of initiated restore jobs with job IDs
@@ -205,12 +306,15 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     cross_account_role_arn = event.get("crossAccountRoleArn")
     management_account_id = os.environ.get("MANAGEMENT_ACCOUNT_ID", "").strip() or None
     exclude_ec2_tag_keys = event.get("excludeEC2TagKeys", [])
+    enable_cdk_recovery_stacks = event.get("recoveryStackNames", [])
 
     print(f"KMS keys available in regions: {list(kms_key_arns_by_region.keys())}")
     print(f"RDS subnet groups available in regions: {list(rds_subnet_groups_by_region.keys())}")
     print(f"DynamoDB regional WCU limit: {dynamodb_regional_wcu_limit:,}")
     if exclude_ec2_tag_keys:
         print(f"EC2 tag keys to exclude: {exclude_ec2_tag_keys}")
+    if enable_cdk_recovery_stacks:
+        print(f"Recovery stacks to check: {enable_cdk_recovery_stacks}")
 
     # Get credentials for restore account once (reused throughout)
     restore_account_credentials = None
@@ -224,6 +328,20 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     except Exception as e:
         print(f"WARNING: Could not obtain cross-account credentials: {str(e)}")
         print("Will attempt operations with Lambda execution role")
+
+    # Discover DynamoDB table from stacks for in-place restore
+    recovery_stack_tables = {}
+    if enable_cdk_recovery_stacks:
+        # Get regions from VPC configs to check for CloudFormation stacks
+        vpc_regions = [config.get("region") for config in vpc_configs if config.get("region")]
+        if not vpc_regions:
+            vpc_regions = ["us-east-1"]
+
+        recovery_stack_tables = discover_dynamodb_tables_from_stacks(
+            stack_names=enable_cdk_recovery_stacks,
+            restore_account_credentials=restore_account_credentials,
+            regions=vpc_regions
+        )
 
     # Build VPC configs by region for region-specific resource restoration
     vpc_configs_by_region = {}
@@ -630,49 +748,91 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 else:
                     raise ValueError(f"No VPC configurations available for restoring {resource_name}")
 
-                # Get allocated WCU for this table
-                allocated_wcu = dynamodb_wcu_allocation.get(resource_id, 50)  # fallback to default
-
-                # Get KMS key for this region
+                # Get KMS key for this region (used for restore worker EC2 EBS encryption)
                 kms_key_arn = kms_key_arns_by_region.get(actual_region)
                 if not kms_key_arn:
                     raise ValueError(f"No KMS key available for region {actual_region}")
 
-                # Merge original tags with restore tags (restore tags take precedence)
-                original_tags = resource_snapshot.get("originalTags", {})
-                dynamodb_tags = {
-                    **original_tags,
-                    "ManagedBy": "EonBulkRecovery",
-                    "eon:restore": "true",
-                    "eon:snapshot_id": snapshot_id,
-                    "eon:snapshot_time": snapshot_point_in_time
-                }
+                # Check if a pre-created table exists for in-place restore
+                # Match by table name (source table name) and SOURCE region (not restore region)
+                stack_table_match = None
+                if recovery_stack_tables:
+                    # Look for a pre-created table matching the source table name and SOURCE region
+                    if resource_name in recovery_stack_tables:
+                        stack_table = recovery_stack_tables[resource_name]
+                        if stack_table["region"] == source_region:
+                            stack_table_match = stack_table
+                            print(f"Found matching pre-created table '{resource_name}' in {source_region} (source region) (stack: {stack_table['stackName']})")
 
-                print(f"DynamoDB restore config - region: {actual_region}, table: restored-{resource_name}, WCU: {allocated_wcu:,}")
+                if stack_table_match:
+                    # Use in-place restore to existing pre-created table
+                    # The table was created in the same region as the source
+                    restore_target_region = stack_table_match["region"]
 
-                destination_config = {
-                    "awsDynamodb": {
-                        "restoreRegion": actual_region,
-                        "encryptionKeyId": kms_key_arn,
-                        "restoredName": f"restored-{resource_name}",
-                        "writeCapacityUnits": allocated_wcu,
-                        "tags": dynamodb_tags
+                    # Get KMS key for the stack table's region (may be different from actual_region)
+                    stack_kms_key_arn = kms_key_arns_by_region.get(restore_target_region)
+                    if not stack_kms_key_arn:
+                        raise ValueError(f"No KMS key available for region {restore_target_region} (required for in-place restore)")
+
+                    print(f"DynamoDB IN-PLACE restore config - region: {restore_target_region}, table: {stack_table_match['tableName']} (CloudFormation stack: {stack_table_match['stackName']})")
+
+                    job_id = eon_client.restore_dynamodb_to_existing_table(
+                        resource_id=resource_id,
+                        snapshot_id=snapshot_id,
+                        restore_account_id=eon_restore_account_id,
+                        table_name=stack_table_match["tableName"],
+                        region=restore_target_region,
+                        encryption_key_id=stack_kms_key_arn  # EBS encryption for restore worker
+                    )
+
+                    # Capture restored resource details
+                    restored_resource_details = {
+                        "restoredRegion": restore_target_region,
+                        "restoredName": stack_table_match["tableName"],
+                        "restoreType": "IN_PLACE",
+                        "recoveryStackName": stack_table_match["stackName"]
                     }
-                }
+                else:
+                    # Standard restore to new table
+                    # Get allocated WCU for this table
+                    allocated_wcu = dynamodb_wcu_allocation.get(resource_id, 50)  # fallback to default
 
-                job_id = eon_client.restore_dynamodb_table(
-                    resource_id=resource_id,
-                    snapshot_id=snapshot_id,
-                    restore_account_id=eon_restore_account_id,
-                    destination_config=destination_config
-                )
+                    # Merge original tags with restore tags (restore tags take precedence)
+                    original_tags = resource_snapshot.get("originalTags", {})
+                    dynamodb_tags = {
+                        **original_tags,
+                        "ManagedBy": "EonBulkRecovery",
+                        "eon:restore": "true",
+                        "eon:snapshot_id": snapshot_id,
+                        "eon:snapshot_time": snapshot_point_in_time
+                    }
 
-                # Capture restored resource details
-                restored_resource_details = {
-                    "restoredRegion": actual_region,
-                    "restoredName": f"restored-{resource_name}",
-                    "writeCapacityUnits": allocated_wcu
-                }
+                    print(f"DynamoDB restore config - region: {actual_region}, table: restored-{resource_name}, WCU: {allocated_wcu:,}")
+
+                    destination_config = {
+                        "awsDynamodb": {
+                            "restoreRegion": actual_region,
+                            "encryptionKeyId": kms_key_arn,
+                            "restoredName": f"restored-{resource_name}",
+                            "writeCapacityUnits": allocated_wcu,
+                            "tags": dynamodb_tags
+                        }
+                    }
+
+                    job_id = eon_client.restore_dynamodb_table(
+                        resource_id=resource_id,
+                        snapshot_id=snapshot_id,
+                        restore_account_id=eon_restore_account_id,
+                        destination_config=destination_config
+                    )
+
+                    # Capture restored resource details
+                    restored_resource_details = {
+                        "restoredRegion": actual_region,
+                        "restoredName": f"restored-{resource_name}",
+                        "restoreType": "NEW_TABLE",
+                        "writeCapacityUnits": allocated_wcu
+                    }
 
             if job_id:
                 restore_jobs.append({

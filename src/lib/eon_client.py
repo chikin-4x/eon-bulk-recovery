@@ -373,6 +373,55 @@ class EonClient:
         self._handle_response(response, "POST", url, payload)
         return response.json().get("jobId")
 
+    def restore_dynamodb_to_existing_table(
+        self,
+        resource_id: str,
+        snapshot_id: str,
+        restore_account_id: str,
+        table_name: str,
+        region: str,
+        encryption_key_id: Optional[str] = None
+    ) -> str:
+        """
+        Restore a DynamoDB snapshot to an existing table (in-place restore).
+
+        The target table must:
+        - Already exist in the restore account
+        - Be empty (no items)
+        - Have a matching key schema (partition key and sort key names must match exactly)
+
+        Args:
+            resource_id: Eon-assigned resource ID
+            snapshot_id: Snapshot ID to restore from
+            restore_account_id: Eon-assigned restore account ID
+            table_name: Name of the existing target table
+            region: AWS region of the target table
+            encryption_key_id: KMS key ARN for the restore worker EC2 instance (optional)
+
+        Returns:
+            Job ID for the restore operation
+        """
+        url = f"{self.base_url}/projects/{self.project_id}/resource/{resource_id}/snapshots/{snapshot_id}/restore-dynamodb-to-existing"
+
+        destination = {
+            "awsDynamodb": {
+                "restoredName": table_name,
+                "restoreRegion": region
+            }
+        }
+
+        if encryption_key_id:
+            destination["awsDynamodb"]["encryptionKeyId"] = encryption_key_id
+
+        payload = {
+            "restoreAccountId": restore_account_id,
+            "destination": destination
+        }
+
+        response = requests.post(url, json=payload, headers=self._get_headers())
+        self._handle_response(response, "POST", url, payload)
+        return response.json().get("jobId")
+
     def list_restore_accounts(
         self,
         provider_account_id: Optional[str] = None,
