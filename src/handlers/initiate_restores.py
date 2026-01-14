@@ -110,11 +110,10 @@ def discover_dynamodb_tables_from_stacks(
     regions: Optional[List[str]] = None
 ) -> Dict[str, Dict[str, str]]:
     """
-    Discover DynamoDB tables from CloudFormation stack outputs.
+    Discover DynamoDB tables from CloudFormation stack resources.
 
-    Scans CloudFormation stack outputs for DynamoDB table name and region pairs.
-    Looks for outputs with keys containing 'TableName' and 'TableRegion'.
-    Works with any CloudFormation stack (CDK, SAM, plain CFN, etc.).
+    Queries CloudFormation stacks to find all AWS::DynamoDB::Table resources
+    created by the stack. Works with any CloudFormation stack (CDK, SAM, plain CFN, etc.).
 
     Args:
         stack_names: List of CloudFormation stack names to scan
@@ -134,7 +133,7 @@ def discover_dynamodb_tables_from_stacks(
     if not regions:
         regions = ["us-east-1"]
 
-    cdk_tables = {}
+    discovered_tables = {}
 
     for region in regions:
         # Create CloudFormation client
@@ -151,45 +150,34 @@ def discover_dynamodb_tables_from_stacks(
 
         for stack_name in stack_names:
             try:
-                response = cfn_client.describe_stacks(StackName=stack_name)
-                stacks = response.get("Stacks", [])
+                # List all resources in the stack
+                paginator = cfn_client.get_paginator("list_stack_resources")
+                tables_found_in_stack = 0
 
-                if not stacks:
-                    print(f"CloudFormation stack '{stack_name}' not found in region {region}")
-                    continue
+                for page in paginator.paginate(StackName=stack_name):
+                    for resource in page.get("StackResourceSummaries", []):
+                        resource_type = resource.get("ResourceType", "")
+                        resource_status = resource.get("ResourceStatus", "")
 
-                stack = stacks[0]
-                outputs = stack.get("Outputs", [])
+                        # Look for DynamoDB tables that are successfully created
+                        if resource_type == "AWS::DynamoDB::Table" and resource_status in [
+                            "CREATE_COMPLETE", "UPDATE_COMPLETE", "IMPORT_COMPLETE"
+                        ]:
+                            table_name = resource.get("PhysicalResourceId")
+                            logical_id = resource.get("LogicalResourceId", "")
 
-                # Parse outputs to find table name and region pairs
-                table_name = None
-                table_region = None
+                            if table_name:
+                                discovered_tables[table_name] = {
+                                    "tableName": table_name,
+                                    "region": region,
+                                    "stackName": stack_name,
+                                    "logicalId": logical_id
+                                }
+                                tables_found_in_stack += 1
+                                print(f"Discovered DynamoDB table from stack: {table_name} in {region} (stack: {stack_name}, logical ID: {logical_id})")
 
-                for output in outputs:
-                    output_key = output.get("OutputKey", "")
-                    output_value = output.get("OutputValue", "")
-
-                    if "TableName" in output_key:
-                        table_name = output_value
-                    elif "TableRegion" in output_key:
-                        table_region = output_value
-
-                # If we found both table name and region, add to our mapping
-                if table_name and table_region:
-                    cdk_tables[table_name] = {
-                        "tableName": table_name,
-                        "region": table_region,
-                        "stackName": stack_name
-                    }
-                    print(f"Discovered DynamoDB table from stack: {table_name} in {table_region} (stack: {stack_name})")
-                elif table_name:
-                    # If only table name found, use the region where stack was found
-                    cdk_tables[table_name] = {
-                        "tableName": table_name,
-                        "region": region,
-                        "stackName": stack_name
-                    }
-                    print(f"Discovered DynamoDB table from stack: {table_name} in {region} (stack: {stack_name}, region from stack location)")
+                if tables_found_in_stack > 0:
+                    print(f"Found {tables_found_in_stack} DynamoDB table(s) in stack '{stack_name}' ({region})")
 
             except ClientError as e:
                 error_code = e.response.get("Error", {}).get("Code", "")
@@ -200,8 +188,8 @@ def discover_dynamodb_tables_from_stacks(
             except Exception as e:
                 print(f"Unexpected error checking CloudFormation stack '{stack_name}' in {region}: {str(e)}")
 
-    print(f"\nDiscovered {len(cdk_tables)} DynamoDB table from stack(s) for in-place restore")
-    return cdk_tables
+    print(f"\nDiscovered {len(discovered_tables)} DynamoDB table(s) from stack(s) for in-place restore")
+    return discovered_tables
 
 
 def create_s3_bucket(bucket_name: str, region: str, kms_key_id: str, restore_account_id: str, snapshot_id: str, snapshot_point_in_time: str, original_tags: Dict[str, str] = None, restore_account_credentials: Dict[str, str] = None) -> None:

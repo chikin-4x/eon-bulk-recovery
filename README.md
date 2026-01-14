@@ -131,7 +131,7 @@ Note: Tag keys matching `excludeEC2TagKeys` will be filtered from restored EC2 i
   "vpcConfigs": [...]
 }
 ```
-Note: When `recoveryStackNames` is provided, the workflow will scan the specified CloudFormation stacks in the restore account for DynamoDB tables (via stack outputs containing `TableName` and `TableRegion`). If a table matching the source table name AND source region is found, an **in-place restore** is performed to that existing table instead of creating a new table.
+Note: When `recoveryStackNames` is provided, the workflow will query the specified CloudFormation stacks in the restore account to discover all DynamoDB tables created by those stacks. If a table matching the source table name AND source region is found, an **in-place restore** is performed to that existing table instead of creating a new table.
 
 **Example with custom resource name prefix:**
 ```json
@@ -167,7 +167,7 @@ Note: By default, resources are restored with their **original names** (designed
 3. **Configure** - Sets up VPC connectivity
 4. **List Snapshots** - Retrieves resources and their snapshots, extracts table sizes
 5. **Initiate Restores** - For DynamoDB:
-   - If `recoveryStackNames` provided: Scans CloudFormation stacks for pre-created tables, uses in-place restore for matches (by name + source region)
+   - If `recoveryStackNames` provided: Queries CloudFormation stacks for all `AWS::DynamoDB::Table` resources, uses in-place restore for matches (by table name + region)
    - Otherwise: Creates new tables with allocated WCUs (38k per region = 95% of 40k, proportional to table sizes, 50 WCU default for zero-size tables)
 6. **Monitor** - Polls until completion (default: 30 hours max)
 
