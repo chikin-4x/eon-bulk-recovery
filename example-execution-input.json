@@ -4,6 +4,7 @@
   "restoreAccountName": null,
   "restoreRegion": null,
   "snapshotDate": "2025-10-14",
+  "resourceNamePrefix": null,
   "dynamodbRegionalWcuLimit": null,
   "crossAccountRoleArn": null,
   "excludeEC2TagKeys": [],

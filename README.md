@@ -133,6 +133,17 @@ Note: Tag keys matching `excludeEC2TagKeys` will be filtered from restored EC2 i
 ```
 Note: When `recoveryStackNames` is provided, the workflow will scan the specified CloudFormation stacks in the restore account for DynamoDB tables (via stack outputs containing `TableName` and `TableRegion`). If a table matching the source table name AND source region is found, an **in-place restore** is performed to that existing table instead of creating a new table.
 
+**Example with custom resource name prefix:**
+```json
+{
+  "sourceAccountId": "333333333333",
+  "restoreAccountId": "222222222222",
+  "resourceNamePrefix": "dr-",
+  "vpcConfigs": [...]
+}
+```
+Note: By default, resources are restored with their **original names** (designed for full account recovery to a new account). Set `resourceNamePrefix` to add a prefix (e.g., "dr-mydb" instead of "mydb"). For S3 buckets, a hash suffix is always added for global uniqueness.
+
 **Parameter reference:**
 
 | Parameter | Required | Description |
@@ -141,6 +152,7 @@ Note: When `recoveryStackNames` is provided, the workflow will scan the specifie
 | `restoreAccountId` | Yes | Target account for restored resources |
 | `restoreRegion` | No | Force all resources to this region (null = use source regions) |
 | `snapshotDate` | No | Date for snapshot selection (YYYY-MM-DD, null = latest) |
+| `resourceNamePrefix` | No | Prefix for restored resource names (null = use original names) |
 | `dynamodbRegionalWcuLimit` | No | DynamoDB WCU limit per region (default: 40000) |
 | `vpcConfigs` | Yes | Network configuration per region (creates KMS keys and RDS subnet groups automatically) |
 | `crossAccountRoleArn` | No | Custom role ARN or null for Organizations |

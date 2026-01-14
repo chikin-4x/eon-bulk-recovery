@@ -307,10 +307,19 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     management_account_id = os.environ.get("MANAGEMENT_ACCOUNT_ID", "").strip() or None
     exclude_ec2_tag_keys = event.get("excludeEC2TagKeys", [])
     enable_cdk_recovery_stacks = event.get("recoveryStackNames", [])
+    resource_name_prefix = event.get("resourceNamePrefix")  # None means use original name
+
+    # Helper function to generate restored resource name
+    def get_restored_name(original_name: str) -> str:
+        """Generate restored resource name based on prefix setting."""
+        if resource_name_prefix:
+            return f"{resource_name_prefix}{original_name}"
+        return original_name  # Use original name for full account recovery
 
     print(f"KMS keys available in regions: {list(kms_key_arns_by_region.keys())}")
     print(f"RDS subnet groups available in regions: {list(rds_subnet_groups_by_region.keys())}")
     print(f"DynamoDB regional WCU limit: {dynamodb_regional_wcu_limit:,}")
+    print(f"Resource name prefix: {resource_name_prefix if resource_name_prefix else '(none - using original names)'}")
     if exclude_ec2_tag_keys:
         print(f"EC2 tag keys to exclude: {exclude_ec2_tag_keys}")
     if enable_cdk_recovery_stacks:
@@ -555,9 +564,10 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                         print(f"Excluding EC2 tags for {resource_name}: {excluded_tags}")
 
                 # Merge filtered original tags with restore tags (restore tags take precedence)
+                restored_instance_name = get_restored_name(resource_name)
                 ec2_tags = {
                     **filtered_original_tags,
-                    "Name": f"restored-{resource_name}",
+                    "Name": restored_instance_name,
                     "RestoreSource": resource_snapshot.get("providerResourceId", ""),
                     "ManagedBy": "EonBulkRecovery",
                     "eon:restore": "true",
@@ -594,7 +604,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     "restoredRegion": actual_region,
                     "instanceType": instance_type,
                     "volumeCount": len(volume_restore_params),
-                    "restoredName": f"restored-{resource_name}"
+                    "restoredName": restored_instance_name
                 }
 
             elif resource_type == "AWS_RDS":
@@ -628,9 +638,10 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
                 # Merge original tags with restore tags (restore tags take precedence)
                 original_tags = resource_snapshot.get("originalTags", {})
+                restored_db_name = get_restored_name(resource_name)
                 rds_tags = {
                     **original_tags,
-                    "Name": f"restored-{resource_name}",
+                    "Name": restored_db_name,
                     "RestoreSource": resource_snapshot.get("providerResourceId", ""),
                     "ManagedBy": "EonBulkRecovery",
                     "eon:restore": "true",
@@ -642,7 +653,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     "awsRds": {
                         "restoreRegion": actual_region,
                         "encryptionKeyId": kms_key_arn,
-                        "restoredName": f"restored-{resource_name}",
+                        "restoredName": restored_db_name,
                         "securityGroups": rds_security_groups,
                         "subnetGroup": rds_subnet_group_name,
                         "dbInstanceClass": db_instance_class,
@@ -664,7 +675,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 restored_resource_details = {
                     "restoredRegion": actual_region,
                     "dbInstanceClass": db_instance_class,
-                    "restoredName": f"restored-{resource_name}",
+                    "restoredName": restored_db_name,
                     "subnetGroup": rds_subnet_group_name
                 }
 
@@ -687,7 +698,13 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 original_bucket_name = resource_snapshot.get("providerResourceId", resource_name)
                 hash_input = f"{original_bucket_name}-{snapshot_id}-{actual_region}-{restore_account_id}"
                 hash_suffix = hashlib.md5(hash_input.encode()).hexdigest()[:8]
-                restored_bucket_name = f"restored-{original_bucket_name}-{hash_suffix}".lower()[:63]
+                # For S3, we always need a unique suffix since bucket names are globally unique
+                # When restoring to a new account, the original bucket name likely won't be available
+                if resource_name_prefix:
+                    restored_bucket_name = f"{resource_name_prefix}{original_bucket_name}-{hash_suffix}".lower()[:63]
+                else:
+                    # Use original name with hash suffix for uniqueness
+                    restored_bucket_name = f"{original_bucket_name}-{hash_suffix}".lower()[:63]
 
                 # Get KMS key for this region
                 kms_key_arn = kms_key_arns_by_region.get(actual_region)
@@ -807,13 +824,14 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                         "eon:snapshot_time": snapshot_point_in_time
                     }
 
-                    print(f"DynamoDB restore config - region: {actual_region}, table: restored-{resource_name}, WCU: {allocated_wcu:,}")
+                    restored_table_name = get_restored_name(resource_name)
+                    print(f"DynamoDB restore config - region: {actual_region}, table: {restored_table_name}, WCU: {allocated_wcu:,}")
 
                     destination_config = {
                         "awsDynamodb": {
                             "restoreRegion": actual_region,
                             "encryptionKeyId": kms_key_arn,
-                            "restoredName": f"restored-{resource_name}",
+                            "restoredName": restored_table_name,
                             "writeCapacityUnits": allocated_wcu,
                             "tags": dynamodb_tags
                         }
@@ -829,7 +847,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     # Capture restored resource details
                     restored_resource_details = {
                         "restoredRegion": actual_region,
-                        "restoredName": f"restored-{resource_name}",
+                        "restoredName": restored_table_name,
                         "restoreType": "NEW_TABLE",
                         "writeCapacityUnits": allocated_wcu
                     }

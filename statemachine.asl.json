@@ -177,6 +177,7 @@
         "kmsKeyArnsByRegion.$": "$.bootstrapResult.kmsKeyArnsByRegion",
         "rdsSubnetGroupsByRegion.$": "$.bootstrapResult.rdsSubnetGroupsByRegion",
         "dynamodbRegionalWcuLimit.$": "$.dynamodbRegionalWcuLimit",
+        "resourceNamePrefix.$": "$.resourceNamePrefix",
         "vpcConfigs.$": "$.vpcConfigs",
         "crossAccountRoleArn.$": "$.crossAccountRoleArn",
         "excludeEC2TagKeys.$": "$.excludeEC2TagKeys",

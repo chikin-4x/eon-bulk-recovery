@@ -401,9 +401,7 @@ class EonClient:
         Returns:
             Job ID for the restore operation
         """
-        # This endpoint is not under /v1, uses /resource (singular) not /resources
-        base_url_no_v1 = self.base_url.replace("/api/v1", "/api")
-        url = f"{base_url_no_v1}/projects/{self.project_id}/resource/{resource_id}/snapshots/{snapshot_id}/restore-dynamodb-to-existing"
+        url = f"{self.base_url}/projects/{self.project_id}/resources/{resource_id}/snapshots/{snapshot_id}/restore-dynamodb-to-existing"
 
         destination = {
             "awsDynamodb": {
