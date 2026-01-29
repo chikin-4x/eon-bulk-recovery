@@ -234,9 +234,15 @@ def create_s3_bucket(bucket_name: str, region: str, kms_key_id: str, restore_acc
             }
         )
 
-        # Merge original tags with restore tags (restore tags take precedence)
+        # Filter out AWS system tags (aws:, elasticbeanstalk:) as they cannot be manually set
+        filtered_original_tags = {
+            k: v for k, v in original_tags.items()
+            if not k.lower().startswith(("aws:", "elasticbeanstalk:"))
+        }
+
+        # Merge filtered original tags with restore tags (restore tags take precedence)
         s3_tags = {
-            **original_tags,
+            **filtered_original_tags,
             "ManagedBy": "EonBulkRecovery",
             "Purpose": "RestoreDestination",
             "eon:restore": "true",
@@ -688,11 +694,12 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 hash_suffix = hashlib.md5(hash_input.encode()).hexdigest()[:8]
                 # For S3, we always need a unique suffix since bucket names are globally unique
                 # When restoring to a new account, the original bucket name likely won't be available
+                # Note: S3 bucket names cannot end with a hyphen, so we strip trailing hyphens after truncation
                 if resource_name_prefix:
-                    restored_bucket_name = f"{resource_name_prefix}{original_bucket_name}-{hash_suffix}".lower()[:63]
+                    restored_bucket_name = f"{resource_name_prefix}{original_bucket_name}-{hash_suffix}".lower()[:63].rstrip("-")
                 else:
                     # Use original name with hash suffix for uniqueness
-                    restored_bucket_name = f"{original_bucket_name}-{hash_suffix}".lower()[:63]
+                    restored_bucket_name = f"{original_bucket_name}-{hash_suffix}".lower()[:63].rstrip("-")
 
                 # Get KMS key for this region
                 kms_key_arn = kms_key_arns_by_region.get(actual_region)

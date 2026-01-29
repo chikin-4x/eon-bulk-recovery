@@ -142,7 +142,19 @@ Note: When `recoveryStackNames` is provided, the workflow will query the specifi
   "vpcConfigs": [...]
 }
 ```
-Note: By default, resources are restored with their **original names** (designed for full account recovery to a new account). Set `resourceNamePrefix` to add a prefix (e.g., "dr-mydb" instead of "mydb"). For S3 buckets, a hash suffix is always added for global uniqueness.
+Note: By default, resources are restored with their **original names** (designed for full account recovery to a new account). Set `resourceNamePrefix` to add a prefix (e.g., "dr-mydb" instead of "mydb").
+
+### S3 Bucket Naming Limitations
+
+S3 bucket names are **globally unique** across all AWS accounts worldwide. This means:
+
+- **Original bucket names cannot be reused** - The source bucket still exists, so the same name is unavailable
+- **A hash suffix is always added** - Restored buckets are named `{original-name}-{hash}` (e.g., `my-bucket-a1b2c3d4`)
+- **The `resourceNamePrefix` still applies** - With a prefix, buckets become `{prefix}{original-name}-{hash}`
+- **Long bucket names are truncated** - S3 limits names to 63 characters; if your original bucket name exceeds 54 characters, the name will be truncated before the hash suffix is added
+- **AWS system tags are filtered** - Tags with reserved prefixes (`aws:`, `elasticbeanstalk:`) from the original bucket are automatically excluded as they cannot be manually recreated
+
+**Important:** Applications referencing S3 bucket names will need configuration updates after restore to point to the new bucket names. The restored bucket names are included in the workflow output and completion notification.
 
 **Parameter reference:**
 
