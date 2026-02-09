@@ -192,6 +192,140 @@ def discover_dynamodb_tables_from_stacks(
     return discovered_tables
 
 
+def discover_s3_buckets_from_stacks(
+    stack_names: List[str],
+    restore_account_credentials: Optional[Dict[str, str]] = None,
+    regions: Optional[List[str]] = None
+) -> Dict[str, Dict[str, str]]:
+    """
+    Discover S3 buckets from CloudFormation stack resources and index them by eon_functional_id tag.
+
+    Queries CloudFormation stacks to find all AWS::S3::Bucket resources,
+    then fetches the eon_functional_id tag from each bucket to build a lookup dict.
+
+    Args:
+        stack_names: List of CloudFormation stack names to scan
+        restore_account_credentials: Cross-account credentials for restore account
+        regions: List of regions to check for stacks (defaults to us-east-1)
+
+    Returns:
+        Dictionary mapping eon_functional_id tag value to bucket configuration:
+        {
+            "my-functional-id": {
+                "bucketName": "actual-bucket-name",
+                "region": "us-east-1",
+                "stackName": "MyStack",
+                "logicalId": "MyBucketResource",
+                "eonFunctionalId": "my-functional-id"
+            },
+            ...
+        }
+    """
+    if not stack_names:
+        return {}
+
+    if not regions:
+        regions = ["us-east-1"]
+
+    # Phase 1: Discover S3 bucket names from CloudFormation stacks
+    discovered_buckets = []
+
+    for region in regions:
+        if restore_account_credentials:
+            cfn_client = boto3.client(
+                "cloudformation",
+                region_name=region,
+                aws_access_key_id=restore_account_credentials["AccessKeyId"],
+                aws_secret_access_key=restore_account_credentials["SecretAccessKey"],
+                aws_session_token=restore_account_credentials["SessionToken"]
+            )
+        else:
+            cfn_client = boto3.client("cloudformation", region_name=region)
+
+        for stack_name in stack_names:
+            try:
+                paginator = cfn_client.get_paginator("list_stack_resources")
+                buckets_found_in_stack = 0
+
+                for page in paginator.paginate(StackName=stack_name):
+                    for resource in page.get("StackResourceSummaries", []):
+                        resource_type = resource.get("ResourceType", "")
+                        resource_status = resource.get("ResourceStatus", "")
+
+                        if resource_type == "AWS::S3::Bucket" and resource_status in [
+                            "CREATE_COMPLETE", "UPDATE_COMPLETE", "IMPORT_COMPLETE"
+                        ]:
+                            bucket_name = resource.get("PhysicalResourceId")
+                            logical_id = resource.get("LogicalResourceId", "")
+
+                            if bucket_name:
+                                discovered_buckets.append({
+                                    "bucketName": bucket_name,
+                                    "region": region,
+                                    "stackName": stack_name,
+                                    "logicalId": logical_id
+                                })
+                                buckets_found_in_stack += 1
+                                print(f"Discovered S3 bucket from stack: {bucket_name} in {region} (stack: {stack_name}, logical ID: {logical_id})")
+
+                if buckets_found_in_stack > 0:
+                    print(f"Found {buckets_found_in_stack} S3 bucket(s) in stack '{stack_name}' ({region})")
+
+            except ClientError as e:
+                error_code = e.response.get("Error", {}).get("Code", "")
+                if error_code == "ValidationError" and "does not exist" in str(e):
+                    print(f"CloudFormation stack '{stack_name}' not found in region {region}")
+                else:
+                    print(f"Error checking CloudFormation stack '{stack_name}' in {region}: {str(e)}")
+            except Exception as e:
+                print(f"Unexpected error checking CloudFormation stack '{stack_name}' in {region}: {str(e)}")
+
+    # Phase 2: Fetch eon_functional_id tags from discovered buckets
+    s3_buckets_by_functional_id = {}
+
+    for bucket_info in discovered_buckets:
+        if restore_account_credentials:
+            s3_client = boto3.client(
+                "s3",
+                region_name=bucket_info["region"],
+                aws_access_key_id=restore_account_credentials["AccessKeyId"],
+                aws_secret_access_key=restore_account_credentials["SecretAccessKey"],
+                aws_session_token=restore_account_credentials["SessionToken"]
+            )
+        else:
+            s3_client = boto3.client("s3", region_name=bucket_info["region"])
+
+        try:
+            tagging_response = s3_client.get_bucket_tagging(Bucket=bucket_info["bucketName"])
+            tag_set = tagging_response.get("TagSet", [])
+            functional_id = None
+            for tag in tag_set:
+                if tag["Key"] == "eon_functional_id":
+                    functional_id = tag["Value"]
+                    break
+
+            if functional_id:
+                if functional_id in s3_buckets_by_functional_id:
+                    print(f"WARNING: Duplicate eon_functional_id '{functional_id}' found on bucket '{bucket_info['bucketName']}', overwriting previous match")
+                bucket_info["eonFunctionalId"] = functional_id
+                s3_buckets_by_functional_id[functional_id] = bucket_info
+                print(f"Discovered S3 bucket '{bucket_info['bucketName']}' with eon_functional_id='{functional_id}' (stack: {bucket_info['stackName']})")
+            else:
+                print(f"S3 bucket '{bucket_info['bucketName']}' has no eon_functional_id tag, skipping for in-place matching")
+
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code", "")
+            if error_code == "NoSuchTagSet":
+                print(f"S3 bucket '{bucket_info['bucketName']}' has no tags, skipping for in-place matching")
+            else:
+                print(f"Error fetching tags for S3 bucket '{bucket_info['bucketName']}': {str(e)}")
+        except Exception as e:
+            print(f"Unexpected error fetching tags for S3 bucket '{bucket_info['bucketName']}': {str(e)}")
+
+    print(f"\nDiscovered {len(s3_buckets_by_functional_id)} S3 bucket(s) with eon_functional_id from stack(s) for in-place restore")
+    return s3_buckets_by_functional_id
+
+
 def create_s3_bucket(bucket_name: str, region: str, kms_key_id: str, restore_account_id: str, snapshot_id: str, snapshot_point_in_time: str, original_tags: Dict[str, str] = None, restore_account_credentials: Dict[str, str] = None) -> None:
     """Create an S3 bucket in the restore account."""
     if original_tags is None:
@@ -341,6 +475,15 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             vpc_regions = ["us-east-1"]
 
         recovery_stack_tables = discover_dynamodb_tables_from_stacks(
+            stack_names=enable_cdk_recovery_stacks,
+            restore_account_credentials=restore_account_credentials,
+            regions=vpc_regions
+        )
+
+    # Discover S3 buckets from stacks for in-place restore (matched by eon_functional_id tag)
+    recovery_stack_s3_buckets = {}
+    if enable_cdk_recovery_stacks:
+        recovery_stack_s3_buckets = discover_s3_buckets_from_stacks(
             stack_names=enable_cdk_recovery_stacks,
             restore_account_credentials=restore_account_credentials,
             regions=vpc_regions
@@ -687,64 +830,112 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 else:
                     raise ValueError(f"No VPC configurations available for restoring {resource_name}")
 
-                # Create a bucket name (S3 bucket names must be globally unique)
-                # Include snapshot ID and region in the hash to ensure uniqueness across restores
-                original_bucket_name = resource_snapshot.get("providerResourceId", resource_name)
-                hash_input = f"{original_bucket_name}-{snapshot_id}-{actual_region}-{restore_account_id}"
-                hash_suffix = hashlib.md5(hash_input.encode()).hexdigest()[:8]
-                # For S3, we always need a unique suffix since bucket names are globally unique
-                # When restoring to a new account, the original bucket name likely won't be available
-                # Note: S3 bucket names cannot end with a hyphen, so we strip trailing hyphens after truncation
-                if resource_name_prefix:
-                    restored_bucket_name = f"{resource_name_prefix}{original_bucket_name}-{hash_suffix}".lower()[:63].rstrip("-")
-                else:
-                    # Use original name with hash suffix for uniqueness
-                    restored_bucket_name = f"{original_bucket_name}-{hash_suffix}".lower()[:63].rstrip("-")
-
                 # Get KMS key for this region
                 kms_key_arn = kms_key_arns_by_region.get(actual_region)
                 if not kms_key_arn:
                     raise ValueError(f"No KMS key available for region {actual_region}")
 
-                print(f"S3 restore config - region: {actual_region}, bucket: {restored_bucket_name}")
-
                 # Get original tags
                 original_tags = resource_snapshot.get("originalTags", {})
 
-                # Create the S3 bucket first
-                create_s3_bucket(
-                    bucket_name=restored_bucket_name,
-                    region=actual_region,
-                    kms_key_id=kms_key_arn,
-                    restore_account_id=restore_account_id,
-                    snapshot_id=snapshot_id,
-                    snapshot_point_in_time=snapshot_point_in_time,
-                    original_tags=original_tags,
-                    restore_account_credentials=restore_account_credentials
-                )
+                # Check for in-place restore via eon_functional_id tag matching
+                stack_bucket_match = None
+                source_functional_id = original_tags.get("eon_functional_id")
 
-                destination_config = {
-                    "s3Bucket": {
-                        "region": actual_region,
-                        "bucketName": restored_bucket_name,
-                        "encryptionKeyId": kms_key_arn,
-                        "prefix": ""
+                if source_functional_id and recovery_stack_s3_buckets:
+                    if source_functional_id in recovery_stack_s3_buckets:
+                        stack_bucket_match = recovery_stack_s3_buckets[source_functional_id]
+                        print(f"Found matching S3 bucket '{stack_bucket_match['bucketName']}' with eon_functional_id='{source_functional_id}' (stack: {stack_bucket_match['stackName']})")
+
+                if stack_bucket_match:
+                    # In-place restore to existing bucket from recovery stack
+                    restore_bucket_name = stack_bucket_match["bucketName"]
+                    restore_bucket_region = stack_bucket_match["region"]
+
+                    # Get KMS key for the bucket's region (may differ from actual_region)
+                    stack_kms_key_arn = kms_key_arns_by_region.get(restore_bucket_region)
+                    if not stack_kms_key_arn:
+                        raise ValueError(f"No KMS key available for region {restore_bucket_region} (required for in-place S3 restore)")
+
+                    print(f"S3 IN-PLACE restore config - region: {restore_bucket_region}, bucket: {restore_bucket_name} (CloudFormation stack: {stack_bucket_match['stackName']})")
+
+                    destination_config = {
+                        "s3Bucket": {
+                            "region": restore_bucket_region,
+                            "bucketName": restore_bucket_name,
+                            "encryptionKeyId": stack_kms_key_arn,
+                            "prefix": ""
+                        }
                     }
-                }
 
-                job_id = eon_client.restore_s3_bucket(
-                    resource_id=resource_id,
-                    snapshot_id=snapshot_id,
-                    restore_account_id=eon_restore_account_id,
-                    destination_config=destination_config
-                )
+                    job_id = eon_client.restore_s3_bucket(
+                        resource_id=resource_id,
+                        snapshot_id=snapshot_id,
+                        restore_account_id=eon_restore_account_id,
+                        destination_config=destination_config
+                    )
 
-                # Capture restored resource details
-                restored_resource_details = {
-                    "restoredRegion": actual_region,
-                    "restoredBucketName": restored_bucket_name,
-                    "originalBucketName": original_bucket_name
-                }
+                    # Capture restored resource details
+                    restored_resource_details = {
+                        "restoredRegion": restore_bucket_region,
+                        "restoredBucketName": restore_bucket_name,
+                        "originalBucketName": resource_snapshot.get("providerResourceId", resource_name),
+                        "restoreType": "IN_PLACE",
+                        "recoveryStackName": stack_bucket_match["stackName"],
+                        "eonFunctionalId": source_functional_id
+                    }
+                else:
+                    # Default flow: create a new bucket
+                    # Create a bucket name (S3 bucket names must be globally unique)
+                    # Include snapshot ID and region in the hash to ensure uniqueness across restores
+                    original_bucket_name = resource_snapshot.get("providerResourceId", resource_name)
+                    hash_input = f"{original_bucket_name}-{snapshot_id}-{actual_region}-{restore_account_id}"
+                    hash_suffix = hashlib.md5(hash_input.encode()).hexdigest()[:8]
+                    # For S3, we always need a unique suffix since bucket names are globally unique
+                    # When restoring to a new account, the original bucket name likely won't be available
+                    # Note: S3 bucket names cannot end with a hyphen, so we strip trailing hyphens after truncation
+                    if resource_name_prefix:
+                        restored_bucket_name = f"{resource_name_prefix}{original_bucket_name}-{hash_suffix}".lower()[:63].rstrip("-")
+                    else:
+                        # Use original name with hash suffix for uniqueness
+                        restored_bucket_name = f"{original_bucket_name}-{hash_suffix}".lower()[:63].rstrip("-")
+
+                    print(f"S3 restore config - region: {actual_region}, bucket: {restored_bucket_name}")
+
+                    # Create the S3 bucket first
+                    create_s3_bucket(
+                        bucket_name=restored_bucket_name,
+                        region=actual_region,
+                        kms_key_id=kms_key_arn,
+                        restore_account_id=restore_account_id,
+                        snapshot_id=snapshot_id,
+                        snapshot_point_in_time=snapshot_point_in_time,
+                        original_tags=original_tags,
+                        restore_account_credentials=restore_account_credentials
+                    )
+
+                    destination_config = {
+                        "s3Bucket": {
+                            "region": actual_region,
+                            "bucketName": restored_bucket_name,
+                            "encryptionKeyId": kms_key_arn,
+                            "prefix": ""
+                        }
+                    }
+
+                    job_id = eon_client.restore_s3_bucket(
+                        resource_id=resource_id,
+                        snapshot_id=snapshot_id,
+                        restore_account_id=eon_restore_account_id,
+                        destination_config=destination_config
+                    )
+
+                    # Capture restored resource details
+                    restored_resource_details = {
+                        "restoredRegion": actual_region,
+                        "restoredBucketName": restored_bucket_name,
+                        "originalBucketName": original_bucket_name
+                    }
 
             elif resource_type == "AWS_DYNAMO_DB":
                 # Check if VPC config exists for target region, otherwise fall back to any available

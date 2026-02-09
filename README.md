@@ -131,7 +131,7 @@ Note: Tag keys matching `excludeEC2TagKeys` will be filtered from restored EC2 i
   "vpcConfigs": [...]
 }
 ```
-Note: When `recoveryStackNames` is provided, the workflow will query the specified CloudFormation stacks in the restore account to discover all DynamoDB tables created by those stacks. If a table matching the source table name AND source region is found, an **in-place restore** is performed to that existing table instead of creating a new table.
+Note: When `recoveryStackNames` is provided, the workflow will query the specified CloudFormation stacks in the restore account to discover DynamoDB tables and S3 buckets created by those stacks. For DynamoDB, if a table matching the source table name AND source region is found, an **in-place restore** is performed to that existing table instead of creating a new table. For S3, if a stack bucket has an `eon_functional_id` tag whose value matches the same tag on the source bucket (from the Eon snapshot's original tags), an **in-place restore** is performed to that existing bucket instead of creating a new one.
 
 **Example with custom resource name prefix:**
 ```json
@@ -154,6 +154,8 @@ S3 bucket names are **globally unique** across all AWS accounts worldwide. This 
 - **Long bucket names are truncated** - S3 limits names to 63 characters; if your original bucket name exceeds 54 characters, the name will be truncated before the hash suffix is added
 - **AWS system tags are filtered** - Tags with reserved prefixes (`aws:`, `elasticbeanstalk:`) from the original bucket are automatically excluded as they cannot be manually recreated
 
+**In-place restore:** When using `recoveryStackNames`, if a source S3 bucket has an `eon_functional_id` tag and a matching bucket exists in the recovery stack with the same tag value, the data is restored directly to the existing bucket without creating a new one. This avoids naming limitations and ensures the bucket name matches what the recovery stack's application code expects.
+
 **Important:** Applications referencing S3 bucket names will need configuration updates after restore to point to the new bucket names. The restored bucket names are included in the workflow output and completion notification.
 
 **Parameter reference:**
@@ -170,7 +172,7 @@ S3 bucket names are **globally unique** across all AWS accounts worldwide. This 
 | `crossAccountRoleArn` | No | Custom role ARN or null for Organizations |
 | `restoreAccountName` | No | Display name in Eon (null = auto-generate) |
 | `excludeEC2TagKeys` | No | List of tag keys to exclude from restored EC2 instances and volumes (default: []) |
-| `recoveryStackNames` | No | List of CloudFormation stack names to scan for pre-created DynamoDB tables (default: []) |
+| `recoveryStackNames` | No | List of CloudFormation stack names to scan for pre-created DynamoDB tables and S3 buckets (default: []) |
 
 ## How It Works
 
@@ -178,9 +180,10 @@ S3 bucket names are **globally unique** across all AWS accounts worldwide. This 
 2. **Connect** - Registers restore account with Eon
 3. **Configure** - Sets up VPC connectivity
 4. **List Snapshots** - Retrieves resources and their snapshots, extracts table sizes
-5. **Initiate Restores** - For DynamoDB:
-   - If `recoveryStackNames` provided: Queries CloudFormation stacks for all `AWS::DynamoDB::Table` resources, uses in-place restore for matches (by table name + region)
-   - Otherwise: Creates new tables with allocated WCUs (38k per region = 95% of 40k, proportional to table sizes, 50 WCU default for zero-size tables)
+5. **Initiate Restores** - If `recoveryStackNames` provided:
+   - **DynamoDB**: Queries stacks for `AWS::DynamoDB::Table` resources, uses in-place restore for matches (by table name + region)
+   - **S3**: Queries stacks for `AWS::S3::Bucket` resources, uses in-place restore for matches (by `eon_functional_id` tag)
+   - Otherwise: Creates new tables with allocated WCUs (38k per region = 95% of 40k) and new S3 buckets with hash suffixes
 6. **Monitor** - Polls until completion (default: 30 hours max)
 
 ![Notification example](./screenshot_output.png)
