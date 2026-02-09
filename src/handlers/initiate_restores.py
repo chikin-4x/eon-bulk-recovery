@@ -852,7 +852,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     restore_bucket_name = stack_bucket_match["bucketName"]
                     restore_bucket_region = stack_bucket_match["region"]
 
-                    # Get KMS key for the bucket's region (may differ from actual_region)
+                    # Get KMS key for the bucket's region (used for restore worker EC2 EBS encryption)
                     stack_kms_key_arn = kms_key_arns_by_region.get(restore_bucket_region)
                     if not stack_kms_key_arn:
                         raise ValueError(f"No KMS key available for region {restore_bucket_region} (required for in-place S3 restore)")
