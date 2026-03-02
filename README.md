@@ -151,7 +151,7 @@ S3 bucket names are **globally unique** across all AWS accounts worldwide. This 
 - **Original bucket names cannot be reused** - The source bucket still exists, so the same name is unavailable
 - **A hash suffix is always added** - Restored buckets are named `{original-name}-{hash}` (e.g., `my-bucket-a1b2c3d4`)
 - **The `resourceNamePrefix` still applies** - With a prefix, buckets become `{prefix}{original-name}-{hash}`
-- **Long bucket names are truncated** - S3 limits names to 63 characters; if your original bucket name exceeds 54 characters, the name will be truncated before the hash suffix is added
+- **Long bucket names are truncated** - S3 limits names to 63 characters; when the combined name (original + hash suffix) exceeds 63 characters, the original name is truncated to preserve the hash suffix
 - **AWS system tags are filtered** - Tags with reserved prefixes (`aws:`, `elasticbeanstalk:`) from the original bucket are automatically excluded as they cannot be manually recreated
 
 **In-place restore:** When using `recoveryStackNames`, if a source S3 bucket has an `eon_functional_id` tag and a matching bucket exists in the recovery stack with the same tag value, the data is restored directly to the existing bucket without creating a new one. This avoids naming limitations and ensures the bucket name matches what the recovery stack's application code expects.

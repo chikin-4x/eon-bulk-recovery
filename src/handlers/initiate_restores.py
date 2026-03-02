@@ -3,6 +3,7 @@
 import os
 import sys
 import hashlib
+import re
 import time
 import random
 from typing import Dict, Any, List, Optional
@@ -444,6 +445,73 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             return f"{resource_name_prefix}{original_name}"
         return original_name  # Use original name for full account recovery
 
+    def sanitize_s3_bucket_name(base_name: str, hash_suffix: str) -> str:
+        """
+        Build a globally-unique S3 bucket name from a base name and hash suffix.
+
+        S3 bucket name constraints:
+        - 3-63 lowercase alphanumeric characters, hyphens, or dots
+        - Must begin and end with a letter or number
+        - No consecutive periods (we also avoid consecutive hyphens for clarity)
+
+        The hash_suffix is always preserved so the name stays globally unique.
+        When the combined name exceeds 63 chars, the base is truncated to make
+        room for ``-<hash_suffix>``.
+        """
+        max_len = 63
+        suffix_with_sep = f"-{hash_suffix}"  # e.g. "-a1b2c3d4" (9 chars)
+
+        combined = f"{base_name}{suffix_with_sep}".lower()
+
+        if len(combined) <= max_len:
+            name = combined
+        else:
+            # Truncate the base to leave room for the suffix
+            allowed_base = max_len - len(suffix_with_sep)
+            truncated = base_name[:allowed_base].rstrip("-")
+            name = f"{truncated}{suffix_with_sep}".lower()
+
+        # Collapse consecutive hyphens and strip leading/trailing hyphens
+        name = re.sub(r"-{2,}", "-", name)
+        name = name.strip("-")
+        return name
+
+    def sanitize_rds_identifier(name: str) -> str:
+        """
+        Sanitize a name to comply with RDS DB instance/cluster identifier constraints:
+        - 1-63 lowercase alphanumeric characters or hyphens
+        - Must begin with a letter
+        - Can't end with a hyphen
+        - Can't contain two consecutive hyphens
+
+        When truncation is needed, appends a short hash of the original name
+        to prevent collisions between names that share the same prefix.
+        """
+        original = name
+        # Lowercase and replace invalid characters with hyphens
+        name = name.lower()
+        name = re.sub(r"[^a-z0-9-]", "-", name)
+        # Collapse consecutive hyphens
+        name = re.sub(r"-{2,}", "-", name)
+        # Strip leading/trailing hyphens
+        name = name.strip("-")
+        # Ensure it starts with a letter
+        if name and not name[0].isalpha():
+            name = "r" + name
+        # If empty after sanitization, generate from hash
+        if not name:
+            name = "r" + hashlib.sha256(original.encode()).hexdigest()[:8]
+        # Truncate to 63 chars, using a hash suffix to avoid collisions
+        max_len = 63
+        if len(name) > max_len:
+            suffix = hashlib.sha256(original.encode()).hexdigest()[:6]
+            # Leave room for hyphen + 6-char hash suffix
+            truncated = name[:max_len - 7].rstrip("-")
+            name = f"{truncated}-{suffix}"
+        # Final safety: strip any trailing hyphen (shouldn't happen but just in case)
+        name = name.rstrip("-")
+        return name
+
     print(f"KMS keys available in regions: {list(kms_key_arns_by_region.keys())}")
     print(f"RDS subnet groups available in regions: {list(rds_subnet_groups_by_region.keys())}")
     print(f"DynamoDB regional WCU limit: {dynamodb_regional_wcu_limit:,}")
@@ -775,7 +843,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
                 # Merge original tags with restore tags (restore tags take precedence)
                 original_tags = resource_snapshot.get("originalTags", {})
-                restored_db_name = get_restored_name(resource_name)
+                restored_db_name = sanitize_rds_identifier(get_restored_name(resource_name))
                 rds_tags = {
                     **original_tags,
                     "Name": restored_db_name,
@@ -893,12 +961,10 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     hash_suffix = hashlib.md5(hash_input.encode()).hexdigest()[:8]
                     # For S3, we always need a unique suffix since bucket names are globally unique
                     # When restoring to a new account, the original bucket name likely won't be available
-                    # Note: S3 bucket names cannot end with a hyphen, so we strip trailing hyphens after truncation
                     if resource_name_prefix:
-                        restored_bucket_name = f"{resource_name_prefix}{original_bucket_name}-{hash_suffix}".lower()[:63].rstrip("-")
+                        restored_bucket_name = sanitize_s3_bucket_name(f"{resource_name_prefix}{original_bucket_name}", hash_suffix)
                     else:
-                        # Use original name with hash suffix for uniqueness
-                        restored_bucket_name = f"{original_bucket_name}-{hash_suffix}".lower()[:63].rstrip("-")
+                        restored_bucket_name = sanitize_s3_bucket_name(original_bucket_name, hash_suffix)
 
                     print(f"S3 restore config - region: {actual_region}, bucket: {restored_bucket_name}")
 
