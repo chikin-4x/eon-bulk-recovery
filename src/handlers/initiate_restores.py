@@ -64,32 +64,17 @@ def calculate_dynamodb_wcu_allocation_by_region(
         print(f"    Tables with size data: {len(dynamodb_tables)}")
         print(f"    Tables with zero size: {len(zero_size_tables)}")
 
-        # Allocate default WCU to zero-size tables
-        zero_size_total_wcu = len(zero_size_tables) * default_wcu_for_zero_size
+        # Allocate sized tables first so they get proportional shares of capacity
+        allocated_total = 0
 
-        for table in zero_size_tables:
-            wcu_allocation[table["resourceId"]] = default_wcu_for_zero_size
-            print(f"    {table['resourceName']}: 0 GB (no size data) -> {default_wcu_for_zero_size:,} WCU (default)")
-
-        # Remaining WCU for sized tables
-        remaining_wcu = available_wcu - zero_size_total_wcu
-
-        if dynamodb_tables and remaining_wcu > 0:
-            # Calculate total size across all sized tables in this region
+        if dynamodb_tables:
             total_size = sum(table["sizeBytes"] for table in dynamodb_tables)
 
             print(f"    Total data size (sized tables): {total_size / (1024**3):.2f} GB")
-            print(f"    Remaining WCU for sized tables: {remaining_wcu:,}")
-
-            # Allocate WCUs proportionally based on table size
-            allocated_total = zero_size_total_wcu
 
             for table in dynamodb_tables:
-                # Calculate proportional WCU
                 proportion = table["sizeBytes"] / total_size
-                proportional_wcu = int(remaining_wcu * proportion)
-
-                # Ensure minimum of 1 WCU
+                proportional_wcu = int(available_wcu * proportion)
                 allocated_wcu = max(proportional_wcu, 1)
 
                 wcu_allocation[table["resourceId"]] = allocated_wcu
@@ -98,9 +83,17 @@ def calculate_dynamodb_wcu_allocation_by_region(
                 table_size_gb = table["sizeBytes"] / (1024**3)
                 print(f"    {table['resourceName']}: {table_size_gb:.2f} GB ({proportion*100:.1f}%) -> {allocated_wcu:,} WCU")
 
-            print(f"    Total allocated in {region}: {allocated_total:,} WCU ({allocated_total/regional_wcu_capacity*100:.1f}% of regional capacity)")
-        elif not dynamodb_tables:
-            print(f"    Total allocated in {region}: {zero_size_total_wcu:,} WCU (all tables have zero size)")
+        # Give zero-size tables the default or whatever remains, whichever is smaller
+        remaining_wcu = available_wcu - allocated_total
+
+        for table in zero_size_tables:
+            allocated_wcu = min(default_wcu_for_zero_size, max(remaining_wcu, 1))
+            wcu_allocation[table["resourceId"]] = allocated_wcu
+            remaining_wcu -= allocated_wcu
+            allocated_total += allocated_wcu
+            print(f"    {table['resourceName']}: 0 GB (no size data) -> {allocated_wcu:,} WCU")
+
+        print(f"    Total allocated in {region}: {allocated_total:,} WCU ({allocated_total/regional_wcu_capacity*100:.1f}% of regional capacity)")
 
     return wcu_allocation
 
