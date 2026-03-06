@@ -90,6 +90,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             resource_data["instanceType"] = resource_properties.get("instanceType")
         elif resource.get("resourceType") == "AWS_RDS":
             resource_data["dbInstanceClass"] = resource_properties.get("dbInstanceClass")
+        elif resource.get("resourceType") == "AWS_DYNAMO_DB":
+            source_storage = resource.get("sourceStorage", {})
+            resource_data["tableSizeBytes"] = source_storage.get("sizeBytes", 0)
 
         # Debug: Log region extraction
         print(f"Resource {resource_data['resourceName']} ({resource_data['resourceType']}) - region: {resource_data['region']}")

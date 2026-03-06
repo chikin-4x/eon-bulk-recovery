@@ -127,17 +127,17 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             elif resource_type == "AWS_RDS" and resource.get("dbInstanceClass"):
                 snapshot_data["dbInstanceClass"] = resource.get("dbInstanceClass")
 
-            # For DynamoDB tables, extract table size from sourceStorage
+            # For DynamoDB tables, use table size from the resource listing (sourceStorage.sizeBytes)
+            # Note: the snapshot API does NOT include sourceStorage — it's only on the resource API
             elif resource_type == "AWS_DYNAMO_DB":
-                source_storage = snapshot_resource.get("sourceStorage", {})
-                table_size_bytes = source_storage.get("sizeBytes", 0)
+                table_size_bytes = resource.get("tableSizeBytes", 0)
 
                 snapshot_data["tableSizeBytes"] = table_size_bytes
 
                 # Convert bytes to GB for easier reading
                 table_size_gb = table_size_bytes / (1024 ** 3) if table_size_bytes > 0 else 0
 
-                print(f"Extracted DynamoDB table size: {table_size_gb:.2f} GB ({table_size_bytes:,} bytes)")
+                print(f"DynamoDB table size (from resource): {table_size_gb:.2f} GB ({table_size_bytes:,} bytes)")
 
                 if table_size_bytes == 0:
                     print(f"WARNING: No size information available for {resource_name}, will use equal WCU distribution")
