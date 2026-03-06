@@ -167,12 +167,31 @@ S3 bucket names are **globally unique** across all AWS accounts worldwide. This 
 | `restoreRegion` | No | Force all resources to this region (null = use source regions) |
 | `snapshotDate` | No | Date for snapshot selection (YYYY-MM-DD, null = latest) |
 | `resourceNamePrefix` | No | Prefix for restored resource names (null = use original names) |
-| `dynamodbRegionalWcuLimit` | No | DynamoDB WCU limit per region (default: 40000) |
+| `dynamodbRegionalWcuLimit` | No | DynamoDB WCU limit per region for restore throughput (default: 40000). See [DynamoDB WCU Allocation](#dynamodb-wcu-allocation) |
 | `vpcConfigs` | Yes | Network configuration per region (creates KMS keys and RDS subnet groups automatically) |
 | `crossAccountRoleArn` | No | Custom role ARN or null for Organizations |
 | `restoreAccountName` | No | Display name in Eon (null = auto-generate) |
 | `excludeEC2TagKeys` | No | List of tag keys to exclude from restored EC2 instances and volumes (default: []) |
 | `recoveryStackNames` | No | List of CloudFormation stack names to scan for pre-created DynamoDB tables and S3 buckets (default: []) |
+
+### DynamoDB WCU Allocation
+
+When restoring DynamoDB tables, the workflow distributes Write Capacity Units (WCUs) across tables **per-region** to maximize restore throughput without exceeding account limits.
+
+**How it works:**
+1. Tables with known sizes (from Eon's resource inventory) are allocated first, proportionally to their size — a 10 GB table gets 10× the WCUs of a 1 GB table
+2. 95% of the regional WCU limit is used (default: 38,000 out of 40,000) to leave headroom
+3. Tables with unknown sizes (0 bytes) receive a small default allocation (50 WCU) from whatever capacity remains
+
+**Example:** 3 tables in us-east-1 with a 40,000 WCU limit:
+
+| Table | Size | Allocation |
+|-------|------|------------|
+| orders | 30 GB (75%) | 28,500 WCU |
+| users | 10 GB (25%) | 9,500 WCU |
+| cache | 0 GB (unknown) | 50 WCU |
+
+**Tuning:** Set `dynamodbRegionalWcuLimit` based on your restore account's DynamoDB WCU quota. The default (40,000) is the standard AWS account limit. Request a quota increase via AWS Service Quotas if you need faster restores for large datasets.
 
 ## How It Works
 
