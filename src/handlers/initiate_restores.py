@@ -412,6 +412,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         crossAccountRoleArn: ARN of cross-account role (optional)
         excludeEC2TagKeys: List of tag keys to exclude from EC2 instance tags (optional)
         recoveryStackNames: List of CloudFormation stack names to check for pre-created DynamoDB tables (optional)
+        recoveryStacksOnly: If true, only restore resources matching a stack table/bucket (optional, default false)
 
     Returns:
         restoreJobs: List of initiated restore jobs with job IDs
@@ -429,6 +430,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     management_account_id = os.environ.get("MANAGEMENT_ACCOUNT_ID", "").strip() or None
     exclude_ec2_tag_keys = event.get("excludeEC2TagKeys", [])
     enable_cdk_recovery_stacks = event.get("recoveryStackNames", [])
+    recovery_stacks_only = event.get("recoveryStacksOnly", False)
     resource_name_prefix = event.get("resourceNamePrefix")  # None means use original name
 
     # Helper function to generate restored resource name
@@ -513,6 +515,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         print(f"EC2 tag keys to exclude: {exclude_ec2_tag_keys}")
     if enable_cdk_recovery_stacks:
         print(f"Recovery stacks to check: {enable_cdk_recovery_stacks}")
+    if recovery_stacks_only:
+        print(f"Recovery stacks ONLY mode: will skip resources without a matching stack table/bucket")
 
     # Get credentials for restore account once (reused throughout)
     restore_account_credentials = None
@@ -615,6 +619,11 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         target_region = restore_region if restore_region else source_region
 
         print(f"Initiating restore for {resource_type}: {resource_name} (source region: {source_region}, target region: {target_region})")
+
+        # In recoveryStacksOnly mode, skip resource types that don't come from stacks
+        if recovery_stacks_only and resource_type in ("AWS_EC2", "AWS_RDS"):
+            print(f"SKIPPING {resource_name} ({resource_type}) - recoveryStacksOnly mode, no stack matching for this type")
+            continue
 
         try:
             job_id = None
@@ -946,6 +955,10 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                         "eonFunctionalId": source_functional_id
                     }
                 else:
+                    if recovery_stacks_only:
+                        print(f"SKIPPING {resource_name} (S3) - recoveryStacksOnly mode, no matching stack bucket")
+                        continue
+
                     # Default flow: create a new bucket
                     # Create a bucket name (S3 bucket names must be globally unique)
                     # Include snapshot ID and region in the hash to ensure uniqueness across restores
@@ -1055,6 +1068,10 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                         "recoveryStackName": stack_table_match["stackName"]
                     }
                 else:
+                    if recovery_stacks_only:
+                        print(f"SKIPPING {resource_name} (DynamoDB) - recoveryStacksOnly mode, no matching stack table")
+                        continue
+
                     # Standard restore to new table
                     # Get allocated WCU for this table
                     allocated_wcu = dynamodb_wcu_allocation.get(resource_id, 50)  # fallback to default

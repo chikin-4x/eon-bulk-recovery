@@ -9,6 +9,7 @@
   "crossAccountRoleArn": null,
   "excludeEC2TagKeys": [],
   "recoveryStackNames": [],
+  "recoveryStacksOnly": false,
   "vpcConfigs": [
     {
       "region": "us-east-1",

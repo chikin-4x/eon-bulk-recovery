@@ -181,7 +181,8 @@
         "vpcConfigs.$": "$.vpcConfigs",
         "crossAccountRoleArn.$": "$.crossAccountRoleArn",
         "excludeEC2TagKeys.$": "$.excludeEC2TagKeys",
-        "recoveryStackNames.$": "$.recoveryStackNames"
+        "recoveryStackNames.$": "$.recoveryStackNames",
+        "recoveryStacksOnly.$": "$.recoveryStacksOnly"
       },
       "ResultPath": "$.restoreJobsResult",
       "Retry": [

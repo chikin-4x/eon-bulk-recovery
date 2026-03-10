@@ -87,15 +87,22 @@ aws stepfunctions start-execution \
 ### Execution Input
 
 **Minimal example (AWS Organizations):**
+
+> **Important:** All fields must be present in the execution input — Step Functions will fail at runtime if any key referenced in the state machine is missing. Use `null`, `[]`, or `false` for unused optional fields.
+
 ```json
 {
   "sourceAccountId": "333333333333",
   "restoreAccountId": "222222222222",
   "restoreRegion": null,
   "snapshotDate": null,
+  "resourceNamePrefix": null,
   "dynamodbRegionalWcuLimit": 40000,
   "crossAccountRoleArn": null,
   "excludeEC2TagKeys": [],
+  "recoveryStackNames": [],
+  "recoveryStacksOnly": false,
+  "restoreAccountName": null,
   "vpcConfigs": [{
     "region": "us-east-1",
     "vpc": "vpc-xxx",
@@ -111,27 +118,24 @@ aws stepfunctions start-execution \
 }
 ```
 
-**Example with tag exclusion:**
+**Tag exclusion** — add to the minimal example above:
 ```json
-{
-  "sourceAccountId": "333333333333",
-  "restoreAccountId": "222222222222",
-  "excludeEC2TagKeys": ["aws:autoscaling:groupName", "kubernetes.io/cluster/my-cluster"],
-  "vpcConfigs": [...]
-}
+  "excludeEC2TagKeys": ["aws:autoscaling:groupName", "kubernetes.io/cluster/my-cluster"]
 ```
-Note: Tag keys matching `excludeEC2TagKeys` will be filtered from restored EC2 instances and their volumes.
+Tag keys matching this list will be filtered from restored EC2 instances and their volumes.
 
-**Example with pre-created DynamoDB tables (CDK/CloudFormation stacks):**
+**Recovery stacks (in-place restore)** — add to the minimal example above:
 ```json
-{
-  "sourceAccountId": "333333333333",
-  "restoreAccountId": "222222222222",
-  "recoveryStackNames": ["OrdersServiceStack", "UserDataStack"],
-  "vpcConfigs": [...]
-}
+  "recoveryStackNames": ["OrdersServiceStack", "UserDataStack"]
 ```
-Note: When `recoveryStackNames` is provided, the workflow will query the specified CloudFormation stacks in the restore account to discover DynamoDB tables and S3 buckets created by those stacks. For DynamoDB, if a table matching the source table name AND source region is found, an **in-place restore** is performed to that existing table instead of creating a new table. For S3, if a stack bucket has an `eon_functional_id` tag whose value matches the same tag on the source bucket (from the Eon snapshot's original tags), an **in-place restore** is performed to that existing bucket instead of creating a new one.
+The workflow queries the named CloudFormation stacks in the restore account for pre-created DynamoDB tables and S3 buckets. For DynamoDB, if a table matching the source table name AND source region is found, an **in-place restore** is performed instead of creating a new table. For S3, if a stack bucket has an `eon_functional_id` tag matching the source bucket's tag, an **in-place restore** is performed to that existing bucket.
+
+**Stacks-only mode** — set both fields to only restore stack-matched resources:
+```json
+  "recoveryStackNames": ["OrdersServiceStack"],
+  "recoveryStacksOnly": true
+```
+Skips EC2, RDS, and any DynamoDB/S3 resources that don't match a stack table or bucket.
 
 **Example with custom resource name prefix:**
 ```json
@@ -173,6 +177,7 @@ S3 bucket names are **globally unique** across all AWS accounts worldwide. This 
 | `restoreAccountName` | No | Display name in Eon (null = auto-generate) |
 | `excludeEC2TagKeys` | No | List of tag keys to exclude from restored EC2 instances and volumes (default: []) |
 | `recoveryStackNames` | No | List of CloudFormation stack names to scan for pre-created DynamoDB tables and S3 buckets (default: []) |
+| `recoveryStacksOnly` | No | When `true`, only restore resources that match a stack table/bucket — skip EC2, RDS, and unmatched DynamoDB/S3 (default: false) |
 
 ### DynamoDB WCU Allocation
 
