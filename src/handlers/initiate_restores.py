@@ -6,7 +6,8 @@ import hashlib
 import re
 import time
 import random
-from typing import Dict, Any, List, Optional
+from dataclasses import dataclass, field
+from typing import Dict, Any, List, Optional, Tuple
 import boto3
 from botocore.exceptions import ClientError
 
@@ -16,6 +17,132 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from lib.eon_client import EonClient
 from lib.aws_utils import get_eon_credentials, get_cross_account_credentials
 
+
+# ---------------------------------------------------------------------------
+# Shared utilities
+# ---------------------------------------------------------------------------
+
+def create_boto3_client(
+    service: str,
+    region: str,
+    credentials: Optional[Dict[str, str]] = None,
+):
+    """Create a boto3 client, optionally using cross-account credentials."""
+    if credentials:
+        return boto3.client(
+            service,
+            region_name=region,
+            aws_access_key_id=credentials["AccessKeyId"],
+            aws_secret_access_key=credentials["SecretAccessKey"],
+            aws_session_token=credentials["SessionToken"],
+        )
+    return boto3.client(service, region_name=region)
+
+
+def resolve_target_region(
+    target_region: Optional[str],
+    region_configs: Dict[str, Any],
+    resource_name: str,
+    config_label: str = "VPC config",
+    error_label: str = "VPC configurations",
+) -> str:
+    """Pick the best region from *region_configs*, warning on fallback."""
+    if target_region and target_region in region_configs:
+        return target_region
+    if region_configs:
+        fallback = list(region_configs.keys())[0]
+        print(f"WARNING: No {config_label} for target region {target_region}, falling back to: {fallback}")
+        return fallback
+    raise ValueError(f"No {error_label} available for restoring {resource_name}")
+
+
+def require_kms_key(kms_key_arns_by_region: Dict[str, str], region: str) -> str:
+    """Return the KMS key ARN for *region* or raise."""
+    kms_key_arn = kms_key_arns_by_region.get(region)
+    if not kms_key_arn:
+        raise ValueError(f"No KMS key available for region {region}")
+    return kms_key_arn
+
+
+def get_restored_name(original_name: str, prefix: Optional[str] = None) -> str:
+    """Apply the optional resource-name prefix."""
+    if prefix:
+        return f"{prefix}{original_name}"
+    return original_name
+
+
+def sanitize_s3_bucket_name(base_name: str, hash_suffix: str) -> str:
+    """
+    Build a globally-unique S3 bucket name from a base name and hash suffix.
+
+    S3 bucket name constraints:
+    - 3-63 lowercase alphanumeric characters, hyphens, or dots
+    - Must begin and end with a letter or number
+    - No consecutive periods (we also avoid consecutive hyphens for clarity)
+
+    The hash_suffix is always preserved so the name stays globally unique.
+    When the combined name exceeds 63 chars, the base is truncated to make
+    room for ``-<hash_suffix>``.
+    """
+    max_len = 63
+    suffix_with_sep = f"-{hash_suffix}"  # e.g. "-a1b2c3d4" (9 chars)
+
+    combined = f"{base_name}{suffix_with_sep}".lower()
+
+    if len(combined) <= max_len:
+        name = combined
+    else:
+        # Truncate the base to leave room for the suffix
+        allowed_base = max_len - len(suffix_with_sep)
+        truncated = base_name[:allowed_base].rstrip("-")
+        name = f"{truncated}{suffix_with_sep}".lower()
+
+    # Collapse consecutive hyphens and strip leading/trailing hyphens
+    name = re.sub(r"-{2,}", "-", name)
+    name = name.strip("-")
+    return name
+
+
+def sanitize_rds_identifier(name: str) -> str:
+    """
+    Sanitize a name to comply with RDS DB instance/cluster identifier constraints:
+    - 1-63 lowercase alphanumeric characters or hyphens
+    - Must begin with a letter
+    - Can't end with a hyphen
+    - Can't contain two consecutive hyphens
+
+    When truncation is needed, appends a short hash of the original name
+    to prevent collisions between names that share the same prefix.
+    """
+    original = name
+    # Lowercase and replace invalid characters with hyphens
+    name = name.lower()
+    name = re.sub(r"[^a-z0-9-]", "-", name)
+    # Collapse consecutive hyphens
+    name = re.sub(r"-{2,}", "-", name)
+    # Strip leading/trailing hyphens
+    name = name.strip("-")
+    # Ensure it starts with a letter
+    if name and not name[0].isalpha():
+        name = "r" + name
+    # If empty after sanitization, generate from hash
+    if not name:
+        name = "r" + hashlib.sha256(original.encode()).hexdigest()[:8]
+    # Truncate to 63 chars, using a hash suffix to avoid collisions
+    max_len = 63
+    if len(name) > max_len:
+        suffix = hashlib.sha256(original.encode()).hexdigest()[:6]
+        # Leave room for hyphen + 6-char hash suffix
+        truncated = name[:max_len - 7].rstrip("-")
+        name = f"{truncated}-{suffix}"
+    # Final safety: strip any trailing hyphen (shouldn't happen but just in case)
+    name = name.rstrip("-")
+    return name
+
+
+# ---------------------------------------------------------------------------
+# DynamoDB WCU allocation
+# ---------------------------------------------------------------------------
 
 def calculate_dynamodb_wcu_allocation_by_region(
     dynamodb_tables_by_region: Dict[str, List[Dict[str, Any]]],
@@ -98,6 +225,10 @@ def calculate_dynamodb_wcu_allocation_by_region(
     return wcu_allocation
 
 
+# ---------------------------------------------------------------------------
+# CloudFormation stack discovery
+# ---------------------------------------------------------------------------
+
 def discover_dynamodb_tables_from_stacks(
     stack_names: List[str],
     restore_account_credentials: Optional[Dict[str, str]] = None,
@@ -130,17 +261,7 @@ def discover_dynamodb_tables_from_stacks(
     discovered_tables = {}
 
     for region in regions:
-        # Create CloudFormation client
-        if restore_account_credentials:
-            cfn_client = boto3.client(
-                "cloudformation",
-                region_name=region,
-                aws_access_key_id=restore_account_credentials["AccessKeyId"],
-                aws_secret_access_key=restore_account_credentials["SecretAccessKey"],
-                aws_session_token=restore_account_credentials["SessionToken"]
-            )
-        else:
-            cfn_client = boto3.client("cloudformation", region_name=region)
+        cfn_client = create_boto3_client("cloudformation", region, restore_account_credentials)
 
         for stack_name in stack_names:
             try:
@@ -225,16 +346,7 @@ def discover_s3_buckets_from_stacks(
     discovered_buckets = []
 
     for region in regions:
-        if restore_account_credentials:
-            cfn_client = boto3.client(
-                "cloudformation",
-                region_name=region,
-                aws_access_key_id=restore_account_credentials["AccessKeyId"],
-                aws_secret_access_key=restore_account_credentials["SecretAccessKey"],
-                aws_session_token=restore_account_credentials["SessionToken"]
-            )
-        else:
-            cfn_client = boto3.client("cloudformation", region_name=region)
+        cfn_client = create_boto3_client("cloudformation", region, restore_account_credentials)
 
         for stack_name in stack_names:
             try:
@@ -278,16 +390,7 @@ def discover_s3_buckets_from_stacks(
     s3_buckets_by_functional_id = {}
 
     for bucket_info in discovered_buckets:
-        if restore_account_credentials:
-            s3_client = boto3.client(
-                "s3",
-                region_name=bucket_info["region"],
-                aws_access_key_id=restore_account_credentials["AccessKeyId"],
-                aws_secret_access_key=restore_account_credentials["SecretAccessKey"],
-                aws_session_token=restore_account_credentials["SessionToken"]
-            )
-        else:
-            s3_client = boto3.client("s3", region_name=bucket_info["region"])
+        s3_client = create_boto3_client("s3", bucket_info["region"], restore_account_credentials)
 
         try:
             tagging_response = s3_client.get_bucket_tagging(Bucket=bucket_info["bucketName"])
@@ -320,22 +423,16 @@ def discover_s3_buckets_from_stacks(
     return s3_buckets_by_functional_id
 
 
+# ---------------------------------------------------------------------------
+# S3 bucket creation
+# ---------------------------------------------------------------------------
+
 def create_s3_bucket(bucket_name: str, region: str, kms_key_id: str, restore_account_id: str, snapshot_id: str, snapshot_point_in_time: str, original_tags: Dict[str, str] = None, restore_account_credentials: Dict[str, str] = None) -> None:
     """Create an S3 bucket in the restore account."""
     if original_tags is None:
         original_tags = {}
 
-    # Use provided credentials or fall back to Lambda execution role
-    if restore_account_credentials:
-        s3_client = boto3.client(
-            "s3",
-            region_name=region,
-            aws_access_key_id=restore_account_credentials["AccessKeyId"],
-            aws_secret_access_key=restore_account_credentials["SecretAccessKey"],
-            aws_session_token=restore_account_credentials["SessionToken"]
-        )
-    else:
-        s3_client = boto3.client("s3", region_name=region)
+    s3_client = create_boto3_client("s3", region, restore_account_credentials)
 
     try:
         if region == "us-east-1":
@@ -396,6 +493,565 @@ def create_s3_bucket(bucket_name: str, region: str, kms_key_id: str, restore_acc
             raise
 
 
+# ---------------------------------------------------------------------------
+# Restore context (shared state for all restore operations)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _RestoreContext:
+    """Bundles the shared configuration used by every per-resource restore function."""
+    eon_client: EonClient
+    eon_restore_account_id: str
+    restore_account_id: str
+    restore_region: str
+    kms_key_arns_by_region: Dict[str, str]
+    rds_subnet_groups_by_region: Dict[str, str]
+    vpc_configs_by_region: Dict[str, Any]
+    restore_account_credentials: Optional[Dict[str, str]]
+    resource_name_prefix: Optional[str]
+    exclude_ec2_tag_keys: List[str]
+    recovery_stack_tables: Dict[str, Dict[str, str]]
+    recovery_stack_s3_buckets: Dict[str, Dict[str, str]]
+    recovery_stacks_only: bool
+    dynamodb_wcu_allocation: Dict[str, int]
+
+
+# ---------------------------------------------------------------------------
+# Per-resource-type restore functions
+#
+# Each returns Optional[Tuple[str, dict]]:
+#   - None  → skip this resource (e.g. recoveryStacksOnly with no match)
+#   - (job_id, details_dict) → restore was initiated
+#   - raises on error
+# ---------------------------------------------------------------------------
+
+def _initiate_ec2_restore(
+    ctx: _RestoreContext,
+    resource_snapshot: Dict[str, Any],
+    target_region: Optional[str],
+) -> Optional[Tuple[str, dict]]:
+    resource_id = resource_snapshot["resourceId"]
+    resource_name = resource_snapshot["resourceName"]
+    snapshot_id = resource_snapshot["snapshotId"]
+    snapshot_point_in_time = resource_snapshot.get("snapshotPointInTime", "Unknown")
+
+    # Get instance configuration from snapshot
+    instance_type = resource_snapshot.get("instanceType", "t3.medium")
+    volumes = resource_snapshot.get("volumes", [])
+
+    # Resolve region
+    actual_region = resolve_target_region(target_region, ctx.vpc_configs_by_region, resource_name)
+    vpc_config = ctx.vpc_configs_by_region[actual_region]
+    if actual_region == target_region:
+        print(f"Using VPC config for target region: {actual_region}")
+
+    # Extract subnets and security groups from the region-specific VPC config
+    subnets_per_az = vpc_config.get("subnetsPerAvailabilityZone", [])
+    security_groups = vpc_config.get("securityGroups", {})
+    security_group_ids = security_groups.get("restoreServer", [])
+
+    if not subnets_per_az:
+        raise ValueError(f"No subnets available in region {actual_region} for EC2 restore of {resource_name}")
+
+    # Check which AZs support this instance type
+    ec2_client = create_boto3_client("ec2", actual_region, ctx.restore_account_credentials)
+
+    print(f"Checking availability of instance type {instance_type} in region {actual_region}")
+    try:
+        offerings_response = ec2_client.describe_instance_type_offerings(
+            LocationType='availability-zone',
+            Filters=[
+                {'Name': 'instance-type', 'Values': [instance_type]}
+            ]
+        )
+        available_azs = {offering['Location'] for offering in offerings_response.get('InstanceTypeOfferings', [])}
+        print(f"Instance type {instance_type} is available in AZs: {sorted(available_azs)}")
+    except ClientError as e:
+        print(f"WARNING: Could not check instance type availability: {str(e)}")
+        available_azs = None
+
+    # Select a subnet in an AZ that supports the instance type
+    subnet_id = _select_ec2_subnet(subnets_per_az, available_azs, instance_type)
+
+    # Volumes must be present - no volumes means no data to restore
+    if not volumes:
+        print(f"ERROR: No volume configuration found for {resource_name}, cannot restore")
+        raise ValueError(f"No volumes found for EC2 instance {resource_name}")
+
+    kms_key_arn = require_kms_key(ctx.kms_key_arns_by_region, actual_region)
+
+    # Build volume restore parameters from snapshot volume data
+    volume_restore_params = []
+    for vol in volumes:
+        # Get original volume tags and filter out excluded tag keys
+        original_tags = vol.get("tags", {})
+        filtered_volume_tags = {
+            k: v for k, v in original_tags.items()
+            if k not in ctx.exclude_ec2_tag_keys
+        }
+
+        volume_tags = {
+            **filtered_volume_tags,
+            "eon:restore": "true",
+            "eon:snapshot_id": snapshot_id,
+            "eon:snapshot_time": snapshot_point_in_time
+        }
+
+        vol_param = {
+            "providerVolumeId": vol.get("providerVolumeId", "unknown"),
+            "volumeEncryptionKeyId": kms_key_arn,
+            "volumeSettings": vol.get("volumeSettings", {}),
+            "tags": volume_tags
+        }
+        volume_restore_params.append(vol_param)
+
+    print(f"EC2 restore config - region: {actual_region}, instance_type: {instance_type}, subnet: {subnet_id}, "
+          f"security_groups: {len(security_group_ids)}, volumes: {len(volume_restore_params)}")
+    print(f"Volume encryption - using KMS key: {kms_key_arn}")
+
+    # Build instance tags (filter excluded keys, merge with restore tags)
+    original_tags = resource_snapshot.get("originalTags", {})
+    filtered_original_tags = {
+        k: v for k, v in original_tags.items()
+        if k not in ctx.exclude_ec2_tag_keys
+    }
+
+    if ctx.exclude_ec2_tag_keys and original_tags:
+        excluded_tags = [k for k in original_tags.keys() if k in ctx.exclude_ec2_tag_keys]
+        if excluded_tags:
+            print(f"Excluding EC2 tags for {resource_name}: {excluded_tags}")
+
+    restored_instance_name = get_restored_name(resource_name, ctx.resource_name_prefix)
+    ec2_tags = {
+        **filtered_original_tags,
+        "Name": restored_instance_name,
+        "RestoreSource": resource_snapshot.get("providerResourceId", ""),
+        "ManagedBy": "EonBulkRecovery",
+        "eon:restore": "true",
+        "eon:snapshot_id": snapshot_id,
+        "eon:snapshot_time": snapshot_point_in_time
+    }
+
+    destination_config = {
+        "awsEc2": {
+            "region": actual_region,
+            "instanceType": instance_type,
+            "subnetId": subnet_id,
+            "securityGroupIds": security_group_ids,
+            "tags": ec2_tags,
+            "volumeRestoreParameters": volume_restore_params
+        }
+    }
+
+    # NOTE: Temporarily commented out as Eon does not currently request permissions to be able to create instance profile in restore account
+    # instance_profile_name = resource_snapshot.get("instanceProfileName")
+    # if instance_profile_name:
+    #     destination_config["awsEc2"]["instanceProfileName"] = instance_profile_name
+    #     print(f"Including instance profile: {instance_profile_name}")
+
+    job_id = ctx.eon_client.restore_ec2_instance(
+        resource_id=resource_id,
+        snapshot_id=snapshot_id,
+        restore_account_id=ctx.eon_restore_account_id,
+        destination_config=destination_config
+    )
+
+    restored_resource_details = {
+        "restoredRegion": actual_region,
+        "instanceType": instance_type,
+        "volumeCount": len(volume_restore_params),
+        "restoredName": restored_instance_name
+    }
+    return job_id, restored_resource_details
+
+
+def _select_ec2_subnet(
+    subnets_per_az: List[Dict[str, Any]],
+    available_azs: Optional[set],
+    instance_type: str,
+) -> str:
+    """Pick a subnet compatible with *instance_type*, or fall back to random."""
+    if available_azs:
+        compatible_subnets = [
+            subnet for subnet in subnets_per_az
+            if subnet.get("availabilityZone") in available_azs and subnet.get("subnetId")
+        ]
+        if compatible_subnets:
+            selected = random.choice(compatible_subnets)
+            print(f"Selected subnet {selected['subnetId']} in AZ {selected['availabilityZone']} (supports {instance_type})")
+            return selected["subnetId"]
+
+        configured_azs = {subnet.get("availabilityZone") for subnet in subnets_per_az if subnet.get("availabilityZone")}
+        raise ValueError(
+            f"Instance type {instance_type} is not available in any configured availability zones. "
+            f"Instance type available in: {sorted(available_azs)}, "
+            f"Configured subnets in: {sorted(configured_azs)}"
+        )
+
+    # Couldn't check availability, use random selection as fallback
+    available_subnets = [subnet.get("subnetId") for subnet in subnets_per_az if subnet.get("subnetId")]
+    subnet_id = random.choice(available_subnets)
+    print(f"Selected subnet {subnet_id} (could not verify instance type availability)")
+    return subnet_id
+
+
+def _initiate_rds_restore(
+    ctx: _RestoreContext,
+    resource_snapshot: Dict[str, Any],
+    target_region: Optional[str],
+) -> Optional[Tuple[str, dict]]:
+    resource_id = resource_snapshot["resourceId"]
+    resource_name = resource_snapshot["resourceName"]
+    snapshot_id = resource_snapshot["snapshotId"]
+    snapshot_point_in_time = resource_snapshot.get("snapshotPointInTime", "Unknown")
+
+    db_instance_class = resource_snapshot.get("dbInstanceClass", "db.t3.micro")
+
+    # Resolve region via RDS subnet groups
+    actual_region = resolve_target_region(
+        target_region, ctx.rds_subnet_groups_by_region, resource_name,
+        config_label="RDS subnet group",
+        error_label="RDS subnet groups",
+    )
+    rds_subnet_group_name = ctx.rds_subnet_groups_by_region[actual_region]
+    if actual_region == target_region:
+        print(f"Using RDS subnet group for target region: {actual_region}")
+
+    # Get security groups from the region-specific VPC config
+    vpc_config = ctx.vpc_configs_by_region.get(actual_region, {})
+    security_groups_config = vpc_config.get("securityGroups", {})
+    rds_security_groups = security_groups_config.get("restoredRdsInstance", [])
+
+    kms_key_arn = require_kms_key(ctx.kms_key_arns_by_region, actual_region)
+
+    # Merge original tags with restore tags (restore tags take precedence)
+    original_tags = resource_snapshot.get("originalTags", {})
+    restored_db_name = sanitize_rds_identifier(get_restored_name(resource_name, ctx.resource_name_prefix))
+    rds_tags = {
+        **original_tags,
+        "Name": restored_db_name,
+        "RestoreSource": resource_snapshot.get("providerResourceId", ""),
+        "ManagedBy": "EonBulkRecovery",
+        "eon:restore": "true",
+        "eon:snapshot_id": snapshot_id,
+        "eon:snapshot_time": snapshot_point_in_time
+    }
+
+    destination_config = {
+        "awsRds": {
+            "restoreRegion": actual_region,
+            "encryptionKeyId": kms_key_arn,
+            "restoredName": restored_db_name,
+            "securityGroups": rds_security_groups,
+            "subnetGroup": rds_subnet_group_name,
+            "dbInstanceClass": db_instance_class,
+            "tags": rds_tags
+        }
+    }
+
+    print(f"RDS restore config - region: {actual_region}, subnet_group: {rds_subnet_group_name}, "
+          f"security_groups: {len(rds_security_groups)}, instance_class: {db_instance_class}")
+
+    job_id = ctx.eon_client.restore_rds_instance(
+        resource_id=resource_id,
+        snapshot_id=snapshot_id,
+        restore_account_id=ctx.eon_restore_account_id,
+        destination_config=destination_config
+    )
+
+    restored_resource_details = {
+        "restoredRegion": actual_region,
+        "dbInstanceClass": db_instance_class,
+        "restoredName": restored_db_name,
+        "subnetGroup": rds_subnet_group_name
+    }
+    return job_id, restored_resource_details
+
+
+def _initiate_s3_restore(
+    ctx: _RestoreContext,
+    resource_snapshot: Dict[str, Any],
+    target_region: Optional[str],
+) -> Optional[Tuple[str, dict]]:
+    resource_name = resource_snapshot["resourceName"]
+    original_tags = resource_snapshot.get("originalTags", {})
+
+    # Resolve region and KMS key up-front (matches original validation order)
+    actual_region = resolve_target_region(target_region, ctx.vpc_configs_by_region, resource_name)
+    if actual_region == target_region:
+        print(f"Restoring S3 to target region: {actual_region}")
+
+    kms_key_arn = require_kms_key(ctx.kms_key_arns_by_region, actual_region)
+
+    # Check for in-place restore via eon_functional_id tag matching
+    source_functional_id = original_tags.get("eon_functional_id")
+    stack_bucket_match = None
+
+    if source_functional_id and ctx.recovery_stack_s3_buckets:
+        if source_functional_id in ctx.recovery_stack_s3_buckets:
+            stack_bucket_match = ctx.recovery_stack_s3_buckets[source_functional_id]
+            print(f"Found matching S3 bucket '{stack_bucket_match['bucketName']}' with eon_functional_id='{source_functional_id}' (stack: {stack_bucket_match['stackName']})")
+
+    if stack_bucket_match:
+        return _restore_s3_in_place(ctx, resource_snapshot, stack_bucket_match, source_functional_id)
+
+    # No in-place match
+    if ctx.recovery_stacks_only:
+        print(f"SKIPPING {resource_name} (S3) - recoveryStacksOnly mode, no matching stack bucket")
+        return None
+
+    return _restore_s3_new_bucket(ctx, resource_snapshot, actual_region, kms_key_arn)
+
+
+def _restore_s3_in_place(
+    ctx: _RestoreContext,
+    resource_snapshot: Dict[str, Any],
+    stack_bucket_match: Dict[str, str],
+    source_functional_id: str,
+) -> Tuple[str, dict]:
+    """Restore S3 data into an existing bucket from a recovery stack."""
+    resource_id = resource_snapshot["resourceId"]
+    resource_name = resource_snapshot["resourceName"]
+    snapshot_id = resource_snapshot["snapshotId"]
+
+    restore_bucket_name = stack_bucket_match["bucketName"]
+    restore_bucket_region = stack_bucket_match["region"]
+
+    # Get KMS key for the bucket's region (used for restore worker EC2 EBS encryption)
+    stack_kms_key_arn = ctx.kms_key_arns_by_region.get(restore_bucket_region)
+    if not stack_kms_key_arn:
+        raise ValueError(f"No KMS key available for region {restore_bucket_region} (required for in-place S3 restore)")
+
+    print(f"S3 IN-PLACE restore config - region: {restore_bucket_region}, bucket: {restore_bucket_name} (CloudFormation stack: {stack_bucket_match['stackName']})")
+
+    destination_config = {
+        "s3Bucket": {
+            "region": restore_bucket_region,
+            "bucketName": restore_bucket_name,
+            "encryptionKeyId": stack_kms_key_arn,
+            "prefix": ""
+        }
+    }
+
+    job_id = ctx.eon_client.restore_s3_bucket(
+        resource_id=resource_id,
+        snapshot_id=snapshot_id,
+        restore_account_id=ctx.eon_restore_account_id,
+        destination_config=destination_config
+    )
+
+    restored_resource_details = {
+        "restoredRegion": restore_bucket_region,
+        "restoredBucketName": restore_bucket_name,
+        "originalBucketName": resource_snapshot.get("providerResourceId", resource_name),
+        "restoreType": "IN_PLACE",
+        "recoveryStackName": stack_bucket_match["stackName"],
+        "eonFunctionalId": source_functional_id
+    }
+    return job_id, restored_resource_details
+
+
+def _restore_s3_new_bucket(
+    ctx: _RestoreContext,
+    resource_snapshot: Dict[str, Any],
+    actual_region: str,
+    kms_key_arn: str,
+) -> Tuple[str, dict]:
+    """Create a new S3 bucket and restore data into it."""
+    resource_id = resource_snapshot["resourceId"]
+    resource_name = resource_snapshot["resourceName"]
+    snapshot_id = resource_snapshot["snapshotId"]
+    snapshot_point_in_time = resource_snapshot.get("snapshotPointInTime", "Unknown")
+    original_tags = resource_snapshot.get("originalTags", {})
+
+    # Create a bucket name (S3 bucket names must be globally unique)
+    original_bucket_name = resource_snapshot.get("providerResourceId", resource_name)
+    hash_input = f"{original_bucket_name}-{snapshot_id}-{actual_region}-{ctx.restore_account_id}"
+    hash_suffix = hashlib.md5(hash_input.encode()).hexdigest()[:8]
+
+    if ctx.resource_name_prefix:
+        restored_bucket_name = sanitize_s3_bucket_name(f"{ctx.resource_name_prefix}{original_bucket_name}", hash_suffix)
+    else:
+        restored_bucket_name = sanitize_s3_bucket_name(original_bucket_name, hash_suffix)
+
+    print(f"S3 restore config - region: {actual_region}, bucket: {restored_bucket_name}")
+
+    create_s3_bucket(
+        bucket_name=restored_bucket_name,
+        region=actual_region,
+        kms_key_id=kms_key_arn,
+        restore_account_id=ctx.restore_account_id,
+        snapshot_id=snapshot_id,
+        snapshot_point_in_time=snapshot_point_in_time,
+        original_tags=original_tags,
+        restore_account_credentials=ctx.restore_account_credentials
+    )
+
+    destination_config = {
+        "s3Bucket": {
+            "region": actual_region,
+            "bucketName": restored_bucket_name,
+            "encryptionKeyId": kms_key_arn,
+            "prefix": ""
+        }
+    }
+
+    job_id = ctx.eon_client.restore_s3_bucket(
+        resource_id=resource_id,
+        snapshot_id=snapshot_id,
+        restore_account_id=ctx.eon_restore_account_id,
+        destination_config=destination_config
+    )
+
+    restored_resource_details = {
+        "restoredRegion": actual_region,
+        "restoredBucketName": restored_bucket_name,
+        "originalBucketName": original_bucket_name
+    }
+    return job_id, restored_resource_details
+
+
+def _initiate_dynamodb_restore(
+    ctx: _RestoreContext,
+    resource_snapshot: Dict[str, Any],
+    target_region: Optional[str],
+) -> Optional[Tuple[str, dict]]:
+    resource_name = resource_snapshot["resourceName"]
+    source_region = resource_snapshot.get("region")
+
+    # Resolve region and KMS key up-front (matches original validation order)
+    actual_region = resolve_target_region(target_region, ctx.vpc_configs_by_region, resource_name)
+    if actual_region == target_region:
+        print(f"Restoring DynamoDB to target region: {actual_region}")
+
+    kms_key_arn = require_kms_key(ctx.kms_key_arns_by_region, actual_region)
+
+    # Check if a pre-created table exists for in-place restore
+    stack_table_match = None
+    if ctx.recovery_stack_tables:
+        if resource_name in ctx.recovery_stack_tables:
+            stack_table = ctx.recovery_stack_tables[resource_name]
+            if stack_table["region"] == source_region:
+                stack_table_match = stack_table
+                print(f"Found matching pre-created table '{resource_name}' in {source_region} (source region) (stack: {stack_table['stackName']})")
+
+    if stack_table_match:
+        return _restore_dynamodb_in_place(ctx, resource_snapshot, stack_table_match)
+
+    # No in-place match
+    if ctx.recovery_stacks_only:
+        print(f"SKIPPING {resource_name} (DynamoDB) - recoveryStacksOnly mode, no matching stack table")
+        return None
+
+    return _restore_dynamodb_new_table(ctx, resource_snapshot, actual_region, kms_key_arn)
+
+
+def _restore_dynamodb_in_place(
+    ctx: _RestoreContext,
+    resource_snapshot: Dict[str, Any],
+    stack_table_match: Dict[str, str],
+) -> Tuple[str, dict]:
+    """Restore DynamoDB data into an existing pre-created table."""
+    resource_id = resource_snapshot["resourceId"]
+    snapshot_id = resource_snapshot["snapshotId"]
+
+    restore_target_region = stack_table_match["region"]
+
+    # Get KMS key for the stack table's region (may be different from target_region)
+    stack_kms_key_arn = ctx.kms_key_arns_by_region.get(restore_target_region)
+    if not stack_kms_key_arn:
+        raise ValueError(f"No KMS key available for region {restore_target_region} (required for in-place restore)")
+
+    print(f"DynamoDB IN-PLACE restore config - region: {restore_target_region}, table: {stack_table_match['tableName']} (CloudFormation stack: {stack_table_match['stackName']})")
+
+    job_id = ctx.eon_client.restore_dynamodb_to_existing_table(
+        resource_id=resource_id,
+        snapshot_id=snapshot_id,
+        restore_account_id=ctx.eon_restore_account_id,
+        table_name=stack_table_match["tableName"],
+        region=restore_target_region,
+        encryption_key_id=stack_kms_key_arn  # EBS encryption for restore worker
+    )
+
+    restored_resource_details = {
+        "restoredRegion": restore_target_region,
+        "restoredName": stack_table_match["tableName"],
+        "restoreType": "IN_PLACE",
+        "recoveryStackName": stack_table_match["stackName"]
+    }
+    return job_id, restored_resource_details
+
+
+def _restore_dynamodb_new_table(
+    ctx: _RestoreContext,
+    resource_snapshot: Dict[str, Any],
+    actual_region: str,
+    kms_key_arn: str,
+) -> Tuple[str, dict]:
+    """Restore DynamoDB data into a newly created table."""
+    resource_id = resource_snapshot["resourceId"]
+    resource_name = resource_snapshot["resourceName"]
+    snapshot_id = resource_snapshot["snapshotId"]
+    snapshot_point_in_time = resource_snapshot.get("snapshotPointInTime", "Unknown")
+
+    # Get allocated WCU for this table
+    allocated_wcu = ctx.dynamodb_wcu_allocation.get(resource_id, 50)
+
+    # Merge original tags with restore tags (restore tags take precedence)
+    original_tags = resource_snapshot.get("originalTags", {})
+    dynamodb_tags = {
+        **original_tags,
+        "ManagedBy": "EonBulkRecovery",
+        "eon:restore": "true",
+        "eon:snapshot_id": snapshot_id,
+        "eon:snapshot_time": snapshot_point_in_time
+    }
+
+    restored_table_name = get_restored_name(resource_name, ctx.resource_name_prefix)
+    print(f"DynamoDB restore config - region: {actual_region}, table: {restored_table_name}, WCU: {allocated_wcu:,}")
+
+    destination_config = {
+        "awsDynamodb": {
+            "restoreRegion": actual_region,
+            "encryptionKeyId": kms_key_arn,
+            "restoredName": restored_table_name,
+            "writeCapacityUnits": allocated_wcu,
+            "tags": dynamodb_tags
+        }
+    }
+
+    job_id = ctx.eon_client.restore_dynamodb_table(
+        resource_id=resource_id,
+        snapshot_id=snapshot_id,
+        restore_account_id=ctx.eon_restore_account_id,
+        destination_config=destination_config
+    )
+
+    restored_resource_details = {
+        "restoredRegion": actual_region,
+        "restoredName": restored_table_name,
+        "restoreType": "NEW_TABLE",
+        "writeCapacityUnits": allocated_wcu
+    }
+    return job_id, restored_resource_details
+
+
+# ---------------------------------------------------------------------------
+# Dispatch table: resource type -> restore function
+# ---------------------------------------------------------------------------
+
+_RESTORE_DISPATCH = {
+    "AWS_EC2": _initiate_ec2_restore,
+    "AWS_RDS": _initiate_rds_restore,
+    "AWS_S3": _initiate_s3_restore,
+    "AWS_DYNAMO_DB": _initiate_dynamodb_restore,
+}
+
+
+# ---------------------------------------------------------------------------
+# Lambda handler
+# ---------------------------------------------------------------------------
+
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
     Initiate restore jobs for all resource snapshots.
@@ -418,6 +1074,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         restoreJobs: List of initiated restore jobs with job IDs
         totalJobs: Total number of jobs initiated
     """
+    # ---- Parse event ----
     resource_snapshots = event["resourceSnapshots"]
     eon_restore_account_id = event["eonRestoreAccountId"]
     restore_account_id = event["restoreAccountId"]
@@ -433,80 +1090,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     recovery_stacks_only = event.get("recoveryStacksOnly", False)
     resource_name_prefix = event.get("resourceNamePrefix")  # None means use original name
 
-    # Helper function to generate restored resource name
-    def get_restored_name(original_name: str) -> str:
-        """Generate restored resource name based on prefix setting."""
-        if resource_name_prefix:
-            return f"{resource_name_prefix}{original_name}"
-        return original_name  # Use original name for full account recovery
-
-    def sanitize_s3_bucket_name(base_name: str, hash_suffix: str) -> str:
-        """
-        Build a globally-unique S3 bucket name from a base name and hash suffix.
-
-        S3 bucket name constraints:
-        - 3-63 lowercase alphanumeric characters, hyphens, or dots
-        - Must begin and end with a letter or number
-        - No consecutive periods (we also avoid consecutive hyphens for clarity)
-
-        The hash_suffix is always preserved so the name stays globally unique.
-        When the combined name exceeds 63 chars, the base is truncated to make
-        room for ``-<hash_suffix>``.
-        """
-        max_len = 63
-        suffix_with_sep = f"-{hash_suffix}"  # e.g. "-a1b2c3d4" (9 chars)
-
-        combined = f"{base_name}{suffix_with_sep}".lower()
-
-        if len(combined) <= max_len:
-            name = combined
-        else:
-            # Truncate the base to leave room for the suffix
-            allowed_base = max_len - len(suffix_with_sep)
-            truncated = base_name[:allowed_base].rstrip("-")
-            name = f"{truncated}{suffix_with_sep}".lower()
-
-        # Collapse consecutive hyphens and strip leading/trailing hyphens
-        name = re.sub(r"-{2,}", "-", name)
-        name = name.strip("-")
-        return name
-
-    def sanitize_rds_identifier(name: str) -> str:
-        """
-        Sanitize a name to comply with RDS DB instance/cluster identifier constraints:
-        - 1-63 lowercase alphanumeric characters or hyphens
-        - Must begin with a letter
-        - Can't end with a hyphen
-        - Can't contain two consecutive hyphens
-
-        When truncation is needed, appends a short hash of the original name
-        to prevent collisions between names that share the same prefix.
-        """
-        original = name
-        # Lowercase and replace invalid characters with hyphens
-        name = name.lower()
-        name = re.sub(r"[^a-z0-9-]", "-", name)
-        # Collapse consecutive hyphens
-        name = re.sub(r"-{2,}", "-", name)
-        # Strip leading/trailing hyphens
-        name = name.strip("-")
-        # Ensure it starts with a letter
-        if name and not name[0].isalpha():
-            name = "r" + name
-        # If empty after sanitization, generate from hash
-        if not name:
-            name = "r" + hashlib.sha256(original.encode()).hexdigest()[:8]
-        # Truncate to 63 chars, using a hash suffix to avoid collisions
-        max_len = 63
-        if len(name) > max_len:
-            suffix = hashlib.sha256(original.encode()).hexdigest()[:6]
-            # Leave room for hyphen + 6-char hash suffix
-            truncated = name[:max_len - 7].rstrip("-")
-            name = f"{truncated}-{suffix}"
-        # Final safety: strip any trailing hyphen (shouldn't happen but just in case)
-        name = name.rstrip("-")
-        return name
-
+    # ---- Log configuration ----
     print(f"KMS keys available in regions: {list(kms_key_arns_by_region.keys())}")
     print(f"RDS subnet groups available in regions: {list(rds_subnet_groups_by_region.keys())}")
     print(f"DynamoDB regional WCU limit: {dynamodb_regional_wcu_limit:,}")
@@ -518,7 +1102,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     if recovery_stacks_only:
         print(f"Recovery stacks ONLY mode: will skip resources without a matching stack table/bucket")
 
-    # Get credentials for restore account once (reused throughout)
+    # ---- Cross-account credentials ----
     restore_account_credentials = None
     try:
         restore_account_credentials = get_cross_account_credentials(
@@ -531,37 +1115,31 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         print(f"WARNING: Could not obtain cross-account credentials: {str(e)}")
         print("Will attempt operations with Lambda execution role")
 
-    # Discover DynamoDB table from stacks for in-place restore
-    recovery_stack_tables = {}
-    if enable_cdk_recovery_stacks:
-        # Get regions from VPC configs to check for CloudFormation stacks
-        vpc_regions = [config.get("region") for config in vpc_configs if config.get("region")]
-        if not vpc_regions:
-            vpc_regions = ["us-east-1"]
+    # ---- Discover recovery-stack resources ----
+    vpc_regions = [config.get("region") for config in vpc_configs if config.get("region")] or ["us-east-1"]
 
+    recovery_stack_tables = {}
+    recovery_stack_s3_buckets = {}
+    if enable_cdk_recovery_stacks:
         recovery_stack_tables = discover_dynamodb_tables_from_stacks(
             stack_names=enable_cdk_recovery_stacks,
             restore_account_credentials=restore_account_credentials,
             regions=vpc_regions
         )
-
-    # Discover S3 buckets from stacks for in-place restore (matched by eon_functional_id tag)
-    recovery_stack_s3_buckets = {}
-    if enable_cdk_recovery_stacks:
         recovery_stack_s3_buckets = discover_s3_buckets_from_stacks(
             stack_names=enable_cdk_recovery_stacks,
             restore_account_credentials=restore_account_credentials,
             regions=vpc_regions
         )
 
-    # Build VPC configs by region for region-specific resource restoration
+    # ---- Build per-region lookups ----
     vpc_configs_by_region = {}
     for config in vpc_configs:
         region = config.get("region", restore_region)
         vpc_configs_by_region[region] = config
 
-    # Group DynamoDB tables by target region
-    dynamodb_tables_by_region = {}
+    # ---- Pre-compute DynamoDB WCU allocation ----
+    dynamodb_tables_by_region: Dict[str, List[Dict[str, Any]]] = {}
     for snapshot in resource_snapshots:
         if snapshot.get("resourceType") == "AWS_DYNAMO_DB":
             source_region = snapshot.get("region")
@@ -580,7 +1158,6 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     "sizeBytes": snapshot.get("tableSizeBytes", 0)
                 })
 
-    # Calculate WCU allocation per region (95% of regional capacity)
     dynamodb_wcu_allocation = calculate_dynamodb_wcu_allocation_by_region(
         dynamodb_tables_by_region=dynamodb_tables_by_region,
         regional_wcu_capacity=dynamodb_regional_wcu_limit,
@@ -588,10 +1165,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         default_wcu_for_zero_size=50
     )
 
-    # Get Eon credentials
+    # ---- Initialize Eon client ----
     credentials = get_eon_credentials()
-
-    # Initialize Eon client
     eon_client = EonClient(
         account_domain=os.environ["EON_ACCOUNT_DOMAIN"],
         client_id=credentials["clientId"],
@@ -599,6 +1174,25 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         project_id=os.environ["EON_PROJECT_ID"]
     )
 
+    # ---- Build shared context ----
+    ctx = _RestoreContext(
+        eon_client=eon_client,
+        eon_restore_account_id=eon_restore_account_id,
+        restore_account_id=restore_account_id,
+        restore_region=restore_region,
+        kms_key_arns_by_region=kms_key_arns_by_region,
+        rds_subnet_groups_by_region=rds_subnet_groups_by_region,
+        vpc_configs_by_region=vpc_configs_by_region,
+        restore_account_credentials=restore_account_credentials,
+        resource_name_prefix=resource_name_prefix,
+        exclude_ec2_tag_keys=exclude_ec2_tag_keys,
+        recovery_stack_tables=recovery_stack_tables,
+        recovery_stack_s3_buckets=recovery_stack_s3_buckets,
+        recovery_stacks_only=recovery_stacks_only,
+        dynamodb_wcu_allocation=dynamodb_wcu_allocation,
+    )
+
+    # ---- Initiate restores ----
     print(f"\nInitiating restore jobs for {len(resource_snapshots)} snapshots")
     print(f"VPC configurations available in regions: {list(vpc_configs_by_region.keys())}")
 
@@ -612,10 +1206,6 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         snapshot_point_in_time = resource_snapshot.get("snapshotPointInTime", "Unknown")
         source_region = resource_snapshot.get("region")
 
-        # Determine target region based on restoreRegion parameter:
-        # - If restoreRegion is set → force all resources to that region
-        # - If restoreRegion is null → restore to source region
-        # - If target region has no VPC config → fall back to any available region
         target_region = restore_region if restore_region else source_region
 
         print(f"Initiating restore for {resource_type}: {resource_name} (source region: {source_region}, target region: {target_region})")
@@ -625,494 +1215,21 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             print(f"SKIPPING {resource_name} ({resource_type}) - recoveryStacksOnly mode, no stack matching for this type")
             continue
 
+        restore_fn = _RESTORE_DISPATCH.get(resource_type)
+
         try:
+            result = None
+            if restore_fn:
+                result = restore_fn(ctx, resource_snapshot, target_region)
+
+            if result is None and restore_fn:
+                # Resource was intentionally skipped (e.g. recoveryStacksOnly)
+                continue
+
             job_id = None
             restored_resource_details = {}
-
-            if resource_type == "AWS_EC2":
-                # Get instance configuration from snapshot
-                instance_type = resource_snapshot.get("instanceType", "t3.medium")
-                instance_profile_name = resource_snapshot.get("instanceProfileName")
-                volumes = resource_snapshot.get("volumes", [])
-
-                # Check if VPC config exists for target region, otherwise fall back to any available
-                vpc_config = None
-                actual_region = None
-
-                if target_region and target_region in vpc_configs_by_region:
-                    actual_region = target_region
-                    vpc_config = vpc_configs_by_region[target_region]
-                    print(f"Using VPC config for target region: {actual_region}")
-                elif vpc_configs_by_region:
-                    actual_region = list(vpc_configs_by_region.keys())[0]
-                    vpc_config = vpc_configs_by_region[actual_region]
-                    print(f"WARNING: No VPC config for target region {target_region}, falling back to: {actual_region}")
-                else:
-                    raise ValueError(f"No VPC configurations available for restoring {resource_name}")
-
-                # Extract subnets and security groups from the region-specific VPC config
-                subnets_per_az = vpc_config.get("subnetsPerAvailabilityZone", [])
-                security_groups = vpc_config.get("securityGroups", {})
-                security_group_ids = security_groups.get("restoreServer", [])
-
-                if not subnets_per_az:
-                    raise ValueError(f"No subnets available in region {actual_region} for EC2 restore of {resource_name}")
-
-                # Create EC2 client for restore account to check instance type availability
-                if restore_account_credentials:
-                    ec2_client = boto3.client(
-                        "ec2",
-                        region_name=actual_region,
-                        aws_access_key_id=restore_account_credentials["AccessKeyId"],
-                        aws_secret_access_key=restore_account_credentials["SecretAccessKey"],
-                        aws_session_token=restore_account_credentials["SessionToken"]
-                    )
-                else:
-                    # Fallback to Lambda execution role if no cross-account credentials
-                    ec2_client = boto3.client("ec2", region_name=actual_region)
-
-                # Check which AZs support this instance type
-                print(f"Checking availability of instance type {instance_type} in region {actual_region}")
-                try:
-                    offerings_response = ec2_client.describe_instance_type_offerings(
-                        LocationType='availability-zone',
-                        Filters=[
-                            {'Name': 'instance-type', 'Values': [instance_type]}
-                        ]
-                    )
-
-                    available_azs = {offering['Location'] for offering in offerings_response.get('InstanceTypeOfferings', [])}
-                    print(f"Instance type {instance_type} is available in AZs: {sorted(available_azs)}")
-
-                except ClientError as e:
-                    print(f"WARNING: Could not check instance type availability: {str(e)}")
-                    # If we can't check, proceed with random selection
-                    available_azs = None
-
-                # Try to find a subnet in an AZ that supports the instance type
-                subnet_id = None
-                if available_azs:
-                    # Filter subnets to only those in AZs that support the instance type
-                    compatible_subnets = [
-                        subnet for subnet in subnets_per_az
-                        if subnet.get("availabilityZone") in available_azs and subnet.get("subnetId")
-                    ]
-
-                    if compatible_subnets:
-                        selected_subnet = random.choice(compatible_subnets)
-                        subnet_id = selected_subnet["subnetId"]
-                        selected_az = selected_subnet["availabilityZone"]
-                        print(f"Selected subnet {subnet_id} in AZ {selected_az} (supports {instance_type})")
-                    else:
-                        # No compatible subnets found
-                        configured_azs = {subnet.get("availabilityZone") for subnet in subnets_per_az if subnet.get("availabilityZone")}
-                        raise ValueError(
-                            f"Instance type {instance_type} is not available in any configured availability zones. "
-                            f"Instance type available in: {sorted(available_azs)}, "
-                            f"Configured subnets in: {sorted(configured_azs)}"
-                        )
-                else:
-                    # Couldn't check availability, use random selection as fallback
-                    available_subnets = [subnet.get("subnetId") for subnet in subnets_per_az if subnet.get("subnetId")]
-                    subnet_id = random.choice(available_subnets)
-                    print(f"Selected subnet {subnet_id} (could not verify instance type availability)")
-
-                # Volumes must be present - no volumes means no data to restore
-                if not volumes:
-                    print(f"ERROR: No volume configuration found for {resource_name}, cannot restore")
-                    raise ValueError(f"No volumes found for EC2 instance {resource_name}")
-
-                # Get KMS key for this region
-                kms_key_arn = kms_key_arns_by_region.get(actual_region)
-                if not kms_key_arn:
-                    raise ValueError(f"No KMS key available for region {actual_region}")
-
-                # Build volume restore parameters from snapshot volume data
-                volume_restore_params = []
-                for vol in volumes:
-                    # Get original volume tags and filter out excluded tag keys
-                    original_tags = vol.get("tags", {})
-                    filtered_volume_tags = {
-                        k: v for k, v in original_tags.items()
-                        if k not in exclude_ec2_tag_keys
-                    }
-
-                    # Merge filtered original tags with restore tags
-                    volume_tags = {
-                        **filtered_volume_tags,
-                        "eon:restore": "true",
-                        "eon:snapshot_id": snapshot_id,
-                        "eon:snapshot_time": snapshot_point_in_time
-                    }
-
-                    vol_param = {
-                        "providerVolumeId": vol.get("providerVolumeId", "unknown"),
-                        "volumeEncryptionKeyId": kms_key_arn,  # Encrypt volume with region-specific KMS key
-                        "volumeSettings": vol.get("volumeSettings", {}),
-                        "tags": volume_tags
-                    }
-                    volume_restore_params.append(vol_param)
-
-                print(f"EC2 restore config - region: {actual_region}, instance_type: {instance_type}, subnet: {subnet_id}, "
-                      f"security_groups: {len(security_group_ids)}, volumes: {len(volume_restore_params)}")
-                print(f"Volume encryption - using KMS key: {kms_key_arn}")
-
-                # Get original tags and filter out excluded tag keys
-                original_tags = resource_snapshot.get("originalTags", {})
-                filtered_original_tags = {
-                    k: v for k, v in original_tags.items()
-                    if k not in exclude_ec2_tag_keys
-                }
-
-                # Log excluded tags if any were filtered
-                if exclude_ec2_tag_keys and original_tags:
-                    excluded_tags = [k for k in original_tags.keys() if k in exclude_ec2_tag_keys]
-                    if excluded_tags:
-                        print(f"Excluding EC2 tags for {resource_name}: {excluded_tags}")
-
-                # Merge filtered original tags with restore tags (restore tags take precedence)
-                restored_instance_name = get_restored_name(resource_name)
-                ec2_tags = {
-                    **filtered_original_tags,
-                    "Name": restored_instance_name,
-                    "RestoreSource": resource_snapshot.get("providerResourceId", ""),
-                    "ManagedBy": "EonBulkRecovery",
-                    "eon:restore": "true",
-                    "eon:snapshot_id": snapshot_id,
-                    "eon:snapshot_time": snapshot_point_in_time
-                }
-
-                destination_config = {
-                    "awsEc2": {
-                        "region": actual_region,
-                        "instanceType": instance_type,
-                        "subnetId": subnet_id,
-                        "securityGroupIds": security_group_ids,
-                        "tags": ec2_tags,
-                        "volumeRestoreParameters": volume_restore_params
-                    }
-                }
-
-                # Add instance profile if present
-                # NOTE: Temporarily commented out as Eon does not currently request permissions to be able to create instance profile in restore account
-                # if instance_profile_name:
-                #     destination_config["awsEc2"]["instanceProfileName"] = instance_profile_name
-                #     print(f"Including instance profile: {instance_profile_name}")
-
-                job_id = eon_client.restore_ec2_instance(
-                    resource_id=resource_id,
-                    snapshot_id=snapshot_id,
-                    restore_account_id=eon_restore_account_id,
-                    destination_config=destination_config
-                )
-
-                # Capture restored resource details
-                restored_resource_details = {
-                    "restoredRegion": actual_region,
-                    "instanceType": instance_type,
-                    "volumeCount": len(volume_restore_params),
-                    "restoredName": restored_instance_name
-                }
-
-            elif resource_type == "AWS_RDS":
-                # Get instance class from source resource, fallback to default
-                db_instance_class = resource_snapshot.get("dbInstanceClass", "db.t3.micro")
-
-                # Check if RDS subnet group exists for target region, otherwise fall back to any available
-                rds_subnet_group_name = None
-                actual_region = None
-
-                if target_region and target_region in rds_subnet_groups_by_region:
-                    actual_region = target_region
-                    rds_subnet_group_name = rds_subnet_groups_by_region[target_region]
-                    print(f"Using RDS subnet group for target region: {actual_region}")
-                elif rds_subnet_groups_by_region:
-                    actual_region = list(rds_subnet_groups_by_region.keys())[0]
-                    rds_subnet_group_name = rds_subnet_groups_by_region[actual_region]
-                    print(f"WARNING: No RDS subnet group for target region {target_region}, falling back to: {actual_region}")
-                else:
-                    raise ValueError(f"No RDS subnet groups available for restoring {resource_name}")
-
-                # Get security groups from the region-specific VPC config
-                vpc_config = vpc_configs_by_region.get(actual_region, {})
-                security_groups_config = vpc_config.get("securityGroups", {})
-                rds_security_groups = security_groups_config.get("restoredRdsInstance", [])
-
-                # Get KMS key for this region
-                kms_key_arn = kms_key_arns_by_region.get(actual_region)
-                if not kms_key_arn:
-                    raise ValueError(f"No KMS key available for region {actual_region}")
-
-                # Merge original tags with restore tags (restore tags take precedence)
-                original_tags = resource_snapshot.get("originalTags", {})
-                restored_db_name = sanitize_rds_identifier(get_restored_name(resource_name))
-                rds_tags = {
-                    **original_tags,
-                    "Name": restored_db_name,
-                    "RestoreSource": resource_snapshot.get("providerResourceId", ""),
-                    "ManagedBy": "EonBulkRecovery",
-                    "eon:restore": "true",
-                    "eon:snapshot_id": snapshot_id,
-                    "eon:snapshot_time": snapshot_point_in_time
-                }
-
-                destination_config = {
-                    "awsRds": {
-                        "restoreRegion": actual_region,
-                        "encryptionKeyId": kms_key_arn,
-                        "restoredName": restored_db_name,
-                        "securityGroups": rds_security_groups,
-                        "subnetGroup": rds_subnet_group_name,
-                        "dbInstanceClass": db_instance_class,
-                        "tags": rds_tags
-                    }
-                }
-
-                print(f"RDS restore config - region: {actual_region}, subnet_group: {rds_subnet_group_name}, "
-                      f"security_groups: {len(rds_security_groups)}, instance_class: {db_instance_class}")
-
-                job_id = eon_client.restore_rds_instance(
-                    resource_id=resource_id,
-                    snapshot_id=snapshot_id,
-                    restore_account_id=eon_restore_account_id,
-                    destination_config=destination_config
-                )
-
-                # Capture restored resource details
-                restored_resource_details = {
-                    "restoredRegion": actual_region,
-                    "dbInstanceClass": db_instance_class,
-                    "restoredName": restored_db_name,
-                    "subnetGroup": rds_subnet_group_name
-                }
-
-            elif resource_type == "AWS_S3":
-                # Check if VPC config exists for target region, otherwise fall back to any available
-                # VPC configs define which regions are allowed for restoration
-                actual_region = None
-
-                if target_region and target_region in vpc_configs_by_region:
-                    actual_region = target_region
-                    print(f"Restoring S3 to target region: {actual_region}")
-                elif vpc_configs_by_region:
-                    actual_region = list(vpc_configs_by_region.keys())[0]
-                    print(f"WARNING: No VPC config for target region {target_region}, falling back to: {actual_region}")
-                else:
-                    raise ValueError(f"No VPC configurations available for restoring {resource_name}")
-
-                # Get KMS key for this region
-                kms_key_arn = kms_key_arns_by_region.get(actual_region)
-                if not kms_key_arn:
-                    raise ValueError(f"No KMS key available for region {actual_region}")
-
-                # Get original tags
-                original_tags = resource_snapshot.get("originalTags", {})
-
-                # Check for in-place restore via eon_functional_id tag matching
-                stack_bucket_match = None
-                source_functional_id = original_tags.get("eon_functional_id")
-
-                if source_functional_id and recovery_stack_s3_buckets:
-                    if source_functional_id in recovery_stack_s3_buckets:
-                        stack_bucket_match = recovery_stack_s3_buckets[source_functional_id]
-                        print(f"Found matching S3 bucket '{stack_bucket_match['bucketName']}' with eon_functional_id='{source_functional_id}' (stack: {stack_bucket_match['stackName']})")
-
-                if stack_bucket_match:
-                    # In-place restore to existing bucket from recovery stack
-                    restore_bucket_name = stack_bucket_match["bucketName"]
-                    restore_bucket_region = stack_bucket_match["region"]
-
-                    # Get KMS key for the bucket's region (used for restore worker EC2 EBS encryption)
-                    stack_kms_key_arn = kms_key_arns_by_region.get(restore_bucket_region)
-                    if not stack_kms_key_arn:
-                        raise ValueError(f"No KMS key available for region {restore_bucket_region} (required for in-place S3 restore)")
-
-                    print(f"S3 IN-PLACE restore config - region: {restore_bucket_region}, bucket: {restore_bucket_name} (CloudFormation stack: {stack_bucket_match['stackName']})")
-
-                    destination_config = {
-                        "s3Bucket": {
-                            "region": restore_bucket_region,
-                            "bucketName": restore_bucket_name,
-                            "encryptionKeyId": stack_kms_key_arn,
-                            "prefix": ""
-                        }
-                    }
-
-                    job_id = eon_client.restore_s3_bucket(
-                        resource_id=resource_id,
-                        snapshot_id=snapshot_id,
-                        restore_account_id=eon_restore_account_id,
-                        destination_config=destination_config
-                    )
-
-                    # Capture restored resource details
-                    restored_resource_details = {
-                        "restoredRegion": restore_bucket_region,
-                        "restoredBucketName": restore_bucket_name,
-                        "originalBucketName": resource_snapshot.get("providerResourceId", resource_name),
-                        "restoreType": "IN_PLACE",
-                        "recoveryStackName": stack_bucket_match["stackName"],
-                        "eonFunctionalId": source_functional_id
-                    }
-                else:
-                    if recovery_stacks_only:
-                        print(f"SKIPPING {resource_name} (S3) - recoveryStacksOnly mode, no matching stack bucket")
-                        continue
-
-                    # Default flow: create a new bucket
-                    # Create a bucket name (S3 bucket names must be globally unique)
-                    # Include snapshot ID and region in the hash to ensure uniqueness across restores
-                    original_bucket_name = resource_snapshot.get("providerResourceId", resource_name)
-                    hash_input = f"{original_bucket_name}-{snapshot_id}-{actual_region}-{restore_account_id}"
-                    hash_suffix = hashlib.md5(hash_input.encode()).hexdigest()[:8]
-                    # For S3, we always need a unique suffix since bucket names are globally unique
-                    # When restoring to a new account, the original bucket name likely won't be available
-                    if resource_name_prefix:
-                        restored_bucket_name = sanitize_s3_bucket_name(f"{resource_name_prefix}{original_bucket_name}", hash_suffix)
-                    else:
-                        restored_bucket_name = sanitize_s3_bucket_name(original_bucket_name, hash_suffix)
-
-                    print(f"S3 restore config - region: {actual_region}, bucket: {restored_bucket_name}")
-
-                    # Create the S3 bucket first
-                    create_s3_bucket(
-                        bucket_name=restored_bucket_name,
-                        region=actual_region,
-                        kms_key_id=kms_key_arn,
-                        restore_account_id=restore_account_id,
-                        snapshot_id=snapshot_id,
-                        snapshot_point_in_time=snapshot_point_in_time,
-                        original_tags=original_tags,
-                        restore_account_credentials=restore_account_credentials
-                    )
-
-                    destination_config = {
-                        "s3Bucket": {
-                            "region": actual_region,
-                            "bucketName": restored_bucket_name,
-                            "encryptionKeyId": kms_key_arn,
-                            "prefix": ""
-                        }
-                    }
-
-                    job_id = eon_client.restore_s3_bucket(
-                        resource_id=resource_id,
-                        snapshot_id=snapshot_id,
-                        restore_account_id=eon_restore_account_id,
-                        destination_config=destination_config
-                    )
-
-                    # Capture restored resource details
-                    restored_resource_details = {
-                        "restoredRegion": actual_region,
-                        "restoredBucketName": restored_bucket_name,
-                        "originalBucketName": original_bucket_name
-                    }
-
-            elif resource_type == "AWS_DYNAMO_DB":
-                # Check if VPC config exists for target region, otherwise fall back to any available
-                # VPC configs define which regions are allowed for restoration
-                actual_region = None
-
-                if target_region and target_region in vpc_configs_by_region:
-                    actual_region = target_region
-                    print(f"Restoring DynamoDB to target region: {actual_region}")
-                elif vpc_configs_by_region:
-                    actual_region = list(vpc_configs_by_region.keys())[0]
-                    print(f"WARNING: No VPC config for target region {target_region}, falling back to: {actual_region}")
-                else:
-                    raise ValueError(f"No VPC configurations available for restoring {resource_name}")
-
-                # Get KMS key for this region (used for restore worker EC2 EBS encryption)
-                kms_key_arn = kms_key_arns_by_region.get(actual_region)
-                if not kms_key_arn:
-                    raise ValueError(f"No KMS key available for region {actual_region}")
-
-                # Check if a pre-created table exists for in-place restore
-                # Match by table name (source table name) and SOURCE region (not restore region)
-                stack_table_match = None
-                if recovery_stack_tables:
-                    # Look for a pre-created table matching the source table name and SOURCE region
-                    if resource_name in recovery_stack_tables:
-                        stack_table = recovery_stack_tables[resource_name]
-                        if stack_table["region"] == source_region:
-                            stack_table_match = stack_table
-                            print(f"Found matching pre-created table '{resource_name}' in {source_region} (source region) (stack: {stack_table['stackName']})")
-
-                if stack_table_match:
-                    # Use in-place restore to existing pre-created table
-                    # The table was created in the same region as the source
-                    restore_target_region = stack_table_match["region"]
-
-                    # Get KMS key for the stack table's region (may be different from actual_region)
-                    stack_kms_key_arn = kms_key_arns_by_region.get(restore_target_region)
-                    if not stack_kms_key_arn:
-                        raise ValueError(f"No KMS key available for region {restore_target_region} (required for in-place restore)")
-
-                    print(f"DynamoDB IN-PLACE restore config - region: {restore_target_region}, table: {stack_table_match['tableName']} (CloudFormation stack: {stack_table_match['stackName']})")
-
-                    job_id = eon_client.restore_dynamodb_to_existing_table(
-                        resource_id=resource_id,
-                        snapshot_id=snapshot_id,
-                        restore_account_id=eon_restore_account_id,
-                        table_name=stack_table_match["tableName"],
-                        region=restore_target_region,
-                        encryption_key_id=stack_kms_key_arn  # EBS encryption for restore worker
-                    )
-
-                    # Capture restored resource details
-                    restored_resource_details = {
-                        "restoredRegion": restore_target_region,
-                        "restoredName": stack_table_match["tableName"],
-                        "restoreType": "IN_PLACE",
-                        "recoveryStackName": stack_table_match["stackName"]
-                    }
-                else:
-                    if recovery_stacks_only:
-                        print(f"SKIPPING {resource_name} (DynamoDB) - recoveryStacksOnly mode, no matching stack table")
-                        continue
-
-                    # Standard restore to new table
-                    # Get allocated WCU for this table
-                    allocated_wcu = dynamodb_wcu_allocation.get(resource_id, 50)  # fallback to default
-
-                    # Merge original tags with restore tags (restore tags take precedence)
-                    original_tags = resource_snapshot.get("originalTags", {})
-                    dynamodb_tags = {
-                        **original_tags,
-                        "ManagedBy": "EonBulkRecovery",
-                        "eon:restore": "true",
-                        "eon:snapshot_id": snapshot_id,
-                        "eon:snapshot_time": snapshot_point_in_time
-                    }
-
-                    restored_table_name = get_restored_name(resource_name)
-                    print(f"DynamoDB restore config - region: {actual_region}, table: {restored_table_name}, WCU: {allocated_wcu:,}")
-
-                    destination_config = {
-                        "awsDynamodb": {
-                            "restoreRegion": actual_region,
-                            "encryptionKeyId": kms_key_arn,
-                            "restoredName": restored_table_name,
-                            "writeCapacityUnits": allocated_wcu,
-                            "tags": dynamodb_tags
-                        }
-                    }
-
-                    job_id = eon_client.restore_dynamodb_table(
-                        resource_id=resource_id,
-                        snapshot_id=snapshot_id,
-                        restore_account_id=eon_restore_account_id,
-                        destination_config=destination_config
-                    )
-
-                    # Capture restored resource details
-                    restored_resource_details = {
-                        "restoredRegion": actual_region,
-                        "restoredName": restored_table_name,
-                        "restoreType": "NEW_TABLE",
-                        "writeCapacityUnits": allocated_wcu
-                    }
+            if result:
+                job_id, restored_resource_details = result
 
             if job_id:
                 restore_jobs.append({
@@ -1124,7 +1241,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     "snapshotPointInTime": snapshot_point_in_time,
                     "sourceRegion": source_region,
                     "status": "INITIATED",
-                    **restored_resource_details  # Include region and resource-specific details
+                    **restored_resource_details
                 })
                 print(f"Successfully initiated restore job {job_id} for {resource_name}")
 
@@ -1136,7 +1253,6 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
         except Exception as e:
             print(f"ERROR: Failed to initiate restore for {resource_name}: {str(e)}")
-            # Add failed job to the list
             restore_jobs.append({
                 "jobId": None,
                 "resourceId": resource_id,
