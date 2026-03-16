@@ -148,7 +148,8 @@ def calculate_dynamodb_wcu_allocation_by_region(
     dynamodb_tables_by_region: Dict[str, List[Dict[str, Any]]],
     regional_wcu_capacity: int = 40000,
     utilization_percentage: float = 0.95,
-    default_wcu_for_zero_size: int = 50
+    default_wcu_for_zero_size: int = 50,
+    table_wcu_max: int = 40000,
 ) -> Dict[str, int]:
     """
     Calculate WCU allocation for DynamoDB tables per-region based on their sizes.
@@ -158,6 +159,9 @@ def calculate_dynamodb_wcu_allocation_by_region(
         regional_wcu_capacity: WCU capacity per region (default 40000)
         utilization_percentage: Percentage of capacity to use (default 95%)
         default_wcu_for_zero_size: WCU for tables with 0 size (default 50)
+        table_wcu_max: Maximum WCU any single table can receive (default 40000).
+            Prevents a single large table from consuming all provisioned capacity
+            when the regional limit has been raised above the default.
 
     Returns:
         Dictionary mapping resource_id to allocated WCU
@@ -166,6 +170,7 @@ def calculate_dynamodb_wcu_allocation_by_region(
 
     print(f"\nDynamoDB WCU Allocation (per-region):")
     print(f"  Regional capacity: {regional_wcu_capacity:,} WCU per region")
+    print(f"  Per-table max: {table_wcu_max:,} WCU")
     print(f"  Utilization: {utilization_percentage*100}%")
     print(f"  Regions with DynamoDB tables: {len(dynamodb_tables_by_region)}")
 
@@ -202,13 +207,14 @@ def calculate_dynamodb_wcu_allocation_by_region(
             for table in dynamodb_tables:
                 proportion = table["sizeBytes"] / total_size
                 proportional_wcu = int(available_wcu * proportion)
-                allocated_wcu = max(proportional_wcu, 1)
+                allocated_wcu = min(max(proportional_wcu, 1), table_wcu_max)
 
                 wcu_allocation[table["resourceId"]] = allocated_wcu
                 allocated_total += allocated_wcu
 
                 table_size_gb = table["sizeBytes"] / (1024**3)
-                print(f"    {table['resourceName']}: {table_size_gb:.2f} GB ({proportion*100:.1f}%) -> {allocated_wcu:,} WCU")
+                capped = " (capped)" if proportional_wcu > table_wcu_max else ""
+                print(f"    {table['resourceName']}: {table_size_gb:.2f} GB ({proportion*100:.1f}%) -> {allocated_wcu:,} WCU{capped}")
 
         # Give zero-size tables the default or whatever remains, whichever is smaller
         remaining_wcu = available_wcu - allocated_total
@@ -310,21 +316,25 @@ def discover_dynamodb_tables_from_stacks(
 def discover_s3_buckets_from_stacks(
     stack_names: List[str],
     restore_account_credentials: Optional[Dict[str, str]] = None,
-    regions: Optional[List[str]] = None
+    regions: Optional[List[str]] = None,
+    s3_in_place_tag_key: str = "eon_functional_id",
 ) -> Dict[str, Dict[str, str]]:
     """
-    Discover S3 buckets from CloudFormation stack resources and index them by eon_functional_id tag.
+    Discover S3 buckets from CloudFormation stack resources and index them by a matching tag.
 
     Queries CloudFormation stacks to find all AWS::S3::Bucket resources,
-    then fetches the eon_functional_id tag from each bucket to build a lookup dict.
+    then fetches the matching tag from each bucket to build a lookup dict.
 
     Args:
         stack_names: List of CloudFormation stack names to scan
         restore_account_credentials: Cross-account credentials for restore account
         regions: List of regions to check for stacks (defaults to us-east-1)
+        s3_in_place_tag_key: Tag key used to match source and target S3 buckets
+            for in-place restore (default: "eon_functional_id"). The tag value
+            can be any string (bucket name, hash, UUID, etc.).
 
     Returns:
-        Dictionary mapping eon_functional_id tag value to bucket configuration:
+        Dictionary mapping tag value to bucket configuration:
         {
             "my-functional-id": {
                 "bucketName": "actual-bucket-name",
@@ -386,7 +396,7 @@ def discover_s3_buckets_from_stacks(
             except Exception as e:
                 print(f"Unexpected error checking CloudFormation stack '{stack_name}' in {region}: {str(e)}")
 
-    # Phase 2: Fetch eon_functional_id tags from discovered buckets
+    # Phase 2: Fetch matching tags from discovered buckets
     s3_buckets_by_functional_id = {}
 
     for bucket_info in discovered_buckets:
@@ -397,18 +407,18 @@ def discover_s3_buckets_from_stacks(
             tag_set = tagging_response.get("TagSet", [])
             functional_id = None
             for tag in tag_set:
-                if tag["Key"] == "eon_functional_id":
+                if tag["Key"] == s3_in_place_tag_key:
                     functional_id = tag["Value"]
                     break
 
             if functional_id:
                 if functional_id in s3_buckets_by_functional_id:
-                    print(f"WARNING: Duplicate eon_functional_id '{functional_id}' found on bucket '{bucket_info['bucketName']}', overwriting previous match")
+                    print(f"WARNING: Duplicate '{s3_in_place_tag_key}' value '{functional_id}' found on bucket '{bucket_info['bucketName']}', overwriting previous match")
                 bucket_info["eonFunctionalId"] = functional_id
                 s3_buckets_by_functional_id[functional_id] = bucket_info
-                print(f"Discovered S3 bucket '{bucket_info['bucketName']}' with eon_functional_id='{functional_id}' (stack: {bucket_info['stackName']})")
+                print(f"Discovered S3 bucket '{bucket_info['bucketName']}' with {s3_in_place_tag_key}='{functional_id}' (stack: {bucket_info['stackName']})")
             else:
-                print(f"S3 bucket '{bucket_info['bucketName']}' has no eon_functional_id tag, skipping for in-place matching")
+                print(f"S3 bucket '{bucket_info['bucketName']}' has no '{s3_in_place_tag_key}' tag, skipping for in-place matching")
 
         except ClientError as e:
             error_code = e.response.get("Error", {}).get("Code", "")
@@ -419,7 +429,7 @@ def discover_s3_buckets_from_stacks(
         except Exception as e:
             print(f"Unexpected error fetching tags for S3 bucket '{bucket_info['bucketName']}': {str(e)}")
 
-    print(f"\nDiscovered {len(s3_buckets_by_functional_id)} S3 bucket(s) with eon_functional_id from stack(s) for in-place restore")
+    print(f"\nDiscovered {len(s3_buckets_by_functional_id)} S3 bucket(s) with '{s3_in_place_tag_key}' from stack(s) for in-place restore")
     return s3_buckets_by_functional_id
 
 
@@ -514,6 +524,7 @@ class _RestoreContext:
     recovery_stack_s3_buckets: Dict[str, Dict[str, str]]
     recovery_stacks_only: bool
     dynamodb_wcu_allocation: Dict[str, int]
+    s3_in_place_tag_key: str
 
 
 # ---------------------------------------------------------------------------
@@ -783,14 +794,14 @@ def _initiate_s3_restore(
 
     kms_key_arn = require_kms_key(ctx.kms_key_arns_by_region, actual_region)
 
-    # Check for in-place restore via eon_functional_id tag matching
-    source_functional_id = original_tags.get("eon_functional_id")
+    # Check for in-place restore via tag matching (configurable key)
+    source_functional_id = original_tags.get(ctx.s3_in_place_tag_key)
     stack_bucket_match = None
 
     if source_functional_id and ctx.recovery_stack_s3_buckets:
         if source_functional_id in ctx.recovery_stack_s3_buckets:
             stack_bucket_match = ctx.recovery_stack_s3_buckets[source_functional_id]
-            print(f"Found matching S3 bucket '{stack_bucket_match['bucketName']}' with eon_functional_id='{source_functional_id}' (stack: {stack_bucket_match['stackName']})")
+            print(f"Found matching S3 bucket '{stack_bucket_match['bucketName']}' with {ctx.s3_in_place_tag_key}='{source_functional_id}' (stack: {stack_bucket_match['stackName']})")
 
     if stack_bucket_match:
         return _restore_s3_in_place(ctx, resource_snapshot, stack_bucket_match, source_functional_id)
@@ -1063,12 +1074,14 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         restoreRegion: Primary region for restores
         kmsKeyArnsByRegion: Dictionary mapping region to KMS key ARN for encryption
         rdsSubnetGroupsByRegion: Dictionary mapping region to RDS subnet group name
-        dynamodbRegionalWcuLimit: Regional WCU limit for DynamoDB (default 40000)
+        dynamodbRegionalWcuLimit: Regional WCU limit per region for DynamoDB (default 40000)
+        dynamodbTableWcuMax: Max WCU any single table can receive (default 40000)
         vpcConfigs: VPC configurations for the restore
         crossAccountRoleArn: ARN of cross-account role (optional)
         excludeEC2TagKeys: List of tag keys to exclude from EC2 instance tags (optional)
         recoveryStackNames: List of CloudFormation stack names to check for pre-created DynamoDB tables (optional)
         recoveryStacksOnly: If true, only restore resources matching a stack table/bucket (optional, default false)
+        s3InPlaceTagKey: Tag key for matching S3 buckets for in-place restore (default: "eon_functional_id")
 
     Returns:
         restoreJobs: List of initiated restore jobs with job IDs
@@ -1082,6 +1095,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     kms_key_arns_by_region = event.get("kmsKeyArnsByRegion", {})
     rds_subnet_groups_by_region = event.get("rdsSubnetGroupsByRegion", {})
     dynamodb_regional_wcu_limit = event.get("dynamodbRegionalWcuLimit") or 40000
+    dynamodb_table_wcu_max = event.get("dynamodbTableWcuMax") or 40000
     vpc_configs = event.get("vpcConfigs", [])
     cross_account_role_arn = event.get("crossAccountRoleArn")
     management_account_id = os.environ.get("MANAGEMENT_ACCOUNT_ID", "").strip() or None
@@ -1089,12 +1103,16 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     enable_cdk_recovery_stacks = event.get("recoveryStackNames", [])
     recovery_stacks_only = event.get("recoveryStacksOnly", False)
     resource_name_prefix = event.get("resourceNamePrefix")  # None means use original name
+    s3_in_place_tag_key = event.get("s3InPlaceTagKey") or "eon_functional_id"
 
     # ---- Log configuration ----
     print(f"KMS keys available in regions: {list(kms_key_arns_by_region.keys())}")
     print(f"RDS subnet groups available in regions: {list(rds_subnet_groups_by_region.keys())}")
     print(f"DynamoDB regional WCU limit: {dynamodb_regional_wcu_limit:,}")
+    print(f"DynamoDB per-table WCU max: {dynamodb_table_wcu_max:,}")
     print(f"Resource name prefix: {resource_name_prefix if resource_name_prefix else '(none - using original names)'}")
+    if s3_in_place_tag_key != "eon_functional_id":
+        print(f"S3 in-place restore tag key: {s3_in_place_tag_key}")
     if exclude_ec2_tag_keys:
         print(f"EC2 tag keys to exclude: {exclude_ec2_tag_keys}")
     if enable_cdk_recovery_stacks:
@@ -1129,7 +1147,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         recovery_stack_s3_buckets = discover_s3_buckets_from_stacks(
             stack_names=enable_cdk_recovery_stacks,
             restore_account_credentials=restore_account_credentials,
-            regions=vpc_regions
+            regions=vpc_regions,
+            s3_in_place_tag_key=s3_in_place_tag_key,
         )
 
     # ---- Build per-region lookups ----
@@ -1162,7 +1181,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         dynamodb_tables_by_region=dynamodb_tables_by_region,
         regional_wcu_capacity=dynamodb_regional_wcu_limit,
         utilization_percentage=0.95,
-        default_wcu_for_zero_size=50
+        default_wcu_for_zero_size=50,
+        table_wcu_max=dynamodb_table_wcu_max,
     )
 
     # ---- Initialize Eon client ----
@@ -1190,6 +1210,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         recovery_stack_s3_buckets=recovery_stack_s3_buckets,
         recovery_stacks_only=recovery_stacks_only,
         dynamodb_wcu_allocation=dynamodb_wcu_allocation,
+        s3_in_place_tag_key=s3_in_place_tag_key,
     )
 
     # ---- Initiate restores ----

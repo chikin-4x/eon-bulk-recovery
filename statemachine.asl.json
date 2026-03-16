@@ -177,12 +177,14 @@
         "kmsKeyArnsByRegion.$": "$.bootstrapResult.kmsKeyArnsByRegion",
         "rdsSubnetGroupsByRegion.$": "$.bootstrapResult.rdsSubnetGroupsByRegion",
         "dynamodbRegionalWcuLimit.$": "$.dynamodbRegionalWcuLimit",
+        "dynamodbTableWcuMax.$": "$.dynamodbTableWcuMax",
         "resourceNamePrefix.$": "$.resourceNamePrefix",
         "vpcConfigs.$": "$.vpcConfigs",
         "crossAccountRoleArn.$": "$.crossAccountRoleArn",
         "excludeEC2TagKeys.$": "$.excludeEC2TagKeys",
         "recoveryStackNames.$": "$.recoveryStackNames",
-        "recoveryStacksOnly.$": "$.recoveryStacksOnly"
+        "recoveryStacksOnly.$": "$.recoveryStacksOnly",
+        "s3InPlaceTagKey.$": "$.s3InPlaceTagKey"
       },
       "ResultPath": "$.restoreJobsResult",
       "Retry": [

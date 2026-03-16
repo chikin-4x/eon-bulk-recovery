@@ -128,7 +128,7 @@ Tag keys matching this list will be filtered from restored EC2 instances and the
 ```json
   "recoveryStackNames": ["OrdersServiceStack", "UserDataStack"]
 ```
-The workflow queries the named CloudFormation stacks in the restore account for pre-created DynamoDB tables and S3 buckets. For DynamoDB, if a table matching the source table name AND source region is found, an **in-place restore** is performed instead of creating a new table. For S3, if a stack bucket has an `eon_functional_id` tag matching the source bucket's tag, an **in-place restore** is performed to that existing bucket.
+The workflow queries the named CloudFormation stacks in the restore account for pre-created DynamoDB tables and S3 buckets. For DynamoDB, if a table matching the source table name AND source region is found, an **in-place restore** is performed instead of creating a new table. For S3, if a stack bucket has a tag (key = `s3InPlaceTagKey`, default `eon_functional_id`) matching the source bucket's tag value, an **in-place restore** is performed to that existing bucket.
 
 **Stacks-only mode** — set both fields to only restore stack-matched resources:
 ```json
@@ -158,7 +158,7 @@ S3 bucket names are **globally unique** across all AWS accounts worldwide. This 
 - **Long bucket names are truncated** - S3 limits names to 63 characters; when the combined name (original + hash suffix) exceeds 63 characters, the original name is truncated to preserve the hash suffix
 - **AWS system tags are filtered** - Tags with reserved prefixes (`aws:`, `elasticbeanstalk:`) from the original bucket are automatically excluded as they cannot be manually recreated
 
-**In-place restore:** When using `recoveryStackNames`, if a source S3 bucket has an `eon_functional_id` tag and a matching bucket exists in the recovery stack with the same tag value, the data is restored directly to the existing bucket without creating a new one. This avoids naming limitations and ensures the bucket name matches what the recovery stack's application code expects.
+**In-place restore:** When using `recoveryStackNames`, if a source S3 bucket has a tag matching `s3InPlaceTagKey` (default: `eon_functional_id`) and a recovery-stack bucket has the same tag value, the data is restored directly to the existing bucket. The tag value can be any string — the original bucket name, a hash, a UUID, etc. — it just needs to match between source and target. This avoids naming limitations and ensures the bucket name matches what the recovery stack's application code expects.
 
 **Important:** Applications referencing S3 bucket names will need configuration updates after restore to point to the new bucket names. The restored bucket names are included in the workflow output and completion notification.
 
@@ -171,13 +171,15 @@ S3 bucket names are **globally unique** across all AWS accounts worldwide. This 
 | `restoreRegion` | No | Force all resources to this region (null = use source regions) |
 | `snapshotDate` | No | Date for snapshot selection (YYYY-MM-DD, null = latest) |
 | `resourceNamePrefix` | No | Prefix for restored resource names (null = use original names) |
-| `dynamodbRegionalWcuLimit` | No | DynamoDB WCU limit per region for restore throughput (default: 40000). See [DynamoDB WCU Allocation](#dynamodb-wcu-allocation) |
+| `dynamodbRegionalWcuLimit` | No | Total WCU budget per region across all tables (default: 40000). See [DynamoDB WCU Allocation](#dynamodb-wcu-allocation) |
+| `dynamodbTableWcuMax` | No | Max WCU any single table can receive (default: 40000). Caps individual tables when the regional limit is raised |
 | `vpcConfigs` | Yes | Network configuration per region (creates KMS keys and RDS subnet groups automatically) |
 | `crossAccountRoleArn` | No | Custom role ARN or null for Organizations |
 | `restoreAccountName` | No | Display name in Eon (null = auto-generate) |
 | `excludeEC2TagKeys` | No | List of tag keys to exclude from restored EC2 instances and volumes (default: []) |
 | `recoveryStackNames` | No | List of CloudFormation stack names to scan for pre-created DynamoDB tables and S3 buckets (default: []) |
 | `recoveryStacksOnly` | No | When `true`, only restore resources that match a stack table/bucket — skip EC2, RDS, and unmatched DynamoDB/S3 (default: false) |
+| `s3InPlaceTagKey` | No | Tag key used to match source and target S3 buckets for in-place restore (default: `"eon_functional_id"`). The tag value can be any string — bucket name, hash, UUID, etc. |
 
 ### DynamoDB WCU Allocation
 
@@ -196,7 +198,9 @@ When restoring DynamoDB tables, the workflow distributes Write Capacity Units (W
 | users | 10 GB (25%) | 9,500 WCU |
 | cache | 0 GB (unknown) | 50 WCU |
 
-**Tuning:** Set `dynamodbRegionalWcuLimit` based on your restore account's DynamoDB WCU quota. The default (40,000) is the standard AWS account limit. Request a quota increase via AWS Service Quotas if you need faster restores for large datasets.
+**Per-table cap:** `dynamodbTableWcuMax` (default: 40,000) limits the WCU assigned to any single table. This matters when you raise the regional limit — e.g., with `dynamodbRegionalWcuLimit: 80000` and two tables, each table would get ~38,000 WCU rather than one table consuming 76,000. The restore process uses DynamoDB provisioned capacity, so the per-table cap prevents a single table from monopolizing throughput.
+
+**Tuning:** The standard AWS account limit is 80,000 WCU per region. `dynamodbRegionalWcuLimit` defaults to 40,000 (half) to avoid consuming all capacity during restore — increase it if the restore account is dedicated or has headroom.
 
 ## How It Works
 
@@ -206,11 +210,15 @@ When restoring DynamoDB tables, the workflow distributes Write Capacity Units (W
 4. **List Snapshots** - Retrieves resources and their snapshots, extracts table sizes
 5. **Initiate Restores** - If `recoveryStackNames` provided:
    - **DynamoDB**: Queries stacks for `AWS::DynamoDB::Table` resources, uses in-place restore for matches (by table name + region)
-   - **S3**: Queries stacks for `AWS::S3::Bucket` resources, uses in-place restore for matches (by `eon_functional_id` tag)
+   - **S3**: Queries stacks for `AWS::S3::Bucket` resources, uses in-place restore for matches (by `s3InPlaceTagKey` tag, default `eon_functional_id`)
    - Otherwise: Creates new tables with allocated WCUs (38k per region = 95% of 40k) and new S3 buckets with hash suffixes
 6. **Monitor** - Polls until completion (default: 30 hours max)
 
 ![Notification example](./screenshot_output.png)
+
+### Lambda Timeout
+
+The Lambda function has a 15-minute timeout (configured in `template.yaml`). Each restore job takes ~5 seconds to initiate (API call + rate-limit pause), so a single invocation can handle roughly **~150 resources**. If you are restoring hundreds of resources simultaneously, the function may time out before all jobs are initiated. This is a known limitation — a future enhancement will add batching/continuation support.
 
 ### Monitoring Timeout
 

@@ -6,10 +6,12 @@
   "snapshotDate": "2025-10-14",
   "resourceNamePrefix": null,
   "dynamodbRegionalWcuLimit": null,
+  "dynamodbTableWcuMax": null,
   "crossAccountRoleArn": null,
   "excludeEC2TagKeys": [],
   "recoveryStackNames": [],
   "recoveryStacksOnly": false,
+  "s3InPlaceTagKey": null,
   "vpcConfigs": [
     {
       "region": "us-east-1",
