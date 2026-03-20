@@ -53,7 +53,9 @@ For non-Organization accounts, create an IAM role in the restore account with:
 }
 ```
 
-**Required permissions:** CloudFormation, IAM, RDS, KMS, S3, EC2, Service Quotas
+**Required permissions:** CloudFormation, IAM, RDS, KMS, S3, EC2, DynamoDB, Service Quotas
+
+> **DynamoDB permissions** are needed for in-place restore WCU scaling (`recoveryStackNames`). The role must include: `dynamodb:DescribeTable`, `dynamodb:UpdateTable`, `dynamodb:TagResource`, `dynamodb:UntagResource`, `dynamodb:ListTagsOfResource`. Built-in admin roles (`AWSControlTowerExecution`, `OrganizationAccountAccessRole`) already have these.
 
 ### Deploy the Application
 
@@ -128,7 +130,7 @@ Tag keys matching this list will be filtered from restored EC2 instances and the
 ```json
   "recoveryStackNames": ["OrdersServiceStack", "UserDataStack"]
 ```
-The workflow queries the named CloudFormation stacks in the restore account for pre-created DynamoDB tables and S3 buckets. For DynamoDB, if a table matching the source table name AND source region is found, an **in-place restore** is performed instead of creating a new table. For S3, if a stack bucket has a tag (key = `s3InPlaceTagKey`, default `eon_functional_id`) matching the source bucket's tag value, an **in-place restore** is performed to that existing bucket.
+The workflow queries the named CloudFormation stacks in the restore account for pre-created DynamoDB tables and S3 buckets. For DynamoDB, if a table matching the source table name AND source region is found, an **in-place restore** is performed instead of creating a new table — the table's WCU is temporarily scaled up (same allocation as new table restores) and restored to its original throughput after the restore completes. For S3, if a stack bucket has a tag (key = `s3InPlaceTagKey`, default `eon_functional_id`) matching the source bucket's tag value, an **in-place restore** is performed to that existing bucket.
 
 **Stacks-only mode** — set both fields to only restore stack-matched resources:
 ```json
@@ -183,7 +185,7 @@ S3 bucket names are **globally unique** across all AWS accounts worldwide. This 
 
 ### DynamoDB WCU Allocation
 
-When restoring DynamoDB tables, the workflow distributes Write Capacity Units (WCUs) across tables **per-region** to maximize restore throughput without exceeding account limits.
+When restoring DynamoDB tables, the workflow distributes Write Capacity Units (WCUs) across tables **per-region** to maximize restore throughput without exceeding account limits. This applies to both new table restores and in-place restores (recovery stack tables).
 
 **How it works:**
 1. Tables with known sizes (from Eon's resource inventory) are allocated first, proportionally to their size — a 10 GB table gets 10× the WCUs of a 1 GB table
@@ -202,6 +204,16 @@ When restoring DynamoDB tables, the workflow distributes Write Capacity Units (W
 
 **Tuning:** The standard AWS account limit is 80,000 WCU per region. `dynamodbRegionalWcuLimit` defaults to 40,000 (half) to avoid consuming all capacity during restore — increase it if the restore account is dedicated or has headroom.
 
+**In-place restore WCU scaling:** For recovery stack tables, the workflow:
+1. Reads the table's current billing mode and throughput (including GSIs)
+2. Temporarily switches to provisioned mode with the allocated WCU (or scales up existing provisioned WCU)
+3. Initiates the Eon restore
+4. Restores the original billing mode and throughput after the restore job completes (or fails)
+
+Original settings are preserved via DynamoDB tags (`eon:original_billing_mode`, `eon:original_wcu`, `eon:original_rcu`) as a safety mechanism. If WCU restoration fails, the completion notification includes an **ACTION REQUIRED** section listing affected tables and their original settings.
+
+**Custom cross-account role permissions:** When using a custom `crossAccountRoleArn`, the role must include DynamoDB permissions for WCU scaling — see [Cross-Account Setup (Option B)](#option-b-manual-cross-account-role) for the full list. Built-in admin roles already have these.
+
 ## How It Works
 
 1. **Bootstrap** - Creates KMS keys in each region, RDS subnet groups, IAM roles
@@ -209,10 +221,10 @@ When restoring DynamoDB tables, the workflow distributes Write Capacity Units (W
 3. **Configure** - Sets up VPC connectivity
 4. **List Snapshots** - Retrieves resources and their snapshots, extracts table sizes
 5. **Initiate Restores** - If `recoveryStackNames` provided:
-   - **DynamoDB**: Queries stacks for `AWS::DynamoDB::Table` resources, uses in-place restore for matches (by table name + region)
+   - **DynamoDB**: Queries stacks for `AWS::DynamoDB::Table` resources, uses in-place restore for matches (by table name + region), temporarily scales up WCU
    - **S3**: Queries stacks for `AWS::S3::Bucket` resources, uses in-place restore for matches (by `s3InPlaceTagKey` tag, default `eon_functional_id`)
    - Otherwise: Creates new tables with allocated WCUs (38k per region = 95% of 40k) and new S3 buckets with hash suffixes
-6. **Monitor** - Polls until completion (default: 30 hours max)
+6. **Monitor** - Polls until completion (default: 30 hours max), restores DynamoDB WCU to original settings as each in-place restore completes
 
 ![Notification example](./screenshot_output.png)
 

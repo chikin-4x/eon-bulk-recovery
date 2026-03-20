@@ -15,29 +15,12 @@ from botocore.exceptions import ClientError
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from lib.eon_client import EonClient
-from lib.aws_utils import get_eon_credentials, get_cross_account_credentials
+from lib.aws_utils import get_eon_credentials, get_cross_account_credentials, create_boto3_client
 
 
 # ---------------------------------------------------------------------------
 # Shared utilities
 # ---------------------------------------------------------------------------
-
-def create_boto3_client(
-    service: str,
-    region: str,
-    credentials: Optional[Dict[str, str]] = None,
-):
-    """Create a boto3 client, optionally using cross-account credentials."""
-    if credentials:
-        return boto3.client(
-            service,
-            region_name=region,
-            aws_access_key_id=credentials["AccessKeyId"],
-            aws_secret_access_key=credentials["SecretAccessKey"],
-            aws_session_token=credentials["SessionToken"],
-        )
-    return boto3.client(service, region_name=region)
-
 
 def resolve_target_region(
     target_region: Optional[str],
@@ -229,6 +212,281 @@ def calculate_dynamodb_wcu_allocation_by_region(
         print(f"    Total allocated in {region}: {allocated_total:,} WCU ({allocated_total/regional_wcu_capacity*100:.1f}% of regional capacity)")
 
     return wcu_allocation
+
+
+# ---------------------------------------------------------------------------
+# DynamoDB WCU scaling for in-place restores
+# ---------------------------------------------------------------------------
+
+def _get_original_settings_from_tags(
+    dynamodb_client,
+    table_arn: str,
+) -> Optional[Dict[str, Any]]:
+    """Check for eon:original_* tags on the table (set during a previous scale-up).
+
+    Returns the original settings dict if tags exist, or None if no tags found.
+    """
+    try:
+        response = dynamodb_client.list_tags_of_resource(ResourceArn=table_arn)
+        tags = {t["Key"]: t["Value"] for t in response.get("Tags", [])}
+
+        if "eon:original_billing_mode" in tags:
+            original_gsi_throughput = {}
+            gsi_json = tags.get("eon:original_gsi_throughput")
+            if gsi_json:
+                import json as _json
+                try:
+                    original_gsi_throughput = _json.loads(gsi_json)
+                except (ValueError, TypeError):
+                    pass
+
+            return {
+                "originalBillingMode": tags["eon:original_billing_mode"],
+                "originalWcu": int(tags.get("eon:original_wcu", "0")),
+                "originalRcu": int(tags.get("eon:original_rcu", "0")),
+                "originalGsiThroughput": original_gsi_throughput,
+            }
+    except Exception as e:
+        print(f"WARNING: Could not read tags from table {table_arn}: {e}")
+
+    return None
+
+
+def _tag_original_settings(
+    dynamodb_client,
+    table_arn: str,
+    billing_mode: str,
+    wcu: int,
+    rcu: int,
+    gsi_throughput: Dict[str, Dict[str, int]],
+) -> None:
+    """Write eon:original_* tags to the table for idempotency."""
+    import json as _json
+
+    tags = [
+        {"Key": "eon:original_billing_mode", "Value": billing_mode},
+        {"Key": "eon:original_wcu", "Value": str(wcu)},
+        {"Key": "eon:original_rcu", "Value": str(rcu)},
+    ]
+    if gsi_throughput:
+        tags.append({"Key": "eon:original_gsi_throughput", "Value": _json.dumps(gsi_throughput)})
+
+    dynamodb_client.tag_resource(ResourceArn=table_arn, Tags=tags)
+
+
+def _scale_up_dynamodb_table_wcu(
+    table_name: str,
+    region: str,
+    allocated_wcu: int,
+    credentials: Optional[Dict[str, str]],
+) -> Dict[str, Any]:
+    """
+    Scale up a DynamoDB table's WCU before an in-place restore.
+
+    Captures original settings, tags the table for idempotency, and updates
+    throughput. Returns the original settings dict for later restoration.
+    """
+    if not credentials:
+        print(f"WARNING: No cross-account credentials — cannot scale WCU for {table_name}")
+        return {"wcuScaledUp": False}
+
+    try:
+        dynamodb_client = create_boto3_client("dynamodb", region, credentials)
+
+        # Describe table to get current settings
+        desc = dynamodb_client.describe_table(TableName=table_name)
+        table = desc["Table"]
+        table_arn = table["TableArn"]
+        table_status = table.get("TableStatus")
+
+        if table_status != "ACTIVE":
+            print(f"WARNING: Table {table_name} is in {table_status} state — skipping WCU scale-up")
+            return {"wcuScaledUp": False}
+
+        # Determine current billing mode and throughput
+        billing_mode = table.get("BillingModeSummary", {}).get("BillingMode", "PROVISIONED")
+        current_wcu = table.get("ProvisionedThroughput", {}).get("WriteCapacityUnits", 0)
+        current_rcu = table.get("ProvisionedThroughput", {}).get("ReadCapacityUnits", 0)
+
+        # Capture GSI throughput
+        gsi_throughput = {}
+        for gsi in table.get("GlobalSecondaryIndexes", []):
+            gsi_name = gsi["IndexName"]
+            gsi_pt = gsi.get("ProvisionedThroughput", {})
+            gsi_throughput[gsi_name] = {
+                "rcu": gsi_pt.get("ReadCapacityUnits", 0),
+                "wcu": gsi_pt.get("WriteCapacityUnits", 0),
+            }
+
+        # Check for existing eon:original_* tags (idempotency — we may be retrying)
+        tag_settings = _get_original_settings_from_tags(dynamodb_client, table_arn)
+        if tag_settings:
+            print(f"Found existing eon:original_* tags on {table_name} — using tag values as original settings (likely a retry)")
+            original_billing_mode = tag_settings["originalBillingMode"]
+            original_wcu = tag_settings["originalWcu"]
+            original_rcu = tag_settings["originalRcu"]
+            original_gsi_throughput = tag_settings["originalGsiThroughput"]
+        else:
+            original_billing_mode = billing_mode
+            original_wcu = current_wcu
+            original_rcu = current_rcu
+            original_gsi_throughput = gsi_throughput
+
+        # Short-circuit: already at or above target WCU in PROVISIONED mode
+        if billing_mode == "PROVISIONED" and current_wcu >= allocated_wcu:
+            print(f"Table {table_name} already has {current_wcu:,} WCU >= allocated {allocated_wcu:,} WCU — skipping scale-up")
+            return {"wcuScaledUp": False}
+
+        # Tag original settings before modifying (idempotency for retries)
+        if not tag_settings:
+            _tag_original_settings(
+                dynamodb_client, table_arn,
+                original_billing_mode, original_wcu, original_rcu, original_gsi_throughput,
+            )
+
+        # Build update_table arguments
+        update_kwargs = {"TableName": table_name}
+
+        if billing_mode == "PAY_PER_REQUEST":
+            # Switch from on-demand to provisioned
+            update_kwargs["BillingMode"] = "PROVISIONED"
+            update_kwargs["ProvisionedThroughput"] = {
+                "ReadCapacityUnits": 5,  # Minimal RCU — only writes during restore
+                "WriteCapacityUnits": allocated_wcu,
+            }
+            # GSIs must also be set when switching billing mode
+            if gsi_throughput:
+                update_kwargs["GlobalSecondaryIndexUpdates"] = [
+                    {
+                        "Update": {
+                            "IndexName": gsi_name,
+                            "ProvisionedThroughput": {
+                                "ReadCapacityUnits": 5,
+                                "WriteCapacityUnits": allocated_wcu,
+                            },
+                        }
+                    }
+                    for gsi_name in gsi_throughput
+                ]
+            print(f"Switching {table_name} from PAY_PER_REQUEST to PROVISIONED with {allocated_wcu:,} WCU")
+        else:
+            # Already provisioned — just update throughput
+            update_kwargs["ProvisionedThroughput"] = {
+                "ReadCapacityUnits": max(current_rcu, 5),
+                "WriteCapacityUnits": allocated_wcu,
+            }
+            # Scale up GSI WCU too (writes to base table trigger GSI updates)
+            if gsi_throughput:
+                update_kwargs["GlobalSecondaryIndexUpdates"] = [
+                    {
+                        "Update": {
+                            "IndexName": gsi_name,
+                            "ProvisionedThroughput": {
+                                "ReadCapacityUnits": max(gsi_info["rcu"], 5),
+                                "WriteCapacityUnits": allocated_wcu,
+                            },
+                        }
+                    }
+                    for gsi_name, gsi_info in gsi_throughput.items()
+                ]
+            print(f"Updating {table_name} WCU from {current_wcu:,} to {allocated_wcu:,}")
+
+        dynamodb_client.update_table(**update_kwargs)
+
+        # Wait for table to become ACTIVE (max 60s)
+        _wait_for_table_active(dynamodb_client, table_name, max_wait_seconds=60)
+
+        return {
+            "wcuScaledUp": True,
+            "originalBillingMode": original_billing_mode,
+            "originalWcu": original_wcu,
+            "originalRcu": original_rcu,
+            "originalGsiThroughput": original_gsi_throughput,
+        }
+
+    except Exception as e:
+        print(f"ERROR: Failed to scale up WCU for table {table_name}: {e}")
+        return {"wcuScaledUp": False, "error": str(e)}
+
+
+def _restore_dynamodb_table_wcu_immediate(
+    table_name: str,
+    region: str,
+    original_settings: Dict[str, Any],
+    credentials: Optional[Dict[str, str]],
+) -> None:
+    """
+    Immediately restore a DynamoDB table's WCU to original settings.
+
+    Used for inline rollback when the Eon API call fails after scale-up.
+    """
+    if not original_settings.get("wcuScaledUp") or not credentials:
+        return
+
+    try:
+        dynamodb_client = create_boto3_client("dynamodb", region, credentials)
+        original_billing_mode = original_settings["originalBillingMode"]
+        original_wcu = original_settings["originalWcu"]
+        original_rcu = original_settings["originalRcu"]
+        original_gsi_throughput = original_settings.get("originalGsiThroughput", {})
+
+        update_kwargs = {"TableName": table_name}
+
+        if original_billing_mode == "PAY_PER_REQUEST":
+            update_kwargs["BillingMode"] = "PAY_PER_REQUEST"
+        else:
+            update_kwargs["ProvisionedThroughput"] = {
+                "ReadCapacityUnits": original_rcu,
+                "WriteCapacityUnits": original_wcu,
+            }
+            if original_gsi_throughput:
+                update_kwargs["GlobalSecondaryIndexUpdates"] = [
+                    {
+                        "Update": {
+                            "IndexName": gsi_name,
+                            "ProvisionedThroughput": {
+                                "ReadCapacityUnits": gsi_info["rcu"],
+                                "WriteCapacityUnits": gsi_info["wcu"],
+                            },
+                        }
+                    }
+                    for gsi_name, gsi_info in original_gsi_throughput.items()
+                ]
+
+        dynamodb_client.update_table(**update_kwargs)
+
+        # Clean up idempotency tags
+        table_arn = dynamodb_client.describe_table(TableName=table_name)["Table"]["TableArn"]
+        tag_keys = ["eon:original_billing_mode", "eon:original_wcu", "eon:original_rcu", "eon:original_gsi_throughput"]
+        dynamodb_client.untag_resource(ResourceArn=table_arn, TagKeys=tag_keys)
+
+        print(f"Rolled back WCU for {table_name} to original settings")
+    except Exception as e:
+        print(f"WARNING: Failed to rollback WCU for {table_name}: {e}")
+        print(f"Table may still have elevated WCU — manual intervention may be needed")
+
+
+def _wait_for_table_active(
+    dynamodb_client,
+    table_name: str,
+    max_wait_seconds: int = 60,
+) -> None:
+    """Poll describe_table until status is ACTIVE or timeout."""
+    import time as _time
+    elapsed = 0
+    interval = 5
+    while elapsed < max_wait_seconds:
+        _time.sleep(interval)
+        elapsed += interval
+        try:
+            status = dynamodb_client.describe_table(TableName=table_name)["Table"]["TableStatus"]
+            if status == "ACTIVE":
+                print(f"Table {table_name} is ACTIVE")
+                return
+            print(f"Table {table_name} status: {status} (waited {elapsed}s)")
+        except Exception as e:
+            print(f"WARNING: Error checking table status: {e}")
+    print(f"Table {table_name} did not become ACTIVE within {max_wait_seconds}s — proceeding anyway")
 
 
 # ---------------------------------------------------------------------------
@@ -967,28 +1225,51 @@ def _restore_dynamodb_in_place(
     snapshot_id = resource_snapshot["snapshotId"]
 
     restore_target_region = stack_table_match["region"]
+    table_name = stack_table_match["tableName"]
 
     # Get KMS key for the stack table's region (may be different from target_region)
     stack_kms_key_arn = ctx.kms_key_arns_by_region.get(restore_target_region)
     if not stack_kms_key_arn:
         raise ValueError(f"No KMS key available for region {restore_target_region} (required for in-place restore)")
 
-    print(f"DynamoDB IN-PLACE restore config - region: {restore_target_region}, table: {stack_table_match['tableName']} (CloudFormation stack: {stack_table_match['stackName']})")
-
-    job_id = ctx.eon_client.restore_dynamodb_to_existing_table(
-        resource_id=resource_id,
-        snapshot_id=snapshot_id,
-        restore_account_id=ctx.eon_restore_account_id,
-        table_name=stack_table_match["tableName"],
+    # Scale up table WCU before restore to maximize write throughput
+    allocated_wcu = ctx.dynamodb_wcu_allocation.get(resource_id, 50)
+    original_settings = _scale_up_dynamodb_table_wcu(
+        table_name=table_name,
         region=restore_target_region,
-        encryption_key_id=stack_kms_key_arn  # EBS encryption for restore worker
+        allocated_wcu=allocated_wcu,
+        credentials=ctx.restore_account_credentials,
     )
+
+    print(f"DynamoDB IN-PLACE restore config - region: {restore_target_region}, table: {table_name}, WCU: {allocated_wcu:,} (CloudFormation stack: {stack_table_match['stackName']})")
+
+    try:
+        job_id = ctx.eon_client.restore_dynamodb_to_existing_table(
+            resource_id=resource_id,
+            snapshot_id=snapshot_id,
+            restore_account_id=ctx.eon_restore_account_id,
+            table_name=table_name,
+            region=restore_target_region,
+            encryption_key_id=stack_kms_key_arn  # EBS encryption for restore worker
+        )
+    except Exception:
+        # Eon API failed — rollback WCU immediately to avoid lingering elevated throughput
+        print(f"Eon API call failed for {table_name} — rolling back WCU")
+        _restore_dynamodb_table_wcu_immediate(
+            table_name=table_name,
+            region=restore_target_region,
+            original_settings=original_settings,
+            credentials=ctx.restore_account_credentials,
+        )
+        raise
 
     restored_resource_details = {
         "restoredRegion": restore_target_region,
-        "restoredName": stack_table_match["tableName"],
+        "restoredName": table_name,
         "restoreType": "IN_PLACE",
-        "recoveryStackName": stack_table_match["stackName"]
+        "recoveryStackName": stack_table_match["stackName"],
+        "writeCapacityUnits": allocated_wcu,
+        "originalTableSettings": original_settings,
     }
     return job_id, restored_resource_details
 

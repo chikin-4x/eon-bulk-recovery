@@ -219,6 +219,8 @@
         "restoreAccountId.$": "$.restoreAccountId",
         "restoreRegion.$": "$.restoreRegion",
         "vpcConfigs.$": "$.vpcConfigs",
+        "crossAccountRoleArn.$": "$.crossAccountRoleArn",
+        "wcuRestorationFailures": [],
         "startTime.$": "$$.State.EnteredTime"
       },
       "ResultPath": "$.monitoringState",
@@ -236,6 +238,8 @@
         "restoreAccountId.$": "$.monitoringState.restoreAccountId",
         "restoreRegion.$": "$.monitoringState.restoreRegion",
         "vpcConfigs.$": "$.monitoringState.vpcConfigs",
+        "crossAccountRoleArn.$": "$.monitoringState.crossAccountRoleArn",
+        "wcuRestorationFailures.$": "$.monitoringState.wcuRestorationFailures",
         "startTime.$": "$.monitoringState.startTime"
       },
       "ResultPath": "$.monitoringState",

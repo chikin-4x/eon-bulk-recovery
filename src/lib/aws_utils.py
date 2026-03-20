@@ -7,6 +7,23 @@ import boto3
 from botocore.exceptions import ClientError
 
 
+def create_boto3_client(
+    service: str,
+    region: str,
+    credentials: Optional[Dict[str, str]] = None,
+):
+    """Create a boto3 client, optionally using cross-account credentials."""
+    if credentials:
+        return boto3.client(
+            service,
+            region_name=region,
+            aws_access_key_id=credentials["AccessKeyId"],
+            aws_secret_access_key=credentials["SecretAccessKey"],
+            aws_session_token=credentials["SessionToken"],
+        )
+    return boto3.client(service, region_name=region)
+
+
 def get_eon_credentials() -> Dict[str, str]:
     """
     Retrieve Eon API credentials from Secrets Manager.

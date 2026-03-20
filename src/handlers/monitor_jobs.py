@@ -11,7 +11,94 @@ import boto3
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from lib.eon_client import EonClient
-from lib.aws_utils import get_eon_credentials
+from lib.aws_utils import get_eon_credentials, get_cross_account_credentials, create_boto3_client
+
+
+def _restore_dynamodb_table_wcu(
+    job: Dict[str, Any],
+    restore_account_credentials: Dict[str, str] = None,
+) -> bool:
+    """
+    Restore a DynamoDB table's WCU to its original settings after an in-place restore.
+
+    Returns True on success (or if nothing to do), False on failure.
+    """
+    original_settings = job.get("originalTableSettings", {})
+    if not original_settings.get("wcuScaledUp"):
+        return True
+
+    table_name = job.get("restoredName")
+    region = job.get("restoredRegion")
+
+    if not table_name or not region:
+        print(f"WARNING: Missing table name or region for WCU restoration — skipping")
+        return False
+
+    if not restore_account_credentials:
+        print(f"WARNING: No cross-account credentials — cannot restore WCU for {table_name}")
+        return False
+
+    try:
+        dynamodb_client = create_boto3_client("dynamodb", region, restore_account_credentials)
+
+        # Check if table still exists
+        try:
+            desc = dynamodb_client.describe_table(TableName=table_name)
+            table_arn = desc["Table"]["TableArn"]
+        except Exception as e:
+            if "ResourceNotFoundException" in str(type(e).__name__) or "ResourceNotFoundException" in str(e):
+                print(f"Table {table_name} no longer exists — skipping WCU restoration")
+                return True
+            raise
+
+        original_billing_mode = original_settings["originalBillingMode"]
+        original_wcu = original_settings["originalWcu"]
+        original_rcu = original_settings["originalRcu"]
+        original_gsi_throughput = original_settings.get("originalGsiThroughput", {})
+
+        update_kwargs = {"TableName": table_name}
+
+        if original_billing_mode == "PAY_PER_REQUEST":
+            # Switch back to on-demand — GSIs switch automatically
+            update_kwargs["BillingMode"] = "PAY_PER_REQUEST"
+            print(f"Restoring {table_name} to PAY_PER_REQUEST billing mode")
+        else:
+            # Restore original provisioned throughput
+            update_kwargs["ProvisionedThroughput"] = {
+                "ReadCapacityUnits": original_rcu,
+                "WriteCapacityUnits": original_wcu,
+            }
+            if original_gsi_throughput:
+                update_kwargs["GlobalSecondaryIndexUpdates"] = [
+                    {
+                        "Update": {
+                            "IndexName": gsi_name,
+                            "ProvisionedThroughput": {
+                                "ReadCapacityUnits": gsi_info["rcu"],
+                                "WriteCapacityUnits": gsi_info["wcu"],
+                            },
+                        }
+                    }
+                    for gsi_name, gsi_info in original_gsi_throughput.items()
+                ]
+            print(f"Restoring {table_name} to original throughput: {original_wcu:,} WCU, {original_rcu:,} RCU")
+
+        dynamodb_client.update_table(**update_kwargs)
+
+        # Clean up idempotency tags
+        tag_keys = ["eon:original_billing_mode", "eon:original_wcu", "eon:original_rcu", "eon:original_gsi_throughput"]
+        try:
+            dynamodb_client.untag_resource(ResourceArn=table_arn, TagKeys=tag_keys)
+        except Exception as e:
+            print(f"WARNING: Could not remove eon:original_* tags from {table_name}: {e}")
+
+        print(f"Successfully restored WCU for {table_name}")
+        return True
+
+    except Exception as e:
+        print(f"ERROR: Failed to restore WCU for {table_name} in {region}: {e}")
+        print(f"Table may still have elevated WCU — manual intervention required")
+        return False
 
 
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -25,6 +112,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         restoreAccountId: Restore AWS account ID
         restoreRegion: Restore region
         vpcConfigs: VPC configurations used
+        crossAccountRoleArn: ARN of cross-account role for DynamoDB WCU restoration (optional)
         startTime: ISO timestamp when monitoring started
 
     Returns:
@@ -41,6 +129,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     restore_account_id = event.get("restoreAccountId")
     restore_region = event.get("restoreRegion")
     vpc_configs = event.get("vpcConfigs", [])
+    cross_account_role_arn = event.get("crossAccountRoleArn")
     start_time = event.get("startTime")
     max_iterations = int(os.environ.get("MAX_MONITORING_ITERATIONS", "360"))  # 360 * 5min = 30 hours
 
@@ -55,6 +144,19 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         project_id=os.environ["EON_PROJECT_ID"]
     )
 
+    # Get cross-account credentials for DynamoDB WCU restoration (fresh each invocation)
+    restore_account_credentials = None
+    if cross_account_role_arn and restore_account_id:
+        management_account_id = os.environ.get("MANAGEMENT_ACCOUNT_ID", "").strip() or None
+        try:
+            restore_account_credentials = get_cross_account_credentials(
+                restore_account_id=restore_account_id,
+                cross_account_role_arn=cross_account_role_arn,
+                management_account_id=management_account_id
+            )
+        except Exception as e:
+            print(f"WARNING: Could not obtain cross-account credentials for WCU restoration: {e}")
+
     print(f"Monitoring {len(restore_jobs)} restore jobs (iteration {iteration})")
 
     # Track job statuses
@@ -62,6 +164,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     failed_count = 0
     running_count = 0
     partial_count = 0
+    wcu_restoration_failures = list(event.get("wcuRestorationFailures", []))
 
     job_statuses = []
 
@@ -71,6 +174,13 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # Skip jobs that failed to initiate
         if not job_id:
             failed_count += 1
+            # Restore WCU if scale-up happened but Eon API failed and inline rollback also failed
+            if (job.get("originalTableSettings", {}).get("wcuScaledUp")
+                    and not job.get("wcuRestored")):
+                success = _restore_dynamodb_table_wcu(job, restore_account_credentials)
+                job["wcuRestored"] = True
+                if not success:
+                    wcu_restoration_failures.append(job)
             job_statuses.append({
                 "jobId": None,
                 "resourceId": job.get("resourceId"),
@@ -116,6 +226,15 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 # Unknown status, treat as running
                 running_count += 1
 
+            # Restore DynamoDB WCU for terminal in-place restore jobs
+            if (status in ("JOB_COMPLETED", "JOB_PARTIAL", "JOB_FAILED", "JOB_CANCELED")
+                    and job.get("originalTableSettings", {}).get("wcuScaledUp")
+                    and not job.get("wcuRestored")):
+                success = _restore_dynamodb_table_wcu(job, restore_account_credentials)
+                job["wcuRestored"] = True
+                if not success:
+                    wcu_restoration_failures.append(job)
+
             job_statuses.append(job_status_record)
 
             print(f"Job {job_id} ({job.get('resourceName')}): {status}")
@@ -152,6 +271,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         "restoreAccountId": restore_account_id,
         "restoreRegion": restore_region,
         "vpcConfigs": vpc_configs,
+        "crossAccountRoleArn": cross_account_role_arn,
+        "wcuRestorationFailures": wcu_restoration_failures,
         "startTime": start_time
     }
 
@@ -371,6 +492,41 @@ def send_completion_notification(job_summary: Dict[str, Any], timeout: bool) -> 
             message_lines.append(f"   Duration: {duration_min} minutes")
 
         message_lines.append("")
+
+    # Add ACTION REQUIRED section if any WCU restorations failed
+    wcu_failures = job_summary.get("wcuRestorationFailures", [])
+    if wcu_failures:
+        subject += " - ACTION REQUIRED"
+        message_lines.append("")
+        message_lines.append("⚠️ ACTION REQUIRED: DynamoDB Throughput")
+        message_lines.append("=" * 50)
+        message_lines.append("")
+        message_lines.append("The following tables still have elevated write throughput from the restore.")
+        message_lines.append("Please manually restore their settings to avoid unexpected costs.")
+        message_lines.append("")
+
+        for failure_job in wcu_failures:
+            table_name = failure_job.get("restoredName", "Unknown")
+            region = failure_job.get("restoredRegion", "Unknown")
+            settings = failure_job.get("originalTableSettings", {})
+            original_mode = settings.get("originalBillingMode", "Unknown")
+            original_wcu = settings.get("originalWcu", "Unknown")
+            original_rcu = settings.get("originalRcu", "Unknown")
+            allocated_wcu = failure_job.get("writeCapacityUnits", "Unknown")
+
+            message_lines.append(f"Table: {table_name} ({region})")
+            message_lines.append(f"  Current (elevated) WCU: {allocated_wcu:,}" if isinstance(allocated_wcu, int) else f"  Current (elevated) WCU: {allocated_wcu}")
+            if original_mode == "PAY_PER_REQUEST":
+                message_lines.append(f"  Restore to: PAY_PER_REQUEST (on-demand) billing mode")
+            else:
+                message_lines.append(f"  Restore to: PROVISIONED - {original_wcu:,} WCU, {original_rcu:,} RCU" if isinstance(original_wcu, int) else f"  Restore to: PROVISIONED - {original_wcu} WCU, {original_rcu} RCU")
+
+            original_gsi = settings.get("originalGsiThroughput", {})
+            if original_gsi:
+                message_lines.append(f"  GSIs to restore:")
+                for gsi_name, gsi_info in original_gsi.items():
+                    message_lines.append(f"    {gsi_name}: {gsi_info['rcu']:,} RCU, {gsi_info['wcu']:,} WCU")
+            message_lines.append("")
 
     message = "\n".join(message_lines)
 
