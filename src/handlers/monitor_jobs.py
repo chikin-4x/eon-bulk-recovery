@@ -87,6 +87,7 @@ def _restore_dynamodb_table_wcu(
 
         # Clean up idempotency tags
         tag_keys = ["eon:original_billing_mode", "eon:original_wcu", "eon:original_rcu", "eon:original_gsi_throughput"]
+        tag_keys += [f"eon:original_gsi:{gsi_name}" for gsi_name in original_gsi_throughput]
         try:
             dynamodb_client.untag_resource(ResourceArn=table_arn, TagKeys=tag_keys)
         except Exception as e:

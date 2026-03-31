@@ -227,18 +227,25 @@ def _get_original_settings_from_tags(
     Returns the original settings dict if tags exist, or None if no tags found.
     """
     try:
-        response = dynamodb_client.list_tags_of_resource(ResourceArn=table_arn)
-        tags = {t["Key"]: t["Value"] for t in response.get("Tags", [])}
+        tags = {}
+        kwargs = {"ResourceArn": table_arn}
+        while True:
+            response = dynamodb_client.list_tags_of_resource(**kwargs)
+            tags.update({t["Key"]: t["Value"] for t in response.get("Tags", [])})
+            if "NextToken" not in response:
+                break
+            kwargs["NextToken"] = response["NextToken"]
 
         if "eon:original_billing_mode" in tags:
             original_gsi_throughput = {}
-            gsi_json = tags.get("eon:original_gsi_throughput")
-            if gsi_json:
-                import json as _json
-                try:
-                    original_gsi_throughput = _json.loads(gsi_json)
-                except (ValueError, TypeError):
-                    pass
+            for key, value in tags.items():
+                if key.startswith("eon:original_gsi:"):
+                    gsi_name = key[len("eon:original_gsi:"):]
+                    try:
+                        rcu_str, wcu_str = value.split("/")
+                        original_gsi_throughput[gsi_name] = {"rcu": int(rcu_str), "wcu": int(wcu_str)}
+                    except (ValueError, IndexError):
+                        pass
 
             return {
                 "originalBillingMode": tags["eon:original_billing_mode"],
@@ -261,15 +268,17 @@ def _tag_original_settings(
     gsi_throughput: Dict[str, Dict[str, int]],
 ) -> None:
     """Write eon:original_* tags to the table for idempotency."""
-    import json as _json
-
     tags = [
         {"Key": "eon:original_billing_mode", "Value": billing_mode},
         {"Key": "eon:original_wcu", "Value": str(wcu)},
         {"Key": "eon:original_rcu", "Value": str(rcu)},
     ]
-    if gsi_throughput:
-        tags.append({"Key": "eon:original_gsi_throughput", "Value": _json.dumps(gsi_throughput)})
+    for gsi_name, gsi_info in gsi_throughput.items():
+        tag_key = f"eon:original_gsi:{gsi_name}"
+        if len(tag_key) > 128:
+            print(f"WARNING: Skipping tag for GSI {gsi_name} — tag key exceeds 128-char limit")
+            continue
+        tags.append({"Key": tag_key, "Value": f"{gsi_info['rcu']}/{gsi_info['wcu']}"})
 
     dynamodb_client.tag_resource(ResourceArn=table_arn, Tags=tags)
 
@@ -458,6 +467,7 @@ def _restore_dynamodb_table_wcu_immediate(
         # Clean up idempotency tags
         table_arn = dynamodb_client.describe_table(TableName=table_name)["Table"]["TableArn"]
         tag_keys = ["eon:original_billing_mode", "eon:original_wcu", "eon:original_rcu", "eon:original_gsi_throughput"]
+        tag_keys += [f"eon:original_gsi:{gsi_name}" for gsi_name in original_gsi_throughput]
         dynamodb_client.untag_resource(ResourceArn=table_arn, TagKeys=tag_keys)
 
         print(f"Rolled back WCU for {table_name} to original settings")
