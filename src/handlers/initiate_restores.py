@@ -288,6 +288,7 @@ def _scale_up_dynamodb_table_wcu(
     region: str,
     allocated_wcu: int,
     credentials: Optional[Dict[str, str]],
+    warm_throughput: bool = True,
 ) -> Dict[str, Any]:
     """
     Scale up a DynamoDB table's WCU before an in-place restore.
@@ -405,12 +406,23 @@ def _scale_up_dynamodb_table_wcu(
         # Wait for table to become ACTIVE (max 60s)
         _wait_for_table_active(dynamodb_client, table_name, max_wait_seconds=60)
 
+        # Set warm throughput to pre-allocate partitions for bulk writes
+        warm_success = False
+        if warm_throughput:
+            warm_success = _warm_dynamodb_table(
+                dynamodb_client, table_name,
+                write_units=allocated_wcu,
+            )
+        else:
+            print(f"Warm throughput disabled — skipping for {table_name}")
+
         return {
             "wcuScaledUp": True,
             "originalBillingMode": original_billing_mode,
             "originalWcu": original_wcu,
             "originalRcu": original_rcu,
             "originalGsiThroughput": original_gsi_throughput,
+            "warmThroughputApplied": warm_success,
         }
 
     except Exception as e:
@@ -497,6 +509,97 @@ def _wait_for_table_active(
         except Exception as e:
             print(f"WARNING: Error checking table status: {e}")
     print(f"Table {table_name} did not become ACTIVE within {max_wait_seconds}s — proceeding anyway")
+
+
+def _warm_dynamodb_table(
+    dynamodb_client,
+    table_name: str,
+    write_units: int,
+    read_units: int = 1,
+) -> bool:
+    """
+    Set warm throughput on a DynamoDB table to pre-allocate partitions.
+
+    DynamoDB partitions have a hard limit of 1,000 WCU each. Warm throughput
+    tells DynamoDB to pre-provision enough partitions to handle the specified
+    throughput immediately, preventing partition-level throttling during
+    bulk writes (e.g. restores using BatchWriteItem).
+
+    Works with both provisioned and on-demand billing modes.
+
+    Note: warm throughput values can only be increased, never decreased.
+    There is a one-time cost per unit increase (~$0.00065/WCU in us-east-1).
+
+    Returns True on success, False on failure (non-fatal).
+    """
+    try:
+        # Check current warm throughput to avoid no-op calls
+        desc = dynamodb_client.describe_table(TableName=table_name)
+        table = desc["Table"]
+        current_warm = table.get("WarmThroughput", {})
+        current_write = current_warm.get("WriteUnitsPerSecond", 0)
+
+        if current_write >= write_units:
+            print(f"Table {table_name} warm throughput already at {current_write:,} WCU >= requested {write_units:,} — skipping")
+            return True
+
+        # Build update request with table-level warm throughput
+        update_kwargs = {
+            "TableName": table_name,
+            "WarmThroughput": {
+                "ReadUnitsPerSecond": read_units,
+                "WriteUnitsPerSecond": write_units,
+            },
+        }
+
+        # Also warm GSIs — writes to base table trigger GSI updates
+        gsis = table.get("GlobalSecondaryIndexes", [])
+        if gsis:
+            update_kwargs["GlobalSecondaryIndexUpdates"] = [
+                {
+                    "Update": {
+                        "IndexName": gsi["IndexName"],
+                        "WarmThroughput": {
+                            "ReadUnitsPerSecond": read_units,
+                            "WriteUnitsPerSecond": write_units,
+                        },
+                    }
+                }
+                for gsi in gsis
+            ]
+            gsi_names = ", ".join(gsi["IndexName"] for gsi in gsis)
+            print(f"Setting warm throughput on {table_name} + GSIs ({gsi_names}): {write_units:,} write units/sec")
+        else:
+            print(f"Setting warm throughput on {table_name}: {write_units:,} write units/sec")
+
+        dynamodb_client.update_table(**update_kwargs)
+        print(f"Warm throughput requested for {table_name} — DynamoDB will pre-allocate partitions")
+        return True
+
+    except ClientError as e:
+        error_code = e.response["Error"]["Code"]
+        if error_code == "ResourceInUseException":
+            # Table is being updated (e.g. from the WCU change) — retry after waiting
+            print(f"Table {table_name} is being updated — waiting before setting warm throughput")
+            _wait_for_table_active(dynamodb_client, table_name, max_wait_seconds=120)
+            try:
+                dynamodb_client.update_table(
+                    TableName=table_name,
+                    WarmThroughput={
+                        "ReadUnitsPerSecond": read_units,
+                        "WriteUnitsPerSecond": write_units,
+                    },
+                )
+                print(f"Warm throughput set on {table_name} (after retry)")
+                return True
+            except Exception as retry_err:
+                print(f"WARNING: Failed to set warm throughput on {table_name} after retry: {retry_err}")
+        else:
+            print(f"WARNING: Failed to set warm throughput on {table_name}: {e}")
+        return False
+    except Exception as e:
+        print(f"WARNING: Failed to set warm throughput on {table_name}: {e}")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -792,6 +895,7 @@ class _RestoreContext:
     recovery_stack_s3_buckets: Dict[str, Dict[str, str]]
     recovery_stacks_only: bool
     dynamodb_wcu_allocation: Dict[str, int]
+    dynamodb_warm_throughput: bool
     s3_in_place_tag_key: str
 
 
@@ -1249,6 +1353,7 @@ def _restore_dynamodb_in_place(
         region=restore_target_region,
         allocated_wcu=allocated_wcu,
         credentials=ctx.restore_account_credentials,
+        warm_throughput=ctx.dynamodb_warm_throughput,
     )
 
     print(f"DynamoDB IN-PLACE restore config - region: {restore_target_region}, table: {table_name}, WCU: {allocated_wcu:,} (CloudFormation stack: {stack_table_match['stackName']})")
@@ -1333,8 +1438,11 @@ def _restore_dynamodb_new_table(
         "restoredRegion": actual_region,
         "restoredName": restored_table_name,
         "restoreType": "NEW_TABLE",
-        "writeCapacityUnits": allocated_wcu
+        "writeCapacityUnits": allocated_wcu,
     }
+    if ctx.dynamodb_warm_throughput:
+        restored_resource_details["warmThroughputTarget"] = allocated_wcu
+        restored_resource_details["warmThroughputApplied"] = False
     return job_id, restored_resource_details
 
 
@@ -1395,6 +1503,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     recovery_stacks_only = event.get("recoveryStacksOnly", False)
     resource_name_prefix = event.get("resourceNamePrefix")  # None means use original name
     s3_in_place_tag_key = event.get("s3InPlaceTagKey") or "eon_functional_id"
+    dynamodb_warm_throughput = event.get("dynamodbWarmThroughput", True)
 
     # ---- Log configuration ----
     print(f"KMS keys available in regions: {list(kms_key_arns_by_region.keys())}")
@@ -1402,6 +1511,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     print(f"DynamoDB regional WCU limit: {dynamodb_regional_wcu_limit:,}")
     print(f"DynamoDB per-table WCU max: {dynamodb_table_wcu_max:,}")
     print(f"Resource name prefix: {resource_name_prefix if resource_name_prefix else '(none - using original names)'}")
+    print(f"DynamoDB warm throughput: {'enabled' if dynamodb_warm_throughput else 'disabled'}")
     if s3_in_place_tag_key != "eon_functional_id":
         print(f"S3 in-place restore tag key: {s3_in_place_tag_key}")
     if exclude_ec2_tag_keys:
@@ -1449,10 +1559,22 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         vpc_configs_by_region[region] = config
 
     # ---- Pre-compute DynamoDB WCU allocation ----
+    # In recoveryStacksOnly mode, only allocate WCU to tables that match a
+    # recovery stack. Otherwise non-restored tables dilute the WCU budget.
     dynamodb_tables_by_region: Dict[str, List[Dict[str, Any]]] = {}
+    skipped_non_stack = 0
     for snapshot in resource_snapshots:
         if snapshot.get("resourceType") == "AWS_DYNAMO_DB":
             source_region = snapshot.get("region")
+            resource_name = snapshot["resourceName"]
+
+            # In recoveryStacksOnly mode, skip tables without a matching stack
+            if recovery_stacks_only and recovery_stack_tables:
+                stack_match = recovery_stack_tables.get(resource_name)
+                if not stack_match or stack_match.get("region") != source_region:
+                    skipped_non_stack += 1
+                    continue
+
             target_region = restore_region if restore_region else source_region
 
             # Determine actual region (same logic as restore section)
@@ -1464,9 +1586,12 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
                 dynamodb_tables_by_region[actual_region].append({
                     "resourceId": snapshot["resourceId"],
-                    "resourceName": snapshot["resourceName"],
+                    "resourceName": resource_name,
                     "sizeBytes": snapshot.get("tableSizeBytes", 0)
                 })
+
+    if skipped_non_stack:
+        print(f"WCU allocation: skipped {skipped_non_stack} DynamoDB tables not matching recovery stacks (recoveryStacksOnly mode)")
 
     dynamodb_wcu_allocation = calculate_dynamodb_wcu_allocation_by_region(
         dynamodb_tables_by_region=dynamodb_tables_by_region,
@@ -1501,6 +1626,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         recovery_stack_s3_buckets=recovery_stack_s3_buckets,
         recovery_stacks_only=recovery_stacks_only,
         dynamodb_wcu_allocation=dynamodb_wcu_allocation,
+        dynamodb_warm_throughput=dynamodb_warm_throughput,
         s3_in_place_tag_key=s3_in_place_tag_key,
     )
 

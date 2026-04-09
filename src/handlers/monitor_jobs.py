@@ -14,6 +14,90 @@ from lib.eon_client import EonClient
 from lib.aws_utils import get_eon_credentials, get_cross_account_credentials, create_boto3_client
 
 
+def _apply_warm_throughput_for_new_table(
+    job: Dict[str, Any],
+    restore_account_credentials: Dict[str, str] = None,
+) -> bool:
+    """
+    Apply warm throughput to a newly created DynamoDB table during restore.
+
+    For new table restores, Eon creates the table asynchronously. Once the table
+    exists and is ACTIVE, we set warm throughput to pre-allocate partitions and
+    reduce BatchWriteItem throttling during the data restore phase.
+
+    Returns True if warm throughput was applied (or not needed), False on failure.
+    """
+    warm_target = job.get("warmThroughputTarget")
+    if not warm_target or job.get("warmThroughputApplied"):
+        return True
+
+    table_name = job.get("restoredName")
+    region = job.get("restoredRegion")
+
+    if not table_name or not region or not restore_account_credentials:
+        return False
+
+    try:
+        dynamodb_client = create_boto3_client("dynamodb", region, restore_account_credentials)
+
+        # Check if table exists and is ACTIVE
+        try:
+            desc = dynamodb_client.describe_table(TableName=table_name)
+            table = desc["Table"]
+            status = table.get("TableStatus")
+        except Exception as e:
+            if "ResourceNotFoundException" in str(type(e).__name__) or "ResourceNotFoundException" in str(e):
+                print(f"Table {table_name} does not exist yet — will retry warm throughput next iteration")
+                return False
+            raise
+
+        if status != "ACTIVE":
+            print(f"Table {table_name} is {status} — will retry warm throughput next iteration")
+            return False
+
+        # Check current warm throughput
+        current_warm = table.get("WarmThroughput", {})
+        current_write = current_warm.get("WriteUnitsPerSecond", 0)
+
+        if current_write >= warm_target:
+            print(f"Table {table_name} warm throughput already at {current_write:,} WCU — skipping")
+            return True
+
+        # Build update request
+        update_kwargs = {
+            "TableName": table_name,
+            "WarmThroughput": {
+                "ReadUnitsPerSecond": 1,
+                "WriteUnitsPerSecond": warm_target,
+            },
+        }
+
+        # Also warm GSIs
+        gsis = table.get("GlobalSecondaryIndexes", [])
+        if gsis:
+            update_kwargs["GlobalSecondaryIndexUpdates"] = [
+                {
+                    "Update": {
+                        "IndexName": gsi["IndexName"],
+                        "WarmThroughput": {
+                            "ReadUnitsPerSecond": 1,
+                            "WriteUnitsPerSecond": warm_target,
+                        },
+                    }
+                }
+                for gsi in gsis
+            ]
+
+        print(f"Setting warm throughput on new table {table_name}: {warm_target:,} write units/sec")
+        dynamodb_client.update_table(**update_kwargs)
+        print(f"Warm throughput requested for {table_name}")
+        return True
+
+    except Exception as e:
+        print(f"WARNING: Failed to set warm throughput on {table_name}: {e}")
+        return False
+
+
 def _restore_dynamodb_table_wcu(
     job: Dict[str, Any],
     restore_account_credentials: Dict[str, str] = None,
@@ -226,6 +310,15 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             else:
                 # Unknown status, treat as running
                 running_count += 1
+
+            # Apply warm throughput to new DynamoDB tables (once table exists)
+            if (job.get("resourceType") == "AWS_DYNAMO_DB"
+                    and job.get("warmThroughputTarget")
+                    and not job.get("warmThroughputApplied")
+                    and status in ("JOB_PENDING", "JOB_RUNNING")):
+                success = _apply_warm_throughput_for_new_table(job, restore_account_credentials)
+                if success:
+                    job["warmThroughputApplied"] = True
 
             # Restore DynamoDB WCU for terminal in-place restore jobs
             if (status in ("JOB_COMPLETED", "JOB_PARTIAL", "JOB_FAILED", "JOB_CANCELED")

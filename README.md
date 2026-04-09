@@ -207,10 +207,30 @@ When restoring DynamoDB tables, the workflow distributes Write Capacity Units (W
 **In-place restore WCU scaling:** For recovery stack tables, the workflow:
 1. Reads the table's current billing mode and throughput (including GSIs)
 2. Temporarily switches to provisioned mode with the allocated WCU (or scales up existing provisioned WCU)
-3. Initiates the Eon restore
-4. Restores the original billing mode and throughput after the restore job completes (or fails)
+3. Sets **warm throughput** to pre-allocate DynamoDB partitions (see below)
+4. Initiates the Eon restore
+5. Restores the original billing mode and throughput after the restore job completes (or fails)
 
 Original settings are preserved via DynamoDB tags (`eon:original_billing_mode`, `eon:original_wcu`, `eon:original_rcu`) as a safety mechanism. If WCU restoration fails, the completion notification includes an **ACTION REQUIRED** section listing affected tables and their original settings.
+
+### DynamoDB Warm Throughput
+
+DynamoDB partitions have a hard limit of **1,000 WCU each**. Even with 40,000 WCU provisioned on a table, if the table only has a few partitions, individual partitions will be throttled during bulk writes (`WriteKeyRangeThroughputThrottleEvents`). This is the primary cause of restore throttling for large tables.
+
+**Warm throughput** tells DynamoDB to pre-allocate enough partitions to handle the specified write throughput immediately, rather than scaling reactively. The workflow automatically sets warm throughput on all restored DynamoDB tables:
+
+- **In-place restores (recovery stack tables):** Warm throughput is set after WCU scaling, **before** the restore begins — partitions are pre-allocated before any writes start.
+- **New table restores:** The monitoring handler sets warm throughput once the Eon-created table exists and is ACTIVE. Even mid-restore, this helps by pre-allocating more partitions for the remaining write volume.
+- **GSIs:** Warm throughput is also applied to Global Secondary Indexes, since base table writes trigger GSI updates.
+
+**Important characteristics:**
+- Works with both **provisioned** and **on-demand** (PAY_PER_REQUEST) billing modes
+- Warm throughput values **can only be increased, never decreased** — this is a permanent setting
+- **One-time cost:** ~$0.00065/WCU in us-east-1 (e.g., warming from 4,000 to 40,000 WCU ≈ $23)
+- Subject to account table-level write throughput quota (default: 40,000 WCU, can be increased via Service Quotas)
+- Non-fatal: if warm throughput fails, the restore continues with standard throughput scaling
+
+Warm throughput is enabled by default. To disable it, set `dynamodbWarmThroughput` to `false` in the execution input (the Lambda handler reads this directly — it is not passed through the state machine definition).
 
 **Custom cross-account role permissions:** When using a custom `crossAccountRoleArn`, the role must include DynamoDB permissions for WCU scaling — see [Cross-Account Setup (Option B)](#option-b-manual-cross-account-role) for the full list. Built-in admin roles already have these.
 
