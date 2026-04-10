@@ -288,13 +288,16 @@ def _scale_up_dynamodb_table_wcu(
     region: str,
     allocated_wcu: int,
     credentials: Optional[Dict[str, str]],
-    warm_throughput: bool = True,
 ) -> Dict[str, Any]:
     """
     Scale up a DynamoDB table's WCU before an in-place restore.
 
     Captures original settings, tags the table for idempotency, and updates
     throughput. Returns the original settings dict for later restoration.
+
+    Warm throughput is handled separately by the monitor loop after the restore
+    is initiated — DynamoDB pre-allocates partitions asynchronously, so just
+    getting the request in during the restore is sufficient.
     """
     if not credentials:
         print(f"WARNING: No cross-account credentials — cannot scale WCU for {table_name}")
@@ -403,26 +406,12 @@ def _scale_up_dynamodb_table_wcu(
 
         dynamodb_client.update_table(**update_kwargs)
 
-        # Wait for table to become ACTIVE (max 60s)
-        _wait_for_table_active(dynamodb_client, table_name, max_wait_seconds=60)
-
-        # Set warm throughput to pre-allocate partitions for bulk writes
-        warm_success = False
-        if warm_throughput:
-            warm_success = _warm_dynamodb_table(
-                dynamodb_client, table_name,
-                write_units=allocated_wcu,
-            )
-        else:
-            print(f"Warm throughput disabled — skipping for {table_name}")
-
         return {
             "wcuScaledUp": True,
             "originalBillingMode": original_billing_mode,
             "originalWcu": original_wcu,
             "originalRcu": original_rcu,
             "originalGsiThroughput": original_gsi_throughput,
-            "warmThroughputApplied": warm_success,
         }
 
     except Exception as e:
@@ -486,120 +475,6 @@ def _restore_dynamodb_table_wcu_immediate(
     except Exception as e:
         print(f"WARNING: Failed to rollback WCU for {table_name}: {e}")
         print(f"Table may still have elevated WCU — manual intervention may be needed")
-
-
-def _wait_for_table_active(
-    dynamodb_client,
-    table_name: str,
-    max_wait_seconds: int = 60,
-) -> None:
-    """Poll describe_table until status is ACTIVE or timeout."""
-    import time as _time
-    elapsed = 0
-    interval = 5
-    while elapsed < max_wait_seconds:
-        _time.sleep(interval)
-        elapsed += interval
-        try:
-            status = dynamodb_client.describe_table(TableName=table_name)["Table"]["TableStatus"]
-            if status == "ACTIVE":
-                print(f"Table {table_name} is ACTIVE")
-                return
-            print(f"Table {table_name} status: {status} (waited {elapsed}s)")
-        except Exception as e:
-            print(f"WARNING: Error checking table status: {e}")
-    print(f"Table {table_name} did not become ACTIVE within {max_wait_seconds}s — proceeding anyway")
-
-
-def _warm_dynamodb_table(
-    dynamodb_client,
-    table_name: str,
-    write_units: int,
-    read_units: int = 1,
-) -> bool:
-    """
-    Set warm throughput on a DynamoDB table to pre-allocate partitions.
-
-    DynamoDB partitions have a hard limit of 1,000 WCU each. Warm throughput
-    tells DynamoDB to pre-provision enough partitions to handle the specified
-    throughput immediately, preventing partition-level throttling during
-    bulk writes (e.g. restores using BatchWriteItem).
-
-    Works with both provisioned and on-demand billing modes.
-
-    Note: warm throughput values can only be increased, never decreased.
-    There is a one-time cost per unit increase (~$0.00065/WCU in us-east-1).
-
-    Returns True on success, False on failure (non-fatal).
-    """
-    try:
-        # Check current warm throughput to avoid no-op calls
-        desc = dynamodb_client.describe_table(TableName=table_name)
-        table = desc["Table"]
-        current_warm = table.get("WarmThroughput", {})
-        current_write = current_warm.get("WriteUnitsPerSecond", 0)
-
-        if current_write >= write_units:
-            print(f"Table {table_name} warm throughput already at {current_write:,} WCU >= requested {write_units:,} — skipping")
-            return True
-
-        # Build update request with table-level warm throughput
-        update_kwargs = {
-            "TableName": table_name,
-            "WarmThroughput": {
-                "ReadUnitsPerSecond": read_units,
-                "WriteUnitsPerSecond": write_units,
-            },
-        }
-
-        # Also warm GSIs — writes to base table trigger GSI updates
-        gsis = table.get("GlobalSecondaryIndexes", [])
-        if gsis:
-            update_kwargs["GlobalSecondaryIndexUpdates"] = [
-                {
-                    "Update": {
-                        "IndexName": gsi["IndexName"],
-                        "WarmThroughput": {
-                            "ReadUnitsPerSecond": read_units,
-                            "WriteUnitsPerSecond": write_units,
-                        },
-                    }
-                }
-                for gsi in gsis
-            ]
-            gsi_names = ", ".join(gsi["IndexName"] for gsi in gsis)
-            print(f"Setting warm throughput on {table_name} + GSIs ({gsi_names}): {write_units:,} write units/sec")
-        else:
-            print(f"Setting warm throughput on {table_name}: {write_units:,} write units/sec")
-
-        dynamodb_client.update_table(**update_kwargs)
-        print(f"Warm throughput requested for {table_name} — DynamoDB will pre-allocate partitions")
-        return True
-
-    except ClientError as e:
-        error_code = e.response["Error"]["Code"]
-        if error_code == "ResourceInUseException":
-            # Table is being updated (e.g. from the WCU change) — retry after waiting
-            print(f"Table {table_name} is being updated — waiting before setting warm throughput")
-            _wait_for_table_active(dynamodb_client, table_name, max_wait_seconds=120)
-            try:
-                dynamodb_client.update_table(
-                    TableName=table_name,
-                    WarmThroughput={
-                        "ReadUnitsPerSecond": read_units,
-                        "WriteUnitsPerSecond": write_units,
-                    },
-                )
-                print(f"Warm throughput set on {table_name} (after retry)")
-                return True
-            except Exception as retry_err:
-                print(f"WARNING: Failed to set warm throughput on {table_name} after retry: {retry_err}")
-        else:
-            print(f"WARNING: Failed to set warm throughput on {table_name}: {e}")
-        return False
-    except Exception as e:
-        print(f"WARNING: Failed to set warm throughput on {table_name}: {e}")
-        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1353,10 +1228,23 @@ def _restore_dynamodb_in_place(
         region=restore_target_region,
         allocated_wcu=allocated_wcu,
         credentials=ctx.restore_account_credentials,
-        warm_throughput=ctx.dynamodb_warm_throughput,
     )
 
     print(f"DynamoDB IN-PLACE restore config - region: {restore_target_region}, table: {table_name}, WCU: {allocated_wcu:,} (CloudFormation stack: {stack_table_match['stackName']})")
+
+    restored_resource_details = {
+        "restoredRegion": restore_target_region,
+        "restoredName": table_name,
+        "restoreType": "IN_PLACE",
+        "recoveryStackName": stack_table_match["stackName"],
+        "writeCapacityUnits": allocated_wcu,
+        "originalTableSettings": original_settings,
+    }
+    # Warm throughput is applied by the monitor loop once the table is ACTIVE.
+    # DynamoDB pre-allocates partitions asynchronously after the API call.
+    if ctx.dynamodb_warm_throughput:
+        restored_resource_details["warmThroughputTarget"] = allocated_wcu
+        restored_resource_details["warmThroughputApplied"] = False
 
     try:
         job_id = ctx.eon_client.restore_dynamodb_to_existing_table(
@@ -1378,14 +1266,6 @@ def _restore_dynamodb_in_place(
         )
         raise
 
-    restored_resource_details = {
-        "restoredRegion": restore_target_region,
-        "restoredName": table_name,
-        "restoreType": "IN_PLACE",
-        "recoveryStackName": stack_table_match["stackName"],
-        "writeCapacityUnits": allocated_wcu,
-        "originalTableSettings": original_settings,
-    }
     return job_id, restored_resource_details
 
 

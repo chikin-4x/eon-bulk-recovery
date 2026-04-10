@@ -14,15 +14,16 @@ from lib.eon_client import EonClient
 from lib.aws_utils import get_eon_credentials, get_cross_account_credentials, create_boto3_client
 
 
-def _apply_warm_throughput_for_new_table(
+def _apply_deferred_warm_throughput(
     job: Dict[str, Any],
     restore_account_credentials: Dict[str, str] = None,
 ) -> bool:
     """
-    Apply warm throughput to a newly created DynamoDB table during restore.
+    Apply warm throughput to a DynamoDB table during the monitor loop.
 
-    For new table restores, Eon creates the table asynchronously. Once the table
-    exists and is ACTIVE, we set warm throughput to pre-allocate partitions and
+    Called for both new table restores (where the table doesn't exist yet at initiate
+    time) and in-place restores (where the WCU scale-up may still be in progress).
+    Once the table is ACTIVE, sets warm throughput to pre-allocate partitions and
     reduce BatchWriteItem throttling during the data restore phase.
 
     Returns True if warm throughput was applied (or not needed), False on failure.
@@ -55,11 +56,44 @@ def _apply_warm_throughput_for_new_table(
             print(f"Table {table_name} is {status} — will retry warm throughput next iteration")
             return False
 
-        # Check current warm throughput
+        # Also check GSI statuses — can't update table while GSIs are still updating
+        gsis_raw = table.get("GlobalSecondaryIndexes", [])
+        updating_gsis = [g["IndexName"] for g in gsis_raw if g.get("IndexStatus") != "ACTIVE"]
+        if updating_gsis:
+            print(f"Table {table_name} is ACTIVE but GSIs still updating: {', '.join(updating_gsis)} — will retry next iteration")
+            return False
+
+        # Check current warm throughput — never decrease (DynamoDB doesn't allow it)
         current_warm = table.get("WarmThroughput", {})
         current_write = current_warm.get("WriteUnitsPerSecond", 0)
+        current_read = current_warm.get("ReadUnitsPerSecond", 0)
 
-        if current_write >= warm_target:
+        effective_write = max(current_write, warm_target)
+        effective_read = max(current_read, 1)
+
+        # Check if any GSI needs updating before deciding to skip
+        needs_update = (effective_write > current_write) or (effective_read > current_read)
+
+        gsi_updates = []
+        for gsi in gsis_raw:
+            gsi_warm = gsi.get("WarmThroughput", {})
+            gsi_cur_write = gsi_warm.get("WriteUnitsPerSecond", 0)
+            gsi_cur_read = gsi_warm.get("ReadUnitsPerSecond", 0)
+            gsi_eff_write = max(gsi_cur_write, warm_target)
+            gsi_eff_read = max(gsi_cur_read, 1)
+            if gsi_eff_write > gsi_cur_write or gsi_eff_read > gsi_cur_read:
+                needs_update = True
+            gsi_updates.append({
+                "Update": {
+                    "IndexName": gsi["IndexName"],
+                    "WarmThroughput": {
+                        "ReadUnitsPerSecond": gsi_eff_read,
+                        "WriteUnitsPerSecond": gsi_eff_write,
+                    },
+                }
+            })
+
+        if not needs_update:
             print(f"Table {table_name} warm throughput already at {current_write:,} WCU — skipping")
             return True
 
@@ -67,28 +101,16 @@ def _apply_warm_throughput_for_new_table(
         update_kwargs = {
             "TableName": table_name,
             "WarmThroughput": {
-                "ReadUnitsPerSecond": 1,
-                "WriteUnitsPerSecond": warm_target,
+                "ReadUnitsPerSecond": effective_read,
+                "WriteUnitsPerSecond": effective_write,
             },
         }
 
         # Also warm GSIs
-        gsis = table.get("GlobalSecondaryIndexes", [])
-        if gsis:
-            update_kwargs["GlobalSecondaryIndexUpdates"] = [
-                {
-                    "Update": {
-                        "IndexName": gsi["IndexName"],
-                        "WarmThroughput": {
-                            "ReadUnitsPerSecond": 1,
-                            "WriteUnitsPerSecond": warm_target,
-                        },
-                    }
-                }
-                for gsi in gsis
-            ]
+        if gsi_updates:
+            update_kwargs["GlobalSecondaryIndexUpdates"] = gsi_updates
 
-        print(f"Setting warm throughput on new table {table_name}: {warm_target:,} write units/sec")
+        print(f"Setting warm throughput on {table_name}: {warm_target:,} write units/sec")
         dynamodb_client.update_table(**update_kwargs)
         print(f"Warm throughput requested for {table_name}")
         return True
@@ -311,12 +333,12 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 # Unknown status, treat as running
                 running_count += 1
 
-            # Apply warm throughput to new DynamoDB tables (once table exists)
+            # Apply warm throughput to DynamoDB tables (deferred from initiate step)
             if (job.get("resourceType") == "AWS_DYNAMO_DB"
                     and job.get("warmThroughputTarget")
                     and not job.get("warmThroughputApplied")
                     and status in ("JOB_PENDING", "JOB_RUNNING")):
-                success = _apply_warm_throughput_for_new_table(job, restore_account_credentials)
+                success = _apply_deferred_warm_throughput(job, restore_account_credentials)
                 if success:
                     job["warmThroughputApplied"] = True
 
@@ -369,6 +391,17 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         "wcuRestorationFailures": wcu_restoration_failures,
         "startTime": start_time
     }
+
+    # On timeout, restore WCU for any in-place jobs still running (don't leave elevated WCU)
+    if iteration >= max_iterations:
+        for job in restore_jobs:
+            if (job.get("originalTableSettings", {}).get("wcuScaledUp")
+                    and not job.get("wcuRestored")):
+                print(f"Timeout: restoring WCU for {job.get('resourceName')}")
+                success = _restore_dynamodb_table_wcu(job, restore_account_credentials)
+                job["wcuRestored"] = True
+                if not success:
+                    wcu_restoration_failures.append(job)
 
     # If all jobs are complete or max iterations reached, send SNS notification
     if all_complete or iteration >= max_iterations:
