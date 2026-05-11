@@ -22,6 +22,77 @@ from lib.aws_utils import get_eon_credentials, get_cross_account_credentials, cr
 # Shared utilities
 # ---------------------------------------------------------------------------
 
+def eon_engine_to_aws(eon_engine: Optional[str]) -> Optional[str]:
+    """
+    Map Eon's AwsRdsEngine enum value to the AWS RDS API engine name
+    (e.g. ``POSTGRES`` → ``postgres``, ``AURORA_MYSQL`` → ``aurora-mysql``).
+    Returns None when the input is empty or UNSPECIFIED.
+    """
+    if not eon_engine or eon_engine.upper() == "UNSPECIFIED":
+        return None
+    return eon_engine.lower().replace("_", "-")
+
+
+def validate_rds_instance_class_available(
+    rds_client,
+    eon_engine: Optional[str],
+    db_instance_class: str,
+    configured_azs: List[str],
+    resource_name: str,
+) -> None:
+    """
+    Mirror of the EC2 instance-type availability check for RDS.
+
+    Calls ``describe_orderable_db_instance_options`` for the source engine and
+    class, then raises if no configured AZ offers the class. The intent is to
+    fail loudly before submitting a restore that AWS would later reject, since
+    the script's top priority is to restore using the source's instance class.
+
+    Soft-skips with a warning when engine or class is missing, or when the AWS
+    call itself errors (e.g. permission denied). A soft-skip means the existing
+    server-side behavior takes over instead of pre-failing on our side.
+    """
+    if not db_instance_class:
+        print(f"WARNING: No source DB instance class available for {resource_name} — skipping availability check")
+        return
+
+    aws_engine = eon_engine_to_aws(eon_engine)
+    if not aws_engine:
+        print(f"WARNING: No engine available for {resource_name} — skipping instance class availability check for {db_instance_class}")
+        return
+
+    print(f"Checking availability of RDS instance class {db_instance_class} for engine {aws_engine}")
+    try:
+        offering_azs: set = set()
+        paginator = rds_client.get_paginator("describe_orderable_db_instance_options")
+        for page in paginator.paginate(Engine=aws_engine, DBInstanceClass=db_instance_class):
+            for option in page.get("OrderableDBInstanceOptions", []):
+                for az in option.get("AvailabilityZones", []):
+                    name = az.get("Name")
+                    if name:
+                        offering_azs.add(name)
+    except ClientError as e:
+        print(f"WARNING: Could not check RDS instance class availability: {e}")
+        return
+
+    if not offering_azs:
+        raise ValueError(
+            f"RDS instance class {db_instance_class} is not orderable for engine {aws_engine} "
+            f"in the target region (restoring {resource_name}). "
+            f"Re-run with a different snapshotDate or update the source resource's instance class."
+        )
+
+    overlap = offering_azs.intersection(configured_azs)
+    if not overlap:
+        raise ValueError(
+            f"RDS instance class {db_instance_class} (engine {aws_engine}) is not available "
+            f"in any configured AZ for {resource_name}. "
+            f"Class available in: {sorted(offering_azs)}, "
+            f"Configured AZs: {sorted(configured_azs)}"
+        )
+    print(f"RDS instance class {db_instance_class} is available in configured AZs: {sorted(overlap)}")
+
+
 def resolve_target_region(
     target_region: Optional[str],
     region_configs: Dict[str, Any],
@@ -963,7 +1034,16 @@ def _initiate_rds_restore(
     snapshot_id = resource_snapshot["snapshotId"]
     snapshot_point_in_time = resource_snapshot.get("snapshotPointInTime", "Unknown")
 
-    db_instance_class = resource_snapshot.get("dbInstanceClass", "db.t3.micro")
+    source_db_instance_class = resource_snapshot.get("dbInstanceClass")
+    source_engine = resource_snapshot.get("engine")
+    if not source_db_instance_class:
+        # Source class is the top priority; fall through to a safe default
+        # only when extraction failed upstream. Validation below will still
+        # confirm the default is orderable in the target region.
+        db_instance_class = "db.t3.micro"
+        print(f"WARNING: No source DB instance class for {resource_name}, falling back to {db_instance_class}")
+    else:
+        db_instance_class = source_db_instance_class
 
     # Resolve region via RDS subnet groups
     actual_region = resolve_target_region(
@@ -979,6 +1059,21 @@ def _initiate_rds_restore(
     vpc_config = ctx.vpc_configs_by_region.get(actual_region, {})
     security_groups_config = vpc_config.get("securityGroups", {})
     rds_security_groups = security_groups_config.get("restoredRdsInstance", [])
+
+    # Verify the instance class is orderable in at least one configured AZ in the target region
+    configured_azs = [
+        s.get("availabilityZone")
+        for s in vpc_config.get("subnetsPerAvailabilityZone", [])
+        if s.get("availabilityZone")
+    ]
+    rds_client = create_boto3_client("rds", actual_region, ctx.restore_account_credentials)
+    validate_rds_instance_class_available(
+        rds_client,
+        eon_engine=source_engine,
+        db_instance_class=db_instance_class,
+        configured_azs=configured_azs,
+        resource_name=resource_name,
+    )
 
     kms_key_arn = require_kms_key(ctx.kms_key_arns_by_region, actual_region)
 

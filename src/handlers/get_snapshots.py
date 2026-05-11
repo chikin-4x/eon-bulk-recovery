@@ -123,9 +123,10 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                       f"volumes={len(snapshot_data.get('volumes', []))}, "
                       f"instance_profile={snapshot_data.get('instanceProfileName', 'None')}")
 
-            # For RDS instances, extract DB instance class
-            elif resource_type == "AWS_RDS" and resource.get("dbInstanceClass"):
+            # For RDS instances, carry through DB instance class and engine for class-availability validation
+            elif resource_type == "AWS_RDS":
                 snapshot_data["dbInstanceClass"] = resource.get("dbInstanceClass")
+                snapshot_data["engine"] = resource.get("engine")
 
             # For DynamoDB tables, use table size from the resource listing (sourceStorage.sizeBytes)
             # Note: the snapshot API does NOT include sourceStorage — it's only on the resource API

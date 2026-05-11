@@ -89,7 +89,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         if resource.get("resourceType") == "AWS_EC2":
             resource_data["instanceType"] = resource_properties.get("instanceType")
         elif resource.get("resourceType") == "AWS_RDS":
-            resource_data["dbInstanceClass"] = resource_properties.get("dbInstanceClass")
+            aws_rds = resource_properties.get("awsRds") or {}
+            resource_data["dbInstanceClass"] = aws_rds.get("instanceClass")
+            resource_data["engine"] = aws_rds.get("engine")
         elif resource.get("resourceType") == "AWS_DYNAMO_DB":
             source_storage = resource.get("sourceStorage", {})
             resource_data["tableSizeBytes"] = source_storage.get("sizeBytes", 0)
