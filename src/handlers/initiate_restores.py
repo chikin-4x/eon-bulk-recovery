@@ -1034,16 +1034,13 @@ def _initiate_rds_restore(
     snapshot_id = resource_snapshot["snapshotId"]
     snapshot_point_in_time = resource_snapshot.get("snapshotPointInTime", "Unknown")
 
-    source_db_instance_class = resource_snapshot.get("dbInstanceClass")
+    # Eon stores `instanceClass` only at the RDS instance level. For Aurora
+    # clusters the class lives on cluster member properties (server-side only,
+    # not exposed via API), so `awsRds.instanceClass` comes back empty. In that
+    # case we omit `dbInstanceClass` from the restore request entirely — Eon's
+    # restore service inherits the source class server-side from the snapshot.
+    db_instance_class = resource_snapshot.get("dbInstanceClass") or None
     source_engine = resource_snapshot.get("engine")
-    if not source_db_instance_class:
-        # Source class is the top priority; fall through to a safe default
-        # only when extraction failed upstream. Validation below will still
-        # confirm the default is orderable in the target region.
-        db_instance_class = "db.t3.micro"
-        print(f"WARNING: No source DB instance class for {resource_name}, falling back to {db_instance_class}")
-    else:
-        db_instance_class = source_db_instance_class
 
     # Resolve region via RDS subnet groups
     actual_region = resolve_target_region(
@@ -1060,20 +1057,22 @@ def _initiate_rds_restore(
     security_groups_config = vpc_config.get("securityGroups", {})
     rds_security_groups = security_groups_config.get("restoredRdsInstance", [])
 
-    # Verify the instance class is orderable in at least one configured AZ in the target region
-    configured_azs = [
-        s.get("availabilityZone")
-        for s in vpc_config.get("subnetsPerAvailabilityZone", [])
-        if s.get("availabilityZone")
-    ]
-    rds_client = create_boto3_client("rds", actual_region, ctx.restore_account_credentials)
-    validate_rds_instance_class_available(
-        rds_client,
-        eon_engine=source_engine,
-        db_instance_class=db_instance_class,
-        configured_azs=configured_azs,
-        resource_name=resource_name,
-    )
+    if db_instance_class:
+        configured_azs = [
+            s.get("availabilityZone")
+            for s in vpc_config.get("subnetsPerAvailabilityZone", [])
+            if s.get("availabilityZone")
+        ]
+        rds_client = create_boto3_client("rds", actual_region, ctx.restore_account_credentials)
+        validate_rds_instance_class_available(
+            rds_client,
+            eon_engine=source_engine,
+            db_instance_class=db_instance_class,
+            configured_azs=configured_azs,
+            resource_name=resource_name,
+        )
+    else:
+        print(f"No source DB instance class for {resource_name}; omitting dbInstanceClass so Eon inherits from the snapshot")
 
     kms_key_arn = require_kms_key(ctx.kms_key_arns_by_region, actual_region)
 
@@ -1090,20 +1089,20 @@ def _initiate_rds_restore(
         "eon:snapshot_time": snapshot_point_in_time
     }
 
-    destination_config = {
-        "awsRds": {
-            "restoreRegion": actual_region,
-            "encryptionKeyId": kms_key_arn,
-            "restoredName": restored_db_name,
-            "securityGroups": rds_security_groups,
-            "subnetGroup": rds_subnet_group_name,
-            "dbInstanceClass": db_instance_class,
-            "tags": rds_tags
-        }
+    aws_rds_destination = {
+        "restoreRegion": actual_region,
+        "encryptionKeyId": kms_key_arn,
+        "restoredName": restored_db_name,
+        "securityGroups": rds_security_groups,
+        "subnetGroup": rds_subnet_group_name,
+        "tags": rds_tags
     }
+    if db_instance_class:
+        aws_rds_destination["dbInstanceClass"] = db_instance_class
+    destination_config = {"awsRds": aws_rds_destination}
 
     print(f"RDS restore config - region: {actual_region}, subnet_group: {rds_subnet_group_name}, "
-          f"security_groups: {len(rds_security_groups)}, instance_class: {db_instance_class}")
+          f"security_groups: {len(rds_security_groups)}, instance_class: {db_instance_class or '(inherit from source)'}")
 
     job_id = ctx.eon_client.restore_rds_instance(
         resource_id=resource_id,
@@ -1114,7 +1113,7 @@ def _initiate_rds_restore(
 
     restored_resource_details = {
         "restoredRegion": actual_region,
-        "dbInstanceClass": db_instance_class,
+        "dbInstanceClass": db_instance_class or "(inherit from source)",
         "restoredName": restored_db_name,
         "subnetGroup": rds_subnet_group_name
     }
