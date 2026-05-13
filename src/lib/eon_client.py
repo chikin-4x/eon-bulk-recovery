@@ -193,15 +193,28 @@ class EonClient:
         if page_token:
             params["pageToken"] = page_token
 
+        # Exclude statuses that categorically have no Eon snapshots. This keeps
+        # the response small on accounts with thousands of resources (without
+        # which Step Functions' 256 KB I/O limit can be exceeded). We *don't*
+        # restrict to PROTECTED-only because resources in transitional/imperfect
+        # states (e.g. VIOLATIONS_DETECTED, ACTION_REQUIRED, LIMIT_EXCEEDED,
+        # DLSG, ALL_VIOLATIONS_MUTED) can still have valid Eon snapshots.
         payload = {
             "filters": {
                 "accountId": {
                     "in": [source_account_id]
                 },
-                # NOTE: Don't filter backup status, since resources can still contain snapshots even if their current status is not "PROTECTED"
-                # "backupStatus": {
-                #     "in": ["PROTECTED"]
-                # }
+                "backupStatus": {
+                    "notIn": [
+                        "NOT_BACKED_UP",
+                        "GENERIC_BACKUPS",
+                        "EXCLUDED_FROM_BACKUP",
+                        "UNSUPPORTED",
+                        "TERMINATED",
+                        "DISCONNECTED",
+                        "INITIAL_CLASSIFICATION",
+                    ]
+                },
             },
             "sorts": [
                 {
