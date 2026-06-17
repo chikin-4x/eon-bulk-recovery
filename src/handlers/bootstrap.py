@@ -14,6 +14,37 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from lib.aws_utils import get_cross_account_credentials
 
 
+def ensure_rds_service_linked_role(credentials: Dict[str, Any]) -> None:
+    """Ensure the AWSServiceRoleForRDS service-linked role exists in the restore account.
+
+    The workflow's first RDS call in the restore account is CreateDBSubnetGroup.
+    That call *requires* the AWSServiceRoleForRDS service-linked role but does NOT
+    create it — only RDS provisioning calls (CreateDBInstance,
+    RestoreDBInstanceFromDBSnapshot, ...) auto-create it. On an account that has
+    never used RDS the SLR is absent, so CreateDBSubnetGroup fails with
+    "Missing necessary credentials". Create it explicitly here (idempotent:
+    ignore the error when it already exists).
+    """
+    iam_client = boto3.client(
+        "iam",
+        aws_access_key_id=credentials["AccessKeyId"],
+        aws_secret_access_key=credentials["SecretAccessKey"],
+        aws_session_token=credentials["SessionToken"],
+    )
+    try:
+        iam_client.create_service_linked_role(AWSServiceName="rds.amazonaws.com")
+        print("Created AWSServiceRoleForRDS service-linked role")
+    except ClientError as e:
+        error_code = e.response.get("Error", {}).get("Code", "")
+        # RDS returns InvalidInput when the SLR already exists.
+        if error_code in ("InvalidInput", "EntityAlreadyExists"):
+            print("AWSServiceRoleForRDS service-linked role already exists")
+        else:
+            # Non-fatal: if the SLR is genuinely missing, the CreateDBSubnetGroup
+            # call below surfaces a clear error.
+            print(f"WARNING: Could not create AWSServiceRoleForRDS service-linked role: {e}")
+
+
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
     Bootstrap the restore account with necessary IAM permissions, RDS subnet groups, and KMS keys.
@@ -126,6 +157,10 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     rds_subnet_groups_by_region = {}
 
     if vpc_configs:
+        # CreateDBSubnetGroup requires the AWSServiceRoleForRDS service-linked
+        # role to exist; create it first on accounts that have never used RDS.
+        ensure_rds_service_linked_role(credentials)
+
         print(f"Creating RDS subnet groups for {len(vpc_configs)} regions")
 
         for config in vpc_configs:
@@ -297,6 +332,14 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 KeyUsage="ENCRYPT_DECRYPT",
                 Origin="AWS_KMS",
                 MultiRegion=False,
+                # The key policy grants the account root kms:* (the "Enable IAM User
+                # Permissions" statement), so the account always retains control.
+                # Bypass the lockout safety check because the scoped cross-account
+                # role intentionally lacks kms:PutKeyPolicy. Without this, CreateKey
+                # fails with "The new key policy will not allow you to update the key
+                # policy in the future" under a least-privilege role (admin roles such
+                # as OrganizationAccountAccessRole have kms:* and masked this).
+                BypassPolicyLockoutSafetyCheck=True,
                 Policy=json.dumps(key_policy),
                 Tags=[
                     {"TagKey": "ManagedBy", "TagValue": "EonBulkRecovery"},

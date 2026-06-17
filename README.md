@@ -37,25 +37,83 @@ aws cloudformation deploy \
 
 This enables automatic role chaining: Lambda → Chain Role → OrganizationAccountAccessRole
 
-#### Option B: Manual Cross-Account Role
+#### Option B: Least-Privilege Cross-Account Role
 
-For non-Organization accounts, create an IAM role in the restore account with:
+For non-Organization accounts — or Organization accounts that don't want the
+application using the admin `OrganizationAccountAccessRole` — deploy
+`cross-account-role.yaml` in each restore account. It creates a scoped role
+trusting only the bulk recovery Lambda, with exactly the permissions the
+workflow exercises in the restore account.
 
-**Trust policy:**
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Principal": {"AWS": "arn:aws:iam::<BACKUP_ACCOUNT>:role/EonBulkRecoveryLambdaRole"},
-    "Action": "sts:AssumeRole"
-  }]
-}
+```bash
+aws cloudformation deploy \
+  --template-file cross-account-role.yaml \
+  --stack-name eon-bulk-recovery-cross-account-role \
+  --parameter-overrides BackupAccountId=<YOUR_BACKUP_ACCOUNT_ID> \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --region us-east-1
 ```
 
-**Required permissions:** CloudFormation, IAM, RDS, KMS, S3, EC2, DynamoDB, Service Quotas
+Then pass the stack's `CrossAccountRoleArn` output as the `crossAccountRoleArn`
+field in the execution input. Optional parameters: `CrossAccountRoleName`,
+`LambdaExecutionRoleName` (default `EonBulkRecoveryLambdaRole`), and
+`PermissionsBoundaryArn` (for orgs that mandate a boundary).
 
-> **DynamoDB permissions** are needed for in-place restore WCU scaling (`recoveryStackNames`). The role must include: `dynamodb:DescribeTable`, `dynamodb:UpdateTable`, `dynamodb:TagResource`, `dynamodb:UntagResource`, `dynamodb:ListTagsOfResource`. Built-in admin roles (`AWSControlTowerExecution`, `OrganizationAccountAccessRole`) already have these.
+**What it grants:** CloudFormation (deploy Eon's `restore-account.yml`, list
+recovery-stack resources), IAM scoped to `EonRestore*` (the bootstrap stack
+creates those roles/policies/instance profile — including `iam:PassRole`, which
+AWS requires to attach the node role to its instance profile), KMS (per-region
+keys + aliases),
+RDS (subnet groups + instance-class availability), S3 (create destination
+buckets, read recovery-bucket tags), EC2 (`DescribeInstanceTypeOfferings`), and
+DynamoDB (`DescribeTable`, `UpdateTable`, `TagResource`, `UntagResource`,
+`ListTagsOfResource` for in-place WCU scaling).
+
+The role does **not** carry data-plane restore permissions (`ec2:RunInstances`,
+`rds:RestoreDB*`, S3/DynamoDB writes). Those belong to Eon's `EonRestoreAccountRole` /
+`EonRestoreNodeRole`, which the bootstrap stack creates.
+
+> **IAM scope note:** the `EonRestore*` grant lets this role create IAM principals
+> via the bootstrap stack — the broadest permission in the template. It is scoped
+> by name prefix (not exact names) so it keeps working as Eon evolves
+> `restore-account.yml`, which is fetched as "latest" at bootstrap time.
+
+#### Option B at scale: deploy the role to every account via StackSet
+
+To roll the cross-account role out to many restore accounts at once, deploy
+`cross-account-role-stackset.yaml` **once** from your AWS Organizations management
+account (or a registered CloudFormation StackSets delegated administrator). It
+creates a service-managed StackSet that deploys the same role to every account in
+the target OU(s) — and auto-deploys it to accounts added to those OUs later.
+
+```bash
+# One-time per org: enable trusted access between StackSets and Organizations
+aws cloudformation activate-organizations-access
+
+aws cloudformation deploy \
+  --template-file cross-account-role-stackset.yaml \
+  --stack-name eon-bulk-recovery-cross-account-role-stackset \
+  --parameter-overrides \
+      BackupAccountId=<YOUR_BACKUP_ACCOUNT_ID> \
+      TargetOrganizationalUnitIds=<ou-xxxx-aaaa,ou-xxxx-bbbb> \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --region us-east-1
+```
+
+The role lands in each account under the same name (`CrossAccountRoleName`,
+default `EonBulkRecoveryCrossAccountRole`), so its ARN per account is
+`arn:aws:iam::<account-id>:role/EonBulkRecoveryCrossAccountRole` — that's the
+value for `crossAccountRoleArn` when restoring into that account.
+
+Notes:
+- The role only creates IAM (global), so the StackSet deploys to a single region
+  (`HomeRegion`, default `us-east-1`). One region per account is correct — don't
+  add more, or the role name collides.
+- Service-managed StackSets do **not** deploy to the Organizations management
+  account. If it's also a restore target, deploy `cross-account-role.yaml` there
+  as a normal stack.
+- `cross-account-role-stackset.yaml` embeds `cross-account-role.yaml` verbatim as
+  the per-account template; keep the two in sync.
 
 ### Deploy the Application
 

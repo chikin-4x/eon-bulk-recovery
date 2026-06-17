@@ -1,0 +1,334 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Eon Bulk Recovery - Least-privilege cross-account role for the restore account.
+  Deploy this in each restore (target) account so the Eon Bulk Recovery Lambda can
+  bootstrap, configure, and orchestrate restores WITHOUT relying on the broad
+  OrganizationAccountAccessRole / AWSControlTowerExecution admin roles. After
+  deploying, pass this role's ARN (stack output CrossAccountRoleArn) as the
+  "crossAccountRoleArn" field in the Step Functions execution input.
+
+# ---------------------------------------------------------------------------
+# What this role does (and does NOT do)
+#
+# The Eon Bulk Recovery Lambda (running in the backup/deployment account) assumes
+# THIS role and, under its credentials, performs only the orchestration steps the
+# script itself runs in the restore account:
+#   * bootstrap        -> deploy Eon's restore-account.yml stack (creates the
+#                         EonRestore* IAM roles/policies), create per-region KMS
+#                         keys, create RDS DB subnet groups
+#   * initiate_restores-> discover recovery-stack tables/buckets, create new S3
+#                         destination buckets, validate EC2 instance-type /
+#                         RDS instance-class availability, scale DynamoDB WCU
+#   * monitor_jobs     -> set DynamoDB warm throughput, restore original WCU
+#
+# The actual data restore (ec2:RunInstances, rds:RestoreDB*, writing S3 objects,
+# DynamoDB ImportTable/BatchWriteItem, etc.) is performed by Eon's own
+# EonRestoreAccountRole / EonRestoreNodeRole — created by the bootstrap stack —
+# NOT by this role. That is why this role needs no data-plane restore permissions.
+# ---------------------------------------------------------------------------
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Trust (who may assume this role)
+        Parameters:
+          - BackupAccountId
+          - LambdaExecutionRoleName
+      - Label:
+          default: Naming and guardrails
+        Parameters:
+          - CrossAccountRoleName
+          - PermissionsBoundaryArn
+    ParameterLabels:
+      BackupAccountId:
+        default: Backup account ID (where Eon Bulk Recovery is deployed)
+      LambdaExecutionRoleName:
+        default: Eon Bulk Recovery Lambda role name
+      CrossAccountRoleName:
+        default: Name for the role this template creates
+      PermissionsBoundaryArn:
+        default: Optional permissions boundary ARN
+
+Parameters:
+  BackupAccountId:
+    Type: String
+    Description: AWS account ID where the Eon Bulk Recovery application (Step Functions + Lambda) is deployed.
+    AllowedPattern: '^\d{12}$'
+    ConstraintDescription: Must be a valid 12-digit AWS account ID.
+
+  LambdaExecutionRoleName:
+    Type: String
+    Description: Name of the Lambda execution role in the backup account that assumes this role. Matches the RoleName in the bulk recovery template.yaml.
+    Default: EonBulkRecoveryLambdaRole
+
+  CrossAccountRoleName:
+    Type: String
+    Description: Name for the cross-account role created in this (restore) account.
+    Default: EonBulkRecoveryCrossAccountRole
+
+  PermissionsBoundaryArn:
+    Type: String
+    Description: >-
+      (Optional) ARN of an IAM policy to attach as this role's permissions boundary.
+      Leave blank if your org does not require one. If set, the boundary MUST allow
+      every action in the inline policy below — otherwise bootstrap will fail.
+    Default: ''
+
+Conditions:
+  HasPermissionsBoundary: !Not [!Equals [!Ref PermissionsBoundaryArn, '']]
+
+Resources:
+  EonBulkRecoveryCrossAccountRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref CrossAccountRoleName
+      Description: Least-privilege role assumed by the Eon Bulk Recovery Lambda to orchestrate restores in this account.
+      PermissionsBoundary: !If [HasPermissionsBoundary, !Ref PermissionsBoundaryArn, !Ref 'AWS::NoValue']
+      # Only the Eon Bulk Recovery Lambda role in the backup account may assume this
+      # role. The Lambda calls sts:AssumeRole directly (no ExternalId), so none is
+      # required here. (Eon's separate EonRestoreAccountRole — created by the
+      # bootstrap stack — handles the Eon-service trust with its own ExternalId.)
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${BackupAccountId}:role/${LambdaExecutionRoleName}'
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Application
+          Value: EonBulkRecovery
+        - Key: Purpose
+          Value: CrossAccountRestoreOrchestration
+      Policies:
+        - PolicyName: EonBulkRecoveryCrossAccountPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+
+              # -------------------------------------------------------------
+              # CloudFormation
+              # bootstrap: CreateStack/DescribeStacks on the Eon restore-account
+              # stack ("eon-restore-account-<accountId>"). The boto3
+              # stack_create_complete waiter polls DescribeStacks;
+              # DescribeStackEvents is included for failure diagnostics.
+              # -------------------------------------------------------------
+              - Sid: EonRestoreAccountStackManagement
+                Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:*:${AWS::AccountId}:stack/eon-restore-account-*/*'
+
+              # initiate_restores: discover_*_from_stacks() lists resources of
+              # the customer-supplied recoveryStackNames (arbitrary stack names
+              # in this account) to find pre-created DynamoDB tables / S3 buckets.
+              - Sid: RecoveryStackResourceDiscovery
+                Effect: Allow
+                Action:
+                  - cloudformation:ListStackResources
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:cloudformation:*:${AWS::AccountId}:stack/*'
+
+              # -------------------------------------------------------------
+              # IAM — required because the bootstrap CloudFormation stack
+              # (Eon's restore-account.yml) creates the EonRestore* IAM roles,
+              # managed policies, and instance profile with CAPABILITY_NAMED_IAM.
+              # CloudFormation makes these IAM calls under THIS role's credentials.
+              #
+              # Scoped to the "EonRestore*" name prefix (roles, policies,
+              # instance profiles). This is the broadest grant in the template:
+              # it can create/modify IAM principals named EonRestore*. The prefix
+              # (rather than exact names) keeps the role working if Eon adds
+              # resources to restore-account.yml, which is fetched as "latest"
+              # at bootstrap time. Update/version/delete actions cover automatic
+              # rollback of a failed create and re-deploys onto an existing stack.
+              # -------------------------------------------------------------
+              - Sid: EonRestoreRoleManagement
+                Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:GetRole
+                  - iam:DeleteRole
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:UpdateRole
+                  - iam:UpdateAssumeRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:ListAttachedRolePolicies
+                  - iam:ListRolePolicies
+                  - iam:PutRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:ListInstanceProfilesForRole
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/EonRestore*'
+
+              - Sid: EonRestoreManagedPolicyManagement
+                Effect: Allow
+                Action:
+                  - iam:CreatePolicy
+                  - iam:GetPolicy
+                  - iam:DeletePolicy
+                  - iam:CreatePolicyVersion
+                  - iam:DeletePolicyVersion
+                  - iam:GetPolicyVersion
+                  - iam:ListPolicyVersions
+                  - iam:ListEntitiesForPolicy
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/EonRestore*'
+
+              - Sid: EonRestoreInstanceProfileManagement
+                Effect: Allow
+                Action:
+                  - iam:CreateInstanceProfile
+                  - iam:GetInstanceProfile
+                  - iam:DeleteInstanceProfile
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/EonRestore*'
+
+              # iam:AddRoleToInstanceProfile / iam:RemoveRoleFromInstanceProfile
+              # authorize against BOTH the instance-profile AND the role resource,
+              # so both ARNs are listed. The bootstrap stack adds EonRestoreNodeRole
+              # to the EonRestoreNodeRole instance profile.
+              - Sid: EonRestoreInstanceProfileRoleAssociation
+                Effect: Allow
+                Action:
+                  - iam:AddRoleToInstanceProfile
+                  - iam:RemoveRoleFromInstanceProfile
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/EonRestore*'
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/EonRestore*'
+
+              # iam:PassRole is REQUIRED for AddRoleToInstanceProfile — AWS mandates
+              # the caller hold PassRole on the role being added to the instance
+              # profile ("The caller of this operation must be granted the PassRole
+              # permission on the IAM role by a permissions policy"). Without this,
+              # bootstrap fails when CloudFormation creates EonRestoreNodeInstanceProfile.
+              # Scoped to EonRestore* roles only.
+              - Sid: EonRestorePassRoleForInstanceProfile
+                Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/EonRestore*'
+
+              # -------------------------------------------------------------
+              # KMS — bootstrap creates one encryption key + alias per region
+              # (used as the volume/bucket/table encryption key for restores).
+              # CreateKey has no resource-level scope (the key does not exist
+              # yet); alias actions are scoped to the eon-restore-* alias names.
+              # -------------------------------------------------------------
+              - Sid: BootstrapKmsKeyCreation
+                Effect: Allow
+                Action:
+                  - kms:CreateKey
+                  - kms:TagResource   # required when CreateKey is called with Tags
+                  - kms:DescribeKey
+                Resource: '*'
+
+              - Sid: BootstrapKmsAliasManagement
+                Effect: Allow
+                Action:
+                  - kms:CreateAlias
+                  - kms:UpdateAlias
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:alias/eon-restore-*'
+                  - !Sub 'arn:${AWS::Partition}:kms:*:${AWS::AccountId}:key/*'
+
+              # -------------------------------------------------------------
+              # RDS
+              # bootstrap: create one DB subnet group per region (eon-restore-*),
+              #            tagged on creation (AddTagsToResource).
+              # initiate:  DescribeOrderableDBInstanceOptions to confirm the
+              #            source DB instance class is orderable in a target AZ
+              #            (no resource-level scope on this describe API).
+              # -------------------------------------------------------------
+              - Sid: BootstrapRdsSubnetGroups
+                Effect: Allow
+                Action:
+                  - rds:CreateDBSubnetGroup
+                  - rds:AddTagsToResource
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:rds:*:${AWS::AccountId}:subgrp:eon-restore-*'
+
+              - Sid: RdsInstanceClassAvailabilityCheck
+                Effect: Allow
+                Action:
+                  - rds:DescribeOrderableDBInstanceOptions
+                Resource: '*'
+
+              # CreateDBSubnetGroup (the workflow's first RDS call) requires the
+              # AWSServiceRoleForRDS service-linked role to already exist but does
+              # not create it. On accounts that have never used RDS the bootstrap
+              # handler creates it explicitly (ensure_rds_service_linked_role),
+              # which needs this grant. Without it, bootstrap fails with
+              # "Missing necessary credentials". (Eon's restore-account.yml grants
+              # the same to EonRestoreAccountRole.)
+              - Sid: RdsServiceLinkedRole
+                Effect: Allow
+                Action:
+                  - iam:CreateServiceLinkedRole
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/rds.amazonaws.com/AWSServiceRoleForRDS'
+                Condition:
+                  StringLike:
+                    iam:AWSServiceName: rds.amazonaws.com
+
+              # -------------------------------------------------------------
+              # S3 — initiate creates new destination buckets (dynamic, globally
+              # unique names) and reads tags on recovery-stack buckets to match
+              # in-place restore targets. Bucket names are not predictable, so
+              # these bucket-level actions cannot be name-scoped.
+              # -------------------------------------------------------------
+              - Sid: RestoreDestinationBuckets
+                Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:PutEncryptionConfiguration   # put_bucket_encryption
+                  - s3:PutBucketTagging
+                  - s3:GetBucketTagging              # recovery-stack bucket matching
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::*'
+
+              # -------------------------------------------------------------
+              # EC2 — initiate picks a subnet whose AZ supports the source
+              # instance type (DescribeInstanceTypeOfferings has no resource scope).
+              # -------------------------------------------------------------
+              - Sid: Ec2InstanceTypeAvailabilityCheck
+                Effect: Allow
+                Action:
+                  - ec2:DescribeInstanceTypeOfferings
+                Resource: '*'
+
+              # -------------------------------------------------------------
+              # DynamoDB — in-place restore WCU scaling (initiate) and warm
+              # throughput / WCU restoration (monitor). Operates on tables in
+              # this account; tag actions store/remove the eon:original_* tags
+              # used to restore original throughput after the job completes.
+              # -------------------------------------------------------------
+              - Sid: DynamoDbWcuScaling
+                Effect: Allow
+                Action:
+                  - dynamodb:DescribeTable
+                  - dynamodb:UpdateTable
+                  - dynamodb:TagResource
+                  - dynamodb:UntagResource
+                  - dynamodb:ListTagsOfResource
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:dynamodb:*:${AWS::AccountId}:table/*'
+
+Outputs:
+  CrossAccountRoleArn:
+    Description: Pass this ARN as the "crossAccountRoleArn" field in the Step Functions execution input.
+    Value: !GetAtt EonBulkRecoveryCrossAccountRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CrossAccountRoleArn'
+
+  CrossAccountRoleName:
+    Description: Name of the cross-account role.
+    Value: !Ref EonBulkRecoveryCrossAccountRole
