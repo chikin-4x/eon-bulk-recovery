@@ -265,8 +265,17 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             else:
                 raise
 
-        # Key doesn't exist, create a new one with permissive policy
-        # Allow root account, Eon restore roles, and AWS services to use the key
+        # Key doesn't exist, create a new one.
+        # Two principal types, both always resolvable so CreateKey never fails on
+        # principal validation:
+        #   1. Account root with kms:* — keeps the account in full control AND
+        #      enables IAM-based access, so Eon's restore roles use the key through
+        #      their own (via-service scoped) kms:* permissions in restore-account.yml.
+        #   2. AWS service principals (via-service scoped) for service-mediated use.
+        # We deliberately do NOT name the EonRestore* roles here: KMS validates that
+        # every principal ARN resolves at create time, and a not-yet-created or
+        # path-prefixed role would make CreateKey fail with "invalid principals".
+        # Root-enables-IAM already covers those roles.
         key_policy = {
             "Version": "2012-10-17",
             "Statement": [
@@ -275,23 +284,6 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     "Effect": "Allow",
                     "Principal": {"AWS": f"arn:aws:iam::{restore_account_id}:root"},
                     "Action": "kms:*",
-                    "Resource": "*"
-                },
-                {
-                    "Sid": "Allow Eon Restore Roles",
-                    "Effect": "Allow",
-                    "Principal": {"AWS": [
-                        f"arn:aws:iam::{restore_account_id}:role/EonRestoreAccountRole",
-                        f"arn:aws:iam::{restore_account_id}:role/EonRestoreNodeRole"
-                    ]},
-                    "Action": [
-                        "kms:Decrypt",
-                        "kms:Encrypt",
-                        "kms:ReEncrypt*",
-                        "kms:GenerateDataKey*",
-                        "kms:CreateGrant",
-                        "kms:DescribeKey"
-                    ],
                     "Resource": "*"
                 },
                 {
