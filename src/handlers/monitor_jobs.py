@@ -14,6 +14,24 @@ from lib.eon_client import EonClient
 from lib.aws_utils import get_eon_credentials, get_cross_account_credentials, create_boto3_client
 
 
+# Eon restore job statuses (JobStatus enum — see JobStatus.yaml in eon-service).
+# Terminal statuses will not change on further polling; running statuses will.
+# JOB_REJECTED (e.g. a DynamoDB table already exists with mismatched settings) and
+# JOB_SKIPPED are terminal — without listing them here they fall through to the
+# "unknown" branch and get treated as still-running, so the workflow polls them
+# until the max-iteration timeout instead of finishing.
+_SUCCESS_STATUSES = {"JOB_COMPLETED"}
+_PARTIAL_STATUSES = {"JOB_PARTIAL"}
+_FAILED_STATUSES = {"JOB_FAILED", "JOB_CANCELED", "JOB_REJECTED"}
+_SKIPPED_STATUSES = {"JOB_SKIPPED"}
+_RUNNING_STATUSES = {"JOB_PENDING", "JOB_RUNNING"}
+
+# Every status that means the job is finished. Used to trigger DynamoDB WCU
+# restoration for in-place restores — a rejected/skipped in-place job must also
+# have its temporarily-elevated WCU rolled back, not left stuck.
+_TERMINAL_STATUSES = _SUCCESS_STATUSES | _PARTIAL_STATUSES | _FAILED_STATUSES | _SKIPPED_STATUSES
+
+
 def _apply_deferred_warm_throughput(
     job: Dict[str, Any],
     restore_account_credentials: Dict[str, str] = None,
@@ -271,6 +289,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     failed_count = 0
     running_count = 0
     partial_count = 0
+    skipped_count = 0
     wcu_restoration_failures = list(event.get("wcuRestorationFailures", []))
 
     job_statuses = []
@@ -319,18 +338,23 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             }
 
             # Categorize by status
-            if status == "JOB_COMPLETED":
+            if status in _SUCCESS_STATUSES:
                 completed_count += 1
-            elif status in ["JOB_FAILED", "JOB_CANCELED"]:
+            elif status in _FAILED_STATUSES:
                 failed_count += 1
-            elif status == "JOB_PARTIAL":
+            elif status in _PARTIAL_STATUSES:
                 partial_count += 1
                 # Treat partial as a type of completion for decision purposes
                 completed_count += 1
-            elif status in ["JOB_PENDING", "JOB_RUNNING"]:
+            elif status in _SKIPPED_STATUSES:
+                skipped_count += 1
+            elif status in _RUNNING_STATUSES:
                 running_count += 1
             else:
-                # Unknown status, treat as running
+                # Genuinely unknown status (e.g. JOB_UNSPECIFIED or a value newer
+                # than this code knows about). Treat as still running so we keep
+                # polling; the max-iteration timeout backstops an indefinite hang.
+                print(f"Unrecognized job status '{status}' for job {job_id} — treating as running")
                 running_count += 1
 
             # Apply warm throughput to DynamoDB tables (deferred from initiate step)
@@ -343,7 +367,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                     job["warmThroughputApplied"] = True
 
             # Restore DynamoDB WCU for terminal in-place restore jobs
-            if (status in ("JOB_COMPLETED", "JOB_PARTIAL", "JOB_FAILED", "JOB_CANCELED")
+            if (status in _TERMINAL_STATUSES
                     and job.get("originalTableSettings", {}).get("wcuScaledUp")
                     and not job.get("wcuRestored")):
                 success = _restore_dynamodb_table_wcu(job, restore_account_credentials)
@@ -370,7 +394,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     all_complete = (running_count == 0)
 
-    print(f"Job summary: {completed_count} completed, {failed_count} failed, {partial_count} partial, {running_count} still running")
+    print(f"Job summary: {completed_count} completed, {failed_count} failed, {partial_count} partial, {skipped_count} skipped, {running_count} still running")
 
     result = {
         "restoreJobs": restore_jobs,  # Pass through for next iteration
@@ -379,6 +403,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         "completedJobs": completed_count,
         "failedJobs": failed_count,
         "partialJobs": partial_count,
+        "skippedJobs": skipped_count,
         "runningJobs": running_count,
         "totalJobs": len(restore_jobs),
         "iteration": iteration + 1,
@@ -433,6 +458,7 @@ def send_completion_notification(job_summary: Dict[str, Any], timeout: bool) -> 
     completed_jobs = job_summary["completedJobs"]
     failed_jobs = job_summary["failedJobs"]
     partial_jobs = job_summary["partialJobs"]
+    skipped_jobs = job_summary.get("skippedJobs", 0)
     running_jobs = job_summary["runningJobs"]
 
     # Extract context information
@@ -459,12 +485,12 @@ def send_completion_notification(job_summary: Dict[str, Any], timeout: bool) -> 
     if timeout:
         subject = "Eon Bulk Recovery - TIMEOUT"
         status_summary = f"⚠️ Monitoring timed out after {job_summary['iteration']} iterations"
-    elif failed_jobs == 0 and partial_jobs == 0:
+    elif failed_jobs == 0 and partial_jobs == 0 and skipped_jobs == 0:
         subject = "Eon Bulk Recovery - SUCCESS"
         status_summary = f"✅ All {total_jobs} restore jobs completed successfully"
-    elif completed_jobs > 0:
+    elif completed_jobs > 0 or skipped_jobs > 0:
         subject = "Eon Bulk Recovery - PARTIAL SUCCESS"
-        status_summary = f"⚠️ {completed_jobs}/{total_jobs} jobs completed ({failed_jobs} failed, {partial_jobs} partial)"
+        status_summary = f"⚠️ {completed_jobs}/{total_jobs} jobs completed ({failed_jobs} failed, {partial_jobs} partial, {skipped_jobs} skipped)"
     else:
         subject = "Eon Bulk Recovery - FAILURE"
         status_summary = f"❌ All {total_jobs} restore jobs failed"
@@ -515,6 +541,7 @@ def send_completion_notification(job_summary: Dict[str, Any], timeout: bool) -> 
         f"Completed: {completed_jobs}",
         f"Failed: {failed_jobs}",
         f"Partial: {partial_jobs}",
+        f"Skipped: {skipped_jobs}",
         f"Still Running: {running_jobs}",
         "",
         "Job Details:",
@@ -538,6 +565,8 @@ def send_completion_notification(job_summary: Dict[str, Any], timeout: bool) -> 
             "JOB_RUNNING": "🔄",
             "JOB_PENDING": "⏳",
             "JOB_CANCELED": "🚫",
+            "JOB_REJECTED": "⛔",
+            "JOB_SKIPPED": "⏭️",
             "FAILED_TO_INITIATE": "❌"
         }.get(status, "❓")
 

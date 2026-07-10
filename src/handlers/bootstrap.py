@@ -45,6 +45,71 @@ def ensure_rds_service_linked_role(credentials: Dict[str, Any]) -> None:
             print(f"WARNING: Could not create AWSServiceRoleForRDS service-linked role: {e}")
 
 
+def _extract_role_arn(cfn_client, stack_name: str, restore_account_id: str) -> str:
+    """Return the EonRestoreAccountRoleArn from stack outputs, or the conventional ARN."""
+    response = cfn_client.describe_stacks(StackName=stack_name)
+    outputs = response["Stacks"][0].get("Outputs", [])
+    for output in outputs:
+        if output["OutputKey"] == "EonRestoreAccountRoleArn":
+            return output["OutputValue"]
+    # No output (older template or failed create) — fall back to the conventional name.
+    return f"arn:aws:iam::{restore_account_id}:role/EonRestoreAccountRole"
+
+
+def _create_restore_stack(
+    cfn_client,
+    stack_name: str,
+    template_body: str,
+    eon_account_id: str,
+    restore_account_id: str,
+) -> str:
+    """Create the Eon restore-account IAM stack, wait for completion, and return the role ARN."""
+    cfn_client.create_stack(
+        StackName=stack_name,
+        TemplateBody=template_body,
+        Parameters=[
+            {"ParameterKey": "EonAccountId", "ParameterValue": eon_account_id}
+        ],
+        Capabilities=["CAPABILITY_NAMED_IAM"],
+        Tags=[
+            {"Key": "ManagedBy", "Value": "EonBulkRecovery"},
+            {"Key": "RestoreAccountId", "Value": restore_account_id}
+        ]
+    )
+
+    waiter = cfn_client.get_waiter("stack_create_complete")
+    waiter.wait(StackName=stack_name, WaiterConfig={"Delay": 10, "MaxAttempts": 60})
+
+    return _extract_role_arn(cfn_client, stack_name, restore_account_id)
+
+
+def _restore_role_exists(iam_client, role_arn: str) -> bool:
+    """Check whether the IAM role named in *role_arn* still exists in the restore account.
+
+    The bulk recovery workflow trusts the CloudFormation stack outputs for the
+    restore role ARN, but the stack existing does NOT guarantee the role does: it
+    can be deleted out-of-band, or a prior create can have rolled back and left the
+    stack without a usable role. If Eon is then handed an ARN it cannot assume, the
+    connect step fails with INSUFFICIENT_PERMISSIONS.
+
+    Returns True if the role is present. Returns False ONLY when IAM explicitly
+    reports the role does not exist — on any other error (e.g. AccessDenied,
+    throttling) it returns True, so an ambiguous signal never triggers a
+    destructive stack recreation.
+    """
+    role_name = role_arn.split(":role/")[-1].split("/")[-1]
+    try:
+        iam_client.get_role(RoleName=role_name)
+        return True
+    except ClientError as e:
+        error_code = e.response.get("Error", {}).get("Code", "")
+        if error_code in ("NoSuchEntity", "NoSuchEntityException"):
+            print(f"Restore role {role_name} does not exist in the restore account")
+            return False
+        print(f"WARNING: Could not verify restore role {role_name} ({error_code}); assuming it exists")
+        return True
+
+
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     """
     Bootstrap the restore account with necessary IAM permissions, RDS subnet groups, and KMS keys.
@@ -101,57 +166,46 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     print(f"Deploying IAM CloudFormation stack: {stack_name}")
 
     try:
-        cfn_client.create_stack(
-            StackName=stack_name,
-            TemplateBody=template_body,
-            Parameters=[
-                {
-                    "ParameterKey": "EonAccountId",
-                    "ParameterValue": eon_account_id
-                }
-            ],
-            Capabilities=["CAPABILITY_NAMED_IAM"],
-            Tags=[
-                {"Key": "ManagedBy", "Value": "EonBulkRecovery"},
-                {"Key": "RestoreAccountId", "Value": restore_account_id}
-            ]
+        role_arn = _create_restore_stack(
+            cfn_client, stack_name, template_body, eon_account_id, restore_account_id
         )
-
-        # Wait for stack creation to complete
-        waiter = cfn_client.get_waiter("stack_create_complete")
-        waiter.wait(
-            StackName=stack_name,
-            WaiterConfig={"Delay": 10, "MaxAttempts": 60}
-        )
-
-        # Get stack outputs
-        response = cfn_client.describe_stacks(StackName=stack_name)
-        outputs = response["Stacks"][0].get("Outputs", [])
-        role_arn = None
-
-        for output in outputs:
-            if output["OutputKey"] == "EonRestoreAccountRoleArn":
-                role_arn = output["OutputValue"]
-                break
-
-        if not role_arn:
-            # If no output, construct the ARN manually
-            role_arn = f"arn:aws:iam::{restore_account_id}:role/EonRestoreAccountRole"
 
     except ClientError as e:
-        if "AlreadyExistsException" in str(e):
-            print(f"Stack {stack_name} already exists, retrieving role ARN")
-            response = cfn_client.describe_stacks(StackName=stack_name)
-            outputs = response["Stacks"][0].get("Outputs", [])
-            role_arn = None
-            for output in outputs:
-                if output["OutputKey"] == "EonRestoreAccountRoleArn":
-                    role_arn = output["OutputValue"]
-                    break
-            if not role_arn:
-                role_arn = f"arn:aws:iam::{restore_account_id}:role/EonRestoreAccountRole"
-        else:
+        if "AlreadyExistsException" not in str(e):
             raise
+
+        # The stack already exists. Trust it ONLY if the IAM role it manages is
+        # still present. The role can be deleted out-of-band, or a prior create can
+        # have rolled back, leaving a stack whose role ARN Eon cannot assume — which
+        # surfaces later as an INSUFFICIENT_PERMISSIONS connect failure. When the
+        # role is missing, delete and recreate the stack to rebuild it.
+        print(f"Stack {stack_name} already exists, verifying the restore role still exists")
+        role_arn = _extract_role_arn(cfn_client, stack_name, restore_account_id)
+
+        iam_client = boto3.client(
+            "iam",
+            aws_access_key_id=credentials["AccessKeyId"],
+            aws_secret_access_key=credentials["SecretAccessKey"],
+            aws_session_token=credentials["SessionToken"],
+        )
+
+        if _restore_role_exists(iam_client, role_arn):
+            print(f"Restore role {role_arn} exists — reusing existing stack")
+        else:
+            # CloudFormation has no "repair" operation: an update with the same
+            # template is a no-op (it doesn't notice out-of-band deletions), drift
+            # detection only reports, and rollback-state stacks can't be updated at
+            # all. Rebuilding the role would mean deleting and recreating the stack,
+            # which this role is intentionally not permitted to do. Fail with a
+            # clear, actionable message instead of handing Eon an unassumable ARN.
+            role_name = role_arn.split(":role/")[-1].split("/")[-1]
+            raise ValueError(
+                f"CloudFormation stack '{stack_name}' exists but its restore role "
+                f"'{role_name}' is missing from account {restore_account_id} (deleted "
+                f"out-of-band, or a prior create rolled back). Eon cannot assume the role, "
+                f"so the restore would fail at connect. Delete stack '{stack_name}' in "
+                f"account {restore_account_id} and re-run this workflow to rebuild the role."
+            )
 
     # 2. Create RDS subnet groups for all regions in VPC configs
     rds_subnet_groups_by_region = {}

@@ -113,6 +113,10 @@ Resources:
               # stack ("eon-restore-account-<accountId>"). The boto3
               # stack_create_complete waiter polls DescribeStacks;
               # DescribeStackEvents is included for failure diagnostics.
+              # (No DeleteStack: if the stack exists but its EonRestore* role was
+              # deleted out-of-band, bootstrap fails with an actionable error asking
+              # an operator to delete the stack and re-run, rather than doing it
+              # itself — this role is deliberately not allowed to delete stacks.)
               # -------------------------------------------------------------
               - Sid: EonRestoreAccountStackManagement
                 Effect: Allow

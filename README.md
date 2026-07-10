@@ -294,8 +294,8 @@ Warm throughput is enabled by default. To disable it, set `dynamodbWarmThroughpu
 
 ## How It Works
 
-1. **Bootstrap** - Creates KMS keys in each region, RDS subnet groups, IAM roles
-2. **Connect** - Registers restore account with Eon
+1. **Bootstrap** - Creates KMS keys in each region, RDS subnet groups, IAM roles. If the IAM stack already exists but its restore role is missing (deleted out-of-band, or a prior create rolled back), the workflow stops with an actionable error telling you to delete the stack and re-run, rather than handing Eon a role ARN it cannot assume.
+2. **Connect** - Registers restore account with Eon. If a matching account already exists and is `DISCONNECTED` or `INSUFFICIENT_PERMISSIONS`, the step reconnects and polls for `CONNECTED` (and lets the Step Functions retry back off), giving roles just installed by bootstrap time to propagate.
 3. **Configure** - Sets up VPC connectivity
 4. **List Snapshots** - Retrieves resources and their snapshots, extracts table sizes
 5. **Initiate Restores** - If `recoveryStackNames` provided:

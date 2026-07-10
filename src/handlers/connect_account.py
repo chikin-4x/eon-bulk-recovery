@@ -2,6 +2,7 @@
 
 import os
 import sys
+import time
 from typing import Dict, Any
 from requests.exceptions import HTTPError
 
@@ -10,6 +11,39 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from lib.eon_client import EonClient
 from lib.aws_utils import get_eon_credentials
+
+
+def _reconnect_and_wait(
+    eon_client: EonClient,
+    eon_restore_account_id: str,
+    provider_account_id: str,
+    max_attempts: int = 5,
+    delay_seconds: int = 10,
+) -> str:
+    """Trigger a reconnect and poll the account status until it reaches CONNECTED.
+
+    Eon re-validates the restore role's permissions and trust policy on reconnect.
+    Because IAM roles/policies the bootstrap step just installed (or repaired) can
+    take a few seconds to propagate, we reconnect once and then poll the account a
+    handful of times before giving up. Returns the final observed status.
+    """
+    reconnect_response = eon_client.reconnect_restore_account(eon_restore_account_id)
+    status = reconnect_response.get("restoreAccount", {}).get("status", "UNKNOWN")
+    print(f"Reconnect requested, status: {status}")
+
+    attempt = 0
+    while status != "CONNECTED" and attempt < max_attempts:
+        time.sleep(delay_seconds)
+        attempt += 1
+        list_response = eon_client.list_restore_accounts(provider_account_id=provider_account_id)
+        accounts = list_response.get("accounts", [])
+        if not accounts:
+            print(f"Reconnect poll {attempt}/{max_attempts}: account no longer listed")
+            break
+        status = accounts[0].get("status", "UNKNOWN")
+        print(f"Reconnect poll {attempt}/{max_attempts}: status={status}")
+
+    return status
 
 
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
@@ -88,18 +122,24 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         if status == "CONNECTED":
             print("Restore account is already connected, using existing account")
 
-        elif status == "DISCONNECTED":
-            print("Restore account is disconnected, attempting to reconnect...")
-            reconnect_response = eon_client.reconnect_restore_account(eon_restore_account_id)
-            restored_account = reconnect_response.get("restoreAccount", {})
-            status = restored_account.get("status", "UNKNOWN")
-            print(f"Successfully reconnected restore account. New status: {status}")
+        elif status in ("DISCONNECTED", "INSUFFICIENT_PERMISSIONS"):
+            # Both states are recoverable via reconnect: the bootstrap step may
+            # have just (re)installed the restore role, so the permissions Eon
+            # last saw are stale. Reconnect re-validates them.
+            print(f"Restore account status is {status}, attempting to reconnect "
+                  f"(bootstrap may have just installed/repaired the restore role)...")
+            status = _reconnect_and_wait(eon_client, eon_restore_account_id, restore_account_id)
 
-        elif status == "INSUFFICIENT_PERMISSIONS":
-            raise ValueError(
-                f"Restore account {restore_account_id} exists but has INSUFFICIENT_PERMISSIONS status. "
-                f"Please verify the IAM role {role_arn} has correct permissions and trust policy."
-            )
+            if status != "CONNECTED":
+                # Roles may still be propagating in AWS IAM. Raise so the Step
+                # Functions Retry re-runs this step after a backoff and reconnects
+                # again against the (by then more-propagated) role.
+                raise ValueError(
+                    f"Restore account {restore_account_id} did not reach CONNECTED after reconnect "
+                    f"(current status: {status}). Verify the IAM role {role_arn} has the correct "
+                    f"permissions and trust policy; the workflow will retry."
+                )
+            print("Successfully reconnected restore account")
 
         else:
             print(f"Warning: Restore account has unexpected status: {status}")
