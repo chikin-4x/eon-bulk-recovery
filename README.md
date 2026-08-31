@@ -421,6 +421,10 @@ When monitoring reaches this ceiling with jobs still running, the monitor Lambda
 - **CloudWatch Logs** - `/aws/lambda/eon-bulk-recovery-handler`
 - **SNS Notifications** - Email alerts with job summaries
 
+## Changelog
+
+See [CHANGELOG.md](./CHANGELOG.md).
+
 ## License
 
 Licensed under the [Mozilla Public License 2.0](./LICENSE).
