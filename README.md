@@ -2,7 +2,24 @@
 
 Automated disaster recovery application for AWS resources backed up by Eon. Uses AWS Step Functions to orchestrate complete multi-region restore workflows.
 
-![Workflow](./screenshot_statemachine.png)
+```mermaid
+flowchart TD
+    A[Bootstrap Restore Account] --> B[Connect Restore Account]
+    B --> C[Configure VPC]
+    C --> D[List Resources]
+    D --> E[Get Snapshots]
+    E --> F{Any snapshots?}
+    F -- no --> G([No Snapshots Found])
+    F -- yes --> H[Initiate Restores]
+    H --> I[Monitor Jobs]
+    I --> J{Complete?}
+    J -- all done --> K([All Jobs Complete])
+    J -- max iterations --> L([Monitoring Timed Out])
+    J -- still running --> M[Wait 5 min] --> I
+```
+
+Every task state also catches its own failure into a dedicated terminal state
+(`Bootstrap Failed`, `Connect Account Failed`, and so on), omitted above for readability.
 
 ## Quick Start
 
@@ -155,7 +172,9 @@ aws stepfunctions start-execution \
   "sourceAccountId": "333333333333",
   "restoreAccountId": "222222222222",
   "restoreRegion": null,
-  "snapshotDate": null,
+  "snapshotDate": "latest",
+  "resourceTypes": [],
+  "resourceIds": [],
   "resourceNamePrefix": null,
   "dynamodbRegionalWcuLimit": 40000,
   "crossAccountRoleArn": null,
@@ -178,6 +197,37 @@ aws stepfunctions start-execution \
 }
 ```
 
+**Snapshot selection** — `snapshotDate` takes one of:
+
+| Value | Behaviour |
+|-------|-----------|
+| `"latest"` or `null` | Restore each resource's most recent snapshot, whenever it was taken |
+| `"2026-08-29"` | Restore only from snapshots taken on that day |
+
+With a pinned date, any resource without a snapshot on that day is skipped and
+listed in the completion notification under **Resources Without a Snapshot**. If
+*no* resource in scope has a snapshot on that date, the workflow does not start
+any jobs — it sends a `NO SNAPSHOTS FOUND` notification listing every affected
+resource and terminates in the `No Snapshots Found` state.
+
+**Scoping the run** — restrict which resources are restored:
+```json
+  "resourceTypes": ["AWS_DYNAMO_DB", "AWS_S3"],
+  "resourceIds": ["i-0f600a1b15b035105", "1ee34dc5-0a7c-4e56-a820-917371e05c8d", "my-app-bucket"]
+```
+`resourceTypes` limits the run to the named Eon resource types (`AWS_EC2`,
+`AWS_RDS`, `AWS_S3`, `AWS_DYNAMO_DB`); `[]` or omitted means all of them. An
+unrecognised type fails the run at the `List Resources` step rather than quietly
+restoring nothing.
+
+`resourceIds` limits the run to specific resources. It accepts Eon resource IDs
+(the UUIDs shown in the Eon console), cloud provider resource IDs (`i-…`, a
+bucket or table name), or a mix — each is routed to the matching filter and the
+results are unioned. Any ID that matches nothing is logged as a warning, so a
+typo doesn't read as a resource with no backups. Both filters are applied
+server-side by the Eon API, which also keeps the Step Functions payload under its
+256 KB limit on large accounts.
+
 **Tag exclusion** — add to the minimal example above:
 ```json
   "excludeEC2TagKeys": ["aws:autoscaling:groupName", "kubernetes.io/cluster/my-cluster"]
@@ -188,7 +238,7 @@ Tag keys matching this list will be filtered from restored EC2 instances and the
 ```json
   "recoveryStackNames": ["OrdersServiceStack", "UserDataStack"]
 ```
-The workflow queries the named CloudFormation stacks in the restore account for pre-created DynamoDB tables and S3 buckets. For DynamoDB, if a table matching the source table name AND source region is found, an **in-place restore** is performed instead of creating a new table — the table's WCU is temporarily scaled up (same allocation as new table restores) and restored to its original throughput after the restore completes. For S3, if a stack bucket has a tag (key = `s3InPlaceTagKey`, default `eon_functional_id`) matching the source bucket's tag value, an **in-place restore** is performed to that existing bucket.
+The workflow queries the named CloudFormation stacks in the restore account for pre-created DynamoDB tables and S3 buckets. Both `AWS::DynamoDB::Table` and `AWS::DynamoDB::GlobalTable` count as tables — CDK's `TableV2` construct emits the latter, and a global table restores exactly like a regular one. For a global table the replica regions are read from `DescribeTable`, so it matches a source resource in any of its regions and the data is restored into the stack's own region (writes replicate from there). For DynamoDB, if a table matching the source table name AND source region is found, an **in-place restore** is performed instead of creating a new table — the table's WCU is temporarily scaled up (same allocation as new table restores) and restored to its original throughput after the restore completes. For S3, if a stack bucket has a tag (key = `s3InPlaceTagKey`, default `eon_functional_id`) matching the source bucket's tag value, an **in-place restore** is performed to that existing bucket.
 
 **Stacks-only mode** — set both fields to only restore stack-matched resources:
 ```json
@@ -229,7 +279,9 @@ S3 bucket names are **globally unique** across all AWS accounts worldwide. This 
 | `sourceAccountId` | Yes | Account with backed-up resources |
 | `restoreAccountId` | Yes | Target account for restored resources |
 | `restoreRegion` | No | Force all resources to this region (null = use source regions) |
-| `snapshotDate` | No | Date for snapshot selection (YYYY-MM-DD, null = latest) |
+| `snapshotDate` | No | `"latest"` / `null` for each resource's most recent snapshot, or `YYYY-MM-DD` to pin the run to one day |
+| `resourceTypes` | No | Restrict the run to these Eon resource types: `AWS_EC2`, `AWS_RDS`, `AWS_S3`, `AWS_DYNAMO_DB` (default: `[]` = all) |
+| `resourceIds` | No | Restrict the run to specific resources. Accepts Eon resource IDs (UUIDs), provider resource IDs (`i-…`, bucket/table names), or a mix (default: `[]` = all) |
 | `resourceNamePrefix` | No | Prefix for restored resource names (null = use original names) |
 | `dynamodbRegionalWcuLimit` | No | Total WCU budget per region across all tables (default: 40000). See [DynamoDB WCU Allocation](#dynamodb-wcu-allocation) |
 | `dynamodbTableWcuMax` | No | Max WCU any single table can receive (default: 40000). Caps individual tables when the regional limit is raised |
@@ -297,14 +349,58 @@ Warm throughput is enabled by default. To disable it, set `dynamodbWarmThroughpu
 1. **Bootstrap** - Creates KMS keys in each region, RDS subnet groups, IAM roles. If the IAM stack already exists but its restore role is missing (deleted out-of-band, or a prior create rolled back), the workflow stops with an actionable error telling you to delete the stack and re-run, rather than handing Eon a role ARN it cannot assume.
 2. **Connect** - Registers restore account with Eon. If a matching account already exists and is `DISCONNECTED` or `INSUFFICIENT_PERMISSIONS`, the step reconnects and polls for `CONNECTED` (and lets the Step Functions retry back off), giving roles just installed by bootstrap time to propagate.
 3. **Configure** - Sets up VPC connectivity
-4. **List Snapshots** - Retrieves resources and their snapshots, extracts table sizes
-5. **Initiate Restores** - If `recoveryStackNames` provided:
-   - **DynamoDB**: Queries stacks for `AWS::DynamoDB::Table` resources, uses in-place restore for matches (by table name + region), temporarily scales up WCU
+4. **List Resources** - Retrieves resources in scope (`resourceTypes` / `resourceIds` are applied here, server-side)
+5. **Get Snapshots** - Selects a snapshot per resource, extracts table sizes. Resources with nothing to restore are recorded with a reason; if that is all of them, the run stops here with a notification
+6. **Initiate Restores** - If `recoveryStackNames` provided:
+   - **DynamoDB**: Queries stacks for `AWS::DynamoDB::Table` and `AWS::DynamoDB::GlobalTable` resources, uses in-place restore for matches (by table name + region), temporarily scales up WCU
    - **S3**: Queries stacks for `AWS::S3::Bucket` resources, uses in-place restore for matches (by `s3InPlaceTagKey` tag, default `eon_functional_id`)
    - Otherwise: Creates new tables with allocated WCUs (38k per region = 95% of 40k) and new S3 buckets with hash suffixes
-6. **Monitor** - Polls until completion (default: 30 hours max), restores DynamoDB WCU to original settings as each in-place restore completes
+7. **Monitor** - Polls until completion (default: 60 hours max), restores DynamoDB WCU to original settings as each in-place restore completes
 
-![Notification example](./screenshot_output.png)
+Example completion notification:
+
+```
+Eon Bulk Recovery Status Report
+==================================================
+
+⚠️ All 7 restore jobs completed successfully, but 1 resource(s) had no snapshot to restore from
+
+Recovery Details:
+--------------------------------------------------
+Source Account: 333333333333
+Restore Account: 222222222222
+Default Restore Region: us-east-1 (resources restored to original regions)
+Snapshot Date(s): 2026-08-29
+VPC Configurations:
+  - vpc-00000000000000001 in us-east-1 (3 subnets)
+Total Duration: 0h 15m
+
+Job Summary:
+--------------------------------------------------
+Total Jobs: 7
+Completed: 7
+Failed: 0
+Partial: 0
+Skipped: 0
+Still Running: 0
+No Snapshot Available: 1
+
+Job Details:
+--------------------------------------------------
+✅ app-data-bucket (AWS_S3)
+   Status: JOB_COMPLETED
+   Job ID: 00000000-0000-0000-0000-000000000000
+   Job Link: https://mycompany.console.eon.io/jobs/restore?pageIndex=0&pageSize=25&id=...
+   Snapshot Date: 2026-08-29T03:00:00Z
+   Region: us-east-1
+   Restored Bucket: app-data-bucket-a1b2c3d4
+   Duration: 3 minutes
+
+Resources Without a Snapshot (not restored):
+--------------------------------------------------
+⏭️ orders (AWS_DYNAMO_DB) in us-west-2
+   Reason: no snapshot taken on 2026-08-29, latest available is 2026-08-10T03:00:00Z
+```
 
 ### Lambda Timeout
 
@@ -314,11 +410,17 @@ The Lambda function has a 15-minute timeout (configured in `template.yaml`). Eac
 
 Configure in `template.yaml`:
 ```yaml
-MAX_MONITORING_ITERATIONS: '360'  # 360 × 5min = 30 hours
+MAX_MONITORING_ITERATIONS: '720'  # 720 × 5min = 60 hours
 ```
+
+When monitoring reaches this ceiling with jobs still running, the monitor Lambda sends a single "TIMEOUT" notification and the state machine terminates in the `Monitoring Timed Out` state. It does **not** keep re-polling and re-sending timeout emails every 5 minutes. Still-running jobs continue on Eon's side — check the Eon console for their final status.
 
 ## Monitoring
 
 - **Step Functions Console** - Visual workflow progress
 - **CloudWatch Logs** - `/aws/lambda/eon-bulk-recovery-handler`
 - **SNS Notifications** - Email alerts with job summaries
+
+## License
+
+Licensed under the [Mozilla Public License 2.0](./LICENSE).
