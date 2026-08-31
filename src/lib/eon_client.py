@@ -175,7 +175,10 @@ class EonClient:
         self,
         source_account_id: str,
         page_token: Optional[str] = None,
-        page_size: int = 100
+        page_size: int = 100,
+        resource_types: Optional[List[str]] = None,
+        resource_ids: Optional[List[str]] = None,
+        provider_resource_ids: Optional[List[str]] = None
     ) -> Dict[str, Any]:
         """
         List protected resources from a source account.
@@ -184,9 +187,18 @@ class EonClient:
             source_account_id: AWS account ID to filter resources
             page_token: Pagination token for next page
             page_size: Number of resources per page
+            resource_types: Restrict to these Eon resource types (e.g. ["AWS_EC2"])
+            resource_ids: Restrict to these Eon-assigned resource IDs
+            provider_resource_ids: Restrict to these cloud-provider resource IDs
+                (e.g. ["i-0f600a1b15b035105"])
 
         Returns:
             Response containing resources list and pagination info
+
+        Note:
+            Filters are combined with AND by the API. Pass either resource_ids or
+            provider_resource_ids in a given call, never both, or the two lists
+            will intersect instead of union.
         """
         url = f"{self.base_url}/projects/{self.project_id}/resources"
         params = {"pageSize": page_size}
@@ -223,6 +235,15 @@ class EonClient:
                 }
             ]
         }
+
+        # Scoping filters. Applying these server-side keeps the response (and the
+        # Step Functions state payload) small on accounts with thousands of resources.
+        if resource_types:
+            payload["filters"]["resourceType"] = {"in": list(resource_types)}
+        if resource_ids:
+            payload["filters"]["id"] = {"in": list(resource_ids)}
+        if provider_resource_ids:
+            payload["filters"]["providerResourceId"] = {"in": list(provider_resource_ids)}
 
         response = requests.post(url, json=payload, params=params, headers=self._get_headers())
         self._handle_response(response, "POST", url, payload)

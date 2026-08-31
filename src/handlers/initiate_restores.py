@@ -18,6 +18,12 @@ from lib.eon_client import EonClient
 from lib.aws_utils import get_eon_credentials, get_cross_account_credentials, create_boto3_client
 
 
+# CloudFormation resource types that represent a DynamoDB table in a recovery
+# stack. GlobalTable is what CDK's TableV2 construct emits; it restores exactly
+# like a regular table.
+DYNAMODB_STACK_RESOURCE_TYPES = ("AWS::DynamoDB::Table", "AWS::DynamoDB::GlobalTable")
+
+
 # ---------------------------------------------------------------------------
 # Shared utilities
 # ---------------------------------------------------------------------------
@@ -552,6 +558,51 @@ def _restore_dynamodb_table_wcu_immediate(
 # CloudFormation stack discovery
 # ---------------------------------------------------------------------------
 
+def _global_table_replica_regions(
+    table_name: str,
+    region: str,
+    restore_account_credentials: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """
+    Return every region a global table has a replica in, starting with `region`.
+
+    Best-effort: if DescribeTable is unavailable the table still matches sources
+    in the stack's own region, which is the pre-existing behaviour.
+    """
+    regions = [region]
+    try:
+        ddb_client = create_boto3_client("dynamodb", region, restore_account_credentials)
+        table = ddb_client.describe_table(TableName=table_name).get("Table", {})
+        for replica in table.get("Replicas", []):
+            replica_region = replica.get("RegionName")
+            if replica_region and replica_region not in regions:
+                regions.append(replica_region)
+    except Exception as e:
+        print(f"WARNING: Could not read replica regions for global table '{table_name}' in {region}: {str(e)}. "
+              f"It will only match source resources in {region}.")
+
+    return regions
+
+
+def stack_table_match(
+    recovery_stack_tables: Dict[str, Dict[str, Any]],
+    resource_name: str,
+    source_region: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """
+    Find the pre-created recovery-stack table for a source resource, if any.
+
+    Matches on table name plus region, where "region" is the stack's region for a
+    regular table and any replica region for a global table.
+    """
+    entry = recovery_stack_tables.get(resource_name)
+    if not entry:
+        return None
+
+    match_regions = entry.get("regions") or [entry.get("region")]
+    return entry if source_region in match_regions else None
+
+
 def discover_dynamodb_tables_from_stacks(
     stack_names: List[str],
     restore_account_credentials: Optional[Dict[str, str]] = None,
@@ -560,8 +611,16 @@ def discover_dynamodb_tables_from_stacks(
     """
     Discover DynamoDB tables from CloudFormation stack resources.
 
-    Queries CloudFormation stacks to find all AWS::DynamoDB::Table resources
-    created by the stack. Works with any CloudFormation stack (CDK, SAM, plain CFN, etc.).
+    Queries CloudFormation stacks to find all DynamoDB table resources created by
+    the stack. Works with any CloudFormation stack (CDK, SAM, plain CFN, etc.).
+
+    Both AWS::DynamoDB::Table and AWS::DynamoDB::GlobalTable are matched. A global
+    table is still a DynamoDB table as far as restoring goes — Eon inventories one
+    representative resource for the replica set — but CloudFormation reports it
+    under a different resource type, which CDK's TableV2 construct emits by
+    default. Matching only AWS::DynamoDB::Table silently misses those, so the
+    table gets restored as a new table (or skipped in recoveryStacksOnly mode)
+    instead of restored in place.
 
     Args:
         stack_names: List of CloudFormation stack names to scan
@@ -598,21 +657,41 @@ def discover_dynamodb_tables_from_stacks(
                         resource_status = resource.get("ResourceStatus", "")
 
                         # Look for DynamoDB tables that are successfully created
-                        if resource_type == "AWS::DynamoDB::Table" and resource_status in [
+                        if resource_type in DYNAMODB_STACK_RESOURCE_TYPES and resource_status in [
                             "CREATE_COMPLETE", "UPDATE_COMPLETE", "IMPORT_COMPLETE"
                         ]:
+                            # PhysicalResourceId is the table name for both
+                            # AWS::DynamoDB::Table and AWS::DynamoDB::GlobalTable.
                             table_name = resource.get("PhysicalResourceId")
                             logical_id = resource.get("LogicalResourceId", "")
 
                             if table_name:
+                                # A global table's stack lives in one region but its
+                                # replicas span several, and Eon inventories the
+                                # replica set as a single resource whose region may be
+                                # any of them. Match on the whole replica set; still
+                                # restore into the stack's own region, since writes
+                                # replicate to the others.
+                                table_regions = [region]
+                                if resource_type == "AWS::DynamoDB::GlobalTable":
+                                    table_regions = _global_table_replica_regions(
+                                        table_name=table_name,
+                                        region=region,
+                                        restore_account_credentials=restore_account_credentials,
+                                    )
+
                                 discovered_tables[table_name] = {
                                     "tableName": table_name,
                                     "region": region,
+                                    "regions": table_regions,
                                     "stackName": stack_name,
-                                    "logicalId": logical_id
+                                    "logicalId": logical_id,
+                                    "cfnResourceType": resource_type
                                 }
                                 tables_found_in_stack += 1
-                                print(f"Discovered DynamoDB table from stack: {table_name} in {region} (stack: {stack_name}, logical ID: {logical_id})")
+                                print(f"Discovered DynamoDB table from stack: {table_name} in {region} "
+                                      f"({resource_type}, stack: {stack_name}, logical ID: {logical_id}, "
+                                      f"matches source regions: {', '.join(table_regions)})")
 
                 if tables_found_in_stack > 0:
                     print(f"Found {tables_found_in_stack} DynamoDB table(s) in stack '{stack_name}' ({region})")
@@ -972,11 +1051,8 @@ def _initiate_ec2_restore(
         }
     }
 
-    # NOTE: Temporarily commented out as Eon does not currently request permissions to be able to create instance profile in restore account
-    # instance_profile_name = resource_snapshot.get("instanceProfileName")
-    # if instance_profile_name:
-    #     destination_config["awsEc2"]["instanceProfileName"] = instance_profile_name
-    #     print(f"Including instance profile: {instance_profile_name}")
+    # The source instance's IAM instance profile is deliberately not reattached to
+    # the restored instance. Attach one after the restore if the workload needs it.
 
     job_id = ctx.eon_client.restore_ec2_instance(
         resource_id=resource_id,
@@ -1279,16 +1355,15 @@ def _initiate_dynamodb_restore(
     kms_key_arn = require_kms_key(ctx.kms_key_arns_by_region, actual_region)
 
     # Check if a pre-created table exists for in-place restore
-    stack_table_match = None
+    matched_stack_table = None
     if ctx.recovery_stack_tables:
-        if resource_name in ctx.recovery_stack_tables:
-            stack_table = ctx.recovery_stack_tables[resource_name]
-            if stack_table["region"] == source_region:
-                stack_table_match = stack_table
-                print(f"Found matching pre-created table '{resource_name}' in {source_region} (source region) (stack: {stack_table['stackName']})")
+        matched_stack_table = stack_table_match(ctx.recovery_stack_tables, resource_name, source_region)
+        if matched_stack_table:
+            print(f"Found matching pre-created table '{resource_name}' for source region {source_region} "
+                  f"(restoring into {matched_stack_table['region']}, stack: {matched_stack_table['stackName']})")
 
-    if stack_table_match:
-        return _restore_dynamodb_in_place(ctx, resource_snapshot, stack_table_match)
+    if matched_stack_table:
+        return _restore_dynamodb_in_place(ctx, resource_snapshot, matched_stack_table)
 
     # No in-place match
     if ctx.recovery_stacks_only:
@@ -1544,8 +1619,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
             # In recoveryStacksOnly mode, skip tables without a matching stack
             if recovery_stacks_only and recovery_stack_tables:
-                stack_match = recovery_stack_tables.get(resource_name)
-                if not stack_match or stack_match.get("region") != source_region:
+                if not stack_table_match(recovery_stack_tables, resource_name, source_region):
                     skipped_non_stack += 1
                     continue
 

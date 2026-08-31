@@ -107,7 +107,9 @@
       "Comment": "List all protected resources from the source account",
       "Parameters": {
         "step": "list_resources",
-        "sourceAccountId.$": "$.sourceAccountId"
+        "sourceAccountId.$": "$.sourceAccountId",
+        "resourceTypes.$": "$.resourceTypes",
+        "resourceIds.$": "$.resourceIds"
       },
       "ResultPath": "$.resourcesResult",
       "Retry": [
@@ -139,7 +141,8 @@
       "Parameters": {
         "step": "get_snapshots",
         "resources.$": "$.resourcesResult.resources",
-        "snapshotDate.$": "$.snapshotDate"
+        "snapshotDate.$": "$.snapshotDate",
+        "sourceAccountId.$": "$.sourceAccountId"
       },
       "ResultPath": "$.snapshotsResult",
       "Retry": [
@@ -157,12 +160,29 @@
           "Next": "Get Snapshots Failed"
         }
       ],
-      "Next": "Initiate Restores"
+      "Next": "Check Snapshots Found"
     },
     "Get Snapshots Failed": {
       "Type": "Fail",
       "Error": "GetSnapshotsFailed",
       "Cause": "Failed to retrieve snapshots for resources"
+    },
+    "Check Snapshots Found": {
+      "Type": "Choice",
+      "Comment": "Stop the run if resources were found but none of them have a snapshot to restore from",
+      "Choices": [
+        {
+          "Variable": "$.snapshotsResult.totalSnapshots",
+          "NumericEquals": 0,
+          "Next": "No Snapshots Found"
+        }
+      ],
+      "Default": "Initiate Restores"
+    },
+    "No Snapshots Found": {
+      "Type": "Fail",
+      "Error": "NoSnapshotsFound",
+      "Cause": "Resources were found in the source account, but none of them have a snapshot matching the requested snapshotDate. A notification listing the affected resources has been sent. Re-run with \"snapshotDate\": \"latest\" to restore each resource's most recent snapshot."
     },
     "Initiate Restores": {
       "Type": "Task",
@@ -221,6 +241,8 @@
         "vpcConfigs.$": "$.vpcConfigs",
         "crossAccountRoleArn.$": "$.crossAccountRoleArn",
         "wcuRestorationFailures": [],
+        "resourcesWithoutSnapshots.$": "$.snapshotsResult.resourcesWithoutSnapshots",
+        "resourcesWithoutSnapshotsCount.$": "$.snapshotsResult.resourcesWithoutSnapshotsCount",
         "startTime.$": "$$.State.EnteredTime"
       },
       "ResultPath": "$.monitoringState",
@@ -240,6 +262,8 @@
         "vpcConfigs.$": "$.monitoringState.vpcConfigs",
         "crossAccountRoleArn.$": "$.monitoringState.crossAccountRoleArn",
         "wcuRestorationFailures.$": "$.monitoringState.wcuRestorationFailures",
+        "resourcesWithoutSnapshots.$": "$.monitoringState.resourcesWithoutSnapshots",
+        "resourcesWithoutSnapshotsCount.$": "$.monitoringState.resourcesWithoutSnapshotsCount",
         "startTime.$": "$.monitoringState.startTime"
       },
       "ResultPath": "$.monitoringState",
@@ -267,12 +291,17 @@
     },
     "Check If Complete": {
       "Type": "Choice",
-      "Comment": "Determine if all jobs are complete or if we should continue monitoring",
+      "Comment": "Determine if all jobs are complete, if monitoring has timed out, or if we should keep polling",
       "Choices": [
         {
           "Variable": "$.monitoringState.allComplete",
           "BooleanEquals": true,
           "Next": "All Jobs Complete"
+        },
+        {
+          "Variable": "$.monitoringState.timedOut",
+          "BooleanEquals": true,
+          "Next": "Monitoring Timed Out"
         }
       ],
       "Default": "Wait For Jobs"
@@ -286,6 +315,11 @@
     "All Jobs Complete": {
       "Type": "Succeed",
       "Comment": "All restore jobs have completed (successfully or with failures)"
+    },
+    "Monitoring Timed Out": {
+      "Type": "Fail",
+      "Error": "MonitoringTimedOut",
+      "Cause": "Monitoring reached the maximum iteration limit (MAX_MONITORING_ITERATIONS) with jobs still running. A timeout notification has been sent; check the Eon console for the final status of any still-running jobs."
     }
   }
 }

@@ -156,7 +156,7 @@ Resources:
           EON_CREDENTIALS_SECRET_ARN: !Ref EonCredentialsSecret
           SNS_TOPIC_ARN: !Ref NotificationTopic
           MANAGEMENT_ACCOUNT_ID: !Ref ManagementAccountId
-          MAX_MONITORING_ITERATIONS: '360'
+          MAX_MONITORING_ITERATIONS: '720'  # 720 × 5min = 60 hours
 
   # IAM Role for Step Functions
   StepFunctionsExecutionRole:

@@ -255,8 +255,10 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     restore_region = event.get("restoreRegion")
     vpc_configs = event.get("vpcConfigs", [])
     cross_account_role_arn = event.get("crossAccountRoleArn")
+    resources_without_snapshots = event.get("resourcesWithoutSnapshots", [])
+    resources_without_snapshots_count = event.get("resourcesWithoutSnapshotsCount", 0)
     start_time = event.get("startTime")
-    max_iterations = int(os.environ.get("MAX_MONITORING_ITERATIONS", "360"))  # 360 * 5min = 30 hours
+    max_iterations = int(os.environ.get("MAX_MONITORING_ITERATIONS", "720"))  # 720 * 5min = 60 hours
 
     # Get Eon credentials
     credentials = get_eon_credentials()
@@ -393,12 +395,18 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             })
 
     all_complete = (running_count == 0)
+    timed_out = iteration >= max_iterations
 
     print(f"Job summary: {completed_count} completed, {failed_count} failed, {partial_count} partial, {skipped_count} skipped, {running_count} still running")
 
     result = {
         "restoreJobs": restore_jobs,  # Pass through for next iteration
         "allComplete": all_complete,
+        # Set once monitoring hits the max-iteration ceiling. The state machine's
+        # "Check If Complete" Choice routes to a terminal state on this flag, so the
+        # monitor loop stops (and the timeout notification below fires exactly once)
+        # instead of re-polling and re-notifying every 5 minutes indefinitely.
+        "timedOut": timed_out,
         "jobStatuses": job_statuses,
         "completedJobs": completed_count,
         "failedJobs": failed_count,
@@ -414,11 +422,15 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         "vpcConfigs": vpc_configs,
         "crossAccountRoleArn": cross_account_role_arn,
         "wcuRestorationFailures": wcu_restoration_failures,
+        # Carried through every iteration so the completion notification can report
+        # resources that were in scope but had no snapshot to restore from.
+        "resourcesWithoutSnapshots": resources_without_snapshots,
+        "resourcesWithoutSnapshotsCount": resources_without_snapshots_count,
         "startTime": start_time
     }
 
     # On timeout, restore WCU for any in-place jobs still running (don't leave elevated WCU)
-    if iteration >= max_iterations:
+    if timed_out:
         for job in restore_jobs:
             if (job.get("originalTableSettings", {}).get("wcuScaledUp")
                     and not job.get("wcuRestored")):
@@ -428,9 +440,11 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 if not success:
                     wcu_restoration_failures.append(job)
 
-    # If all jobs are complete or max iterations reached, send SNS notification
-    if all_complete or iteration >= max_iterations:
-        send_completion_notification(result, iteration >= max_iterations)
+    # If all jobs are complete or max iterations reached, send SNS notification.
+    # On timeout this fires exactly once because the state machine terminates the
+    # monitor loop on the timedOut flag rather than looping back into Monitor Jobs.
+    if all_complete or timed_out:
+        send_completion_notification(result, timed_out)
 
     return result
 
@@ -460,6 +474,8 @@ def send_completion_notification(job_summary: Dict[str, Any], timeout: bool) -> 
     partial_jobs = job_summary["partialJobs"]
     skipped_jobs = job_summary.get("skippedJobs", 0)
     running_jobs = job_summary["runningJobs"]
+    no_snapshot_resources = job_summary.get("resourcesWithoutSnapshots", [])
+    no_snapshot_count = job_summary.get("resourcesWithoutSnapshotsCount", len(no_snapshot_resources))
 
     # Extract context information
     source_account_id = job_summary.get("sourceAccountId", "Unknown")
@@ -485,9 +501,13 @@ def send_completion_notification(job_summary: Dict[str, Any], timeout: bool) -> 
     if timeout:
         subject = "Eon Bulk Recovery - TIMEOUT"
         status_summary = f"⚠️ Monitoring timed out after {job_summary['iteration']} iterations"
-    elif failed_jobs == 0 and partial_jobs == 0 and skipped_jobs == 0:
+    elif failed_jobs == 0 and partial_jobs == 0 and skipped_jobs == 0 and no_snapshot_count == 0:
         subject = "Eon Bulk Recovery - SUCCESS"
         status_summary = f"✅ All {total_jobs} restore jobs completed successfully"
+    elif failed_jobs == 0 and partial_jobs == 0 and skipped_jobs == 0:
+        subject = "Eon Bulk Recovery - PARTIAL SUCCESS"
+        status_summary = (f"⚠️ All {total_jobs} restore jobs completed successfully, but "
+                          f"{no_snapshot_count} resource(s) had no snapshot to restore from")
     elif completed_jobs > 0 or skipped_jobs > 0:
         subject = "Eon Bulk Recovery - PARTIAL SUCCESS"
         status_summary = f"⚠️ {completed_jobs}/{total_jobs} jobs completed ({failed_jobs} failed, {partial_jobs} partial, {skipped_jobs} skipped)"
@@ -543,6 +563,7 @@ def send_completion_notification(job_summary: Dict[str, Any], timeout: bool) -> 
         f"Partial: {partial_jobs}",
         f"Skipped: {skipped_jobs}",
         f"Still Running: {running_jobs}",
+        f"No Snapshot Available: {no_snapshot_count}",
         "",
         "Job Details:",
         "-" * 50
@@ -647,6 +668,24 @@ def send_completion_notification(job_summary: Dict[str, Any], timeout: bool) -> 
             duration_min = job_status["durationSeconds"] // 60
             message_lines.append(f"   Duration: {duration_min} minutes")
 
+        message_lines.append("")
+
+    # List resources that were in scope but produced no restore job, so a
+    # partially-empty recovery doesn't read as a complete one.
+    if no_snapshot_resources:
+        message_lines.append("")
+        message_lines.append("Resources Without a Snapshot (not restored):")
+        message_lines.append("-" * 50)
+        for entry in no_snapshot_resources:
+            message_lines.append(
+                f"⏭️ {entry.get('resourceName')} ({entry.get('resourceType')}) "
+                f"in {entry.get('region') or 'unknown region'}"
+            )
+            message_lines.append(f"   Reason: {entry.get('reason')}")
+        if no_snapshot_count > len(no_snapshot_resources):
+            message_lines.append(
+                f"... and {no_snapshot_count - len(no_snapshot_resources)} more (see CloudWatch logs)"
+            )
         message_lines.append("")
 
     # Add ACTION REQUIRED section if any WCU restorations failed
