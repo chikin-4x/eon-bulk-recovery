@@ -25,7 +25,8 @@ jobs:
         uses: actions/checkout@v7
         with:
           ref: ${{ inputs.version }}
-      - name: aws-actions/setup-sam@v3
+      - name: Setup SAM
+        uses: aws-actions/setup-sam@v3
         with:
           use-installer: true
       - name: Configure AWS credentials
