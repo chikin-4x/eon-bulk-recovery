@@ -1,0 +1,40 @@
+on:
+  workflow_dispatch:
+    inputs:
+      account_number:
+        description: "The account number to deploy to"
+        required: true
+        default: "1234567890"
+      version:
+        description: "The version to deploy"
+        required: true
+        default: "v1.0.0"
+      
+jobs:
+  cdk-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Init cyber-bootstrap
+        uses: cfacorp/gha-cyber-bootstrap@v1
+        with:
+          aws_credentials: ${{ secrets.LEGACY_AWS_ACCESS }}
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.version }}
+      - name: aws-actions/setup-sam@v3
+        with:
+          use-installer: true
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ inputs.account_number }}:role/github-actions-runner
+          aws-region: us-east-1
+          retry-max-attempts: 3
+      - name: Build application
+        run: sam build
+      - name: Deploy application
+        run: sam deploy --no-confirm-changeset --no-fail-on-empty-changeset
