@@ -17,10 +17,10 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - name: Init cyber-bootstrap
-        uses: cfacorp/gha-cyber-bootstrap@v1
+      - name: Harden Runner #this is what cyber-bootstrap does
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
         with:
-          aws_credentials: ${{ secrets.LEGACY_AWS_ACCESS }}
+          egress-policy: audit
       - name: Checkout code
         uses: actions/checkout@v7
         with:
