@@ -38,4 +38,4 @@ jobs:
       - name: Build application
         run: sam build
       - name: Deploy application
-        run: sam deploy --no-confirm-changeset --no-fail-on-empty-changeset
+        run: sam deploy --stack-name {{ vars.STACK_NAME }} --no-confirm-changeset --no-fail-on-empty-changeset --parameter-overrides EonAccountDomain={{ vars.EON_ACCOUNT_DOMAIN }} EonProjectId={{ vars.EON_PROJECT_ID }} EonAccountId={{ vars.EON_ACCOUNT_ID }} EonClientId={{ secrets.EON_CLIENT_ID }} EonClientSecret={{ secrets.EON_CLIENT_SECRET }} ManagementAccountId={{ vars.EON_MANAGEMENT_ACCT_ID }} NotificationEmail={{ vars.NOTIFICATION_EMAIL }}
