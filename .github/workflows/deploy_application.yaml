@@ -11,6 +11,10 @@ on:
         description: "The version to deploy"
         required: true
         default: "v1.0.0"
+      stack_name:
+        description: "The stack name to deploy to (only change if you want to test)"
+        required: true
+        default: "eon-bulk-recovery"
       
 jobs:
   cdk-deploy:
