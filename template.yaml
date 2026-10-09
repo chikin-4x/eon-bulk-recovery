@@ -77,6 +77,9 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub '${AWS::StackName}-lambda-role'
+      Tags:
+        - Key: ALLOW_GHA_DELETE
+          Value: 'TRUE'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -163,6 +166,9 @@ Resources:
     Type: AWS::IAM::Role
     Properties:
       RoleName: !Sub '${AWS::StackName}-step-functions-role'
+      Tags:
+        - Key: ALLOW_GHA_DELETE
+          Value: 'TRUE'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
