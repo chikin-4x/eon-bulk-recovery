@@ -218,14 +218,14 @@ than one resource, the step fails and the error lists what it found.
   "region": "us-east-1",
   "vpc": "primary",
   "subnetsPerAvailabilityZone": [
-    {"availabilityZone": "us-east-1a", "subnetId": "data-1"},
-    {"availabilityZone": "us-east-1b", "subnetId": "data-2"},
-    {"availabilityZone": "us-east-1c", "subnetId": "data-3"},
-    {"availabilityZone": "us-east-1d", "subnetId": "data-4"}
+    {"availabilityZone": "us-east-1a", "subnetId": "my-subnet-1"},
+    {"availabilityZone": "us-east-1b", "subnetId": "my-subnet-2"},
+    {"availabilityZone": "us-east-1c", "subnetId": "my-subnet-3"},
+    {"availabilityZone": "us-east-1d", "subnetId": "my-subnet-4"}
   ],
   "securityGroups": {
-    "restoreServer": ["primary-app-sg"],
-    "restoredRdsInstance": ["primary-data-sg"]
+    "restoreServer": ["some-security-group"],
+    "restoredRdsInstance": ["another-security-group"]
   }
 }]
 ```
