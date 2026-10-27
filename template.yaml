@@ -76,7 +76,11 @@ Resources:
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: EonBulkRecoveryLambdaRole
+      RoleName: !Sub '${AWS::StackName}-lambda-role'
+      PermissionsBoundary: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/GithubActionsIamResourcePermissionsBoundary'
+      Tags:
+        - Key: ALLOW_GHA_DELETE
+          Value: 'TRUE'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -162,7 +166,11 @@ Resources:
   StepFunctionsExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: EonBulkRecoveryStepFunctionsRole
+      RoleName: !Sub '${AWS::StackName}-step-functions-role'
+      PermissionsBoundary: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/GithubActionsIamResourcePermissionsBoundary'
+      Tags:
+        - Key: ALLOW_GHA_DELETE
+          Value: 'TRUE'
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
@@ -189,6 +197,7 @@ Resources:
       Role: !GetAtt StepFunctionsExecutionRole.Arn
       DefinitionUri: ./statemachine.asl.json
       DefinitionSubstitutions:
+        ResolveVpcConfigsFunctionArn: !GetAtt BulkRecoveryFunction.Arn
         BootstrapFunctionArn: !GetAtt BulkRecoveryFunction.Arn
         ConnectAccountFunctionArn: !GetAtt BulkRecoveryFunction.Arn
         ConfigureVpcFunctionArn: !GetAtt BulkRecoveryFunction.Arn
