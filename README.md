@@ -77,8 +77,9 @@ aws cloudformation deploy \
 
 Then pass the stack's `CrossAccountRoleArn` output as the `crossAccountRoleArn`
 field in the execution input. Optional parameters: `CrossAccountRoleName`,
-`LambdaExecutionRoleName` (default `EonBulkRecoveryLambdaRole`), and
-`PermissionsBoundaryArn` (for orgs that mandate a boundary).
+`LambdaExecutionRoleName` (must match the application stack's parameter of the same
+name, default `EonBulkRecoveryLambdaRole`), and `PermissionsBoundaryArn` (for orgs
+that mandate a boundary).
 
 **What it grants:** CloudFormation (deploy Eon's `restore-account.yml`, list
 recovery-stack resources), IAM scoped to `EonRestore*` (the bootstrap stack
@@ -151,6 +152,15 @@ sam deploy --guided --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM
 - `EonClientId` / `EonClientSecret` - API credentials
 - `ManagementAccountId` - (Optional) For AWS Organizations
 - `NotificationEmail` - (Optional) For completion alerts
+- `LambdaExecutionRoleName` / `StepFunctionsRoleName` - (Optional) IAM role names, default `EonBulkRecoveryLambdaRole` / `EonBulkRecoveryStepFunctionsRole`
+
+**A second copy in the same account** (to test a change next to the deployment you rely
+on): give it its own `--stack-name` and override both role names, since IAM role names are
+account-wide. Everything else in the stack is already named after the stack. The chain role
+in the management account and any `cross-account-role.yaml` deployment trust the Lambda
+role by name, and each takes one name, so either deploy them again with the test copy's
+`LambdaExecutionRoleName` or point the test copy at a restore account through
+`crossAccountRoleArn`.
 
 ## Usage
 
@@ -193,6 +203,7 @@ aws stepfunctions start-execution \
   "vpcConfigs": [{
     "region": "us-east-1",
     "vpc": "vpc-xxx",
+    "privateSubnetEnabled": true,
     "subnetsPerAvailabilityZone": [
       {"availabilityZone": "us-east-1a", "subnetId": "subnet-xxx"},
       {"availabilityZone": "us-east-1b", "subnetId": "subnet-yyy"}
@@ -331,6 +342,45 @@ S3 bucket names are **globally unique** across all AWS accounts worldwide. This 
 | `recoveryStacksOnly` | No | When `true`, only restore resources that match a stack table/bucket — skip EC2, RDS, and unmatched DynamoDB/S3 (default: false) |
 | `s3InPlaceTagKey` | No | Tag key used to match source and target S3 buckets for in-place restore (default: `"eon_functional_id"`). The tag value can be any string — bucket name, hash, UUID, etc. |
 
+### Cross-Region Vault Reads
+
+A restore whose target region differs from the vault's region reads the vault from another
+region. Eon has two ways to do that, chosen per VPC by `privateSubnetEnabled` in `vpcConfigs`:
+
+| `privateSubnetEnabled` | How the restore server reaches the vault |
+|------------------------|------------------------------------------|
+| `true` (the default, also when the key is omitted or `null`) | Through an S3 Multi-Region Access Point that Eon creates on the vault for the job and removes afterwards. A `com.amazonaws.s3-global.accesspoint` interface endpoint in the restore VPC keeps that traffic on AWS PrivateLink. |
+| `false` | Through the vault region's regional access point, which the restore server can only reach over the internet: an internet gateway, or a NAT gateway from a private subnet. |
+
+The workflow defaults to `true` because the restore server normally runs in a private subnet,
+and with the regional access point every byte of a cross-region restore crosses the NAT gateway
+and is billed as NAT processing. Over the interface endpoint the same bytes are billed at the
+PrivateLink rate instead, and a subnet with no internet route at all can restore cross-region.
+AWS adds a small per-GB routing charge for traffic through a Multi-Region Access Point.
+
+The default does not create the endpoint. A VPC with a NAT gateway and no
+`s3-global.accesspoint` interface endpoint still restores with the default, and still sends the
+traffic through the NAT gateway; the saving starts when the endpoint exists. Create it with
+private DNS enabled, in the VPC named in `vpcConfigs`, alongside the other endpoints a private
+restore subnet needs (the regional S3 and DynamoDB gateway endpoints, and the ECR, STS and SQS
+interface endpoints). [AWS: Restore Server Requirements] has the full list. An isolated subnet
+without the interface endpoint reaches a vault in another region by neither path, and the
+restore stalls rather than failing fast; creating the endpoint fixes it.
+
+Set `"privateSubnetEnabled": false` on a VPC to keep the regional access point for it, for
+example when the restore server runs in a public subnet and the routing charge is not worth
+paying. Same-region restores never use either path, so the flag has no effect on them. A value
+other than `true`, `false` or `null` fails the `Configure VPC` step.
+
+Self-managed (BYOV) vaults are outside this flag: Eon cannot create an access point on a bucket
+it does not own, so cross-region reads from such a vault use the access point alias configured
+on the vault itself.
+
+The `Configure VPC` log prints the path each VPC was configured with, and the completion
+notification repeats it next to each VPC.
+
+[AWS: Restore Server Requirements]: https://docs.eon.io/data-protection/cloud-workloads/aws/restore-accounts/aws-restore-server-requirements
+
 ### DynamoDB Restore Method
 
 New DynamoDB tables are rebuilt one of two ways:
@@ -383,6 +433,7 @@ When restoring DynamoDB tables, the workflow distributes Write Capacity Units (W
 1. 95% of the regional WCU limit is used (default: 38,000 out of 40,000) to leave headroom
 2. Tables reporting 0 bytes get no allocation. There is nothing to write back, so any WCU they took would come out of a table that does have data. The restore request omits `writeCapacityUnits` for these and Eon applies its own minimum
 3. The budget is split between the tables with known sizes, proportionally to size — a 10 GB table gets 10× the WCUs of a 1 GB table
+4. Every sized table gets at least 10 WCU. Proportional allocation rounds a small table next to a very large one down to almost nothing, and a table restoring at 1 WCU crawls
 
 **Example:** 3 tables in us-east-1 with a 40,000 WCU limit:
 
@@ -447,7 +498,7 @@ fails loudly rather than reaching an account.
 1. **Resolve VPC names** - Looks up any VPC, subnet, or security group names in `vpcConfigs` and replaces them with IDs. IDs pass through unchanged. Runs before bootstrap so subnet groups are created from real subnet IDs.
 2. **Bootstrap** - Creates KMS keys in each region, RDS subnet groups, IAM roles. If the IAM stack already exists but its restore role is missing (deleted out-of-band, or a prior create rolled back), the workflow stops with an actionable error telling you to delete the stack and re-run, rather than handing Eon a role ARN it cannot assume.
 3. **Connect** - Registers restore account with Eon. If a matching account already exists and is `DISCONNECTED` or `INSUFFICIENT_PERMISSIONS`, the step reconnects and polls for `CONNECTED` (and lets the Step Functions retry back off), giving roles just installed by bootstrap time to propagate.
-4. **Configure** - Sets up VPC connectivity
+4. **Configure** - Registers the VPC connectivity with Eon. Every VPC is sent with `privateSubnetEnabled: true` unless the input says `false`, so cross-region restores read the vault through an S3 Multi-Region Access Point (see [Cross-Region Vault Reads](#cross-region-vault-reads))
 5. **List Resources** - Retrieves resources in scope (`resourceTypes` / `resourceIds` are applied here, server-side)
 6. **Get Snapshots** - Selects a snapshot per resource, extracts table sizes. Resources with nothing to restore are recorded with a reason; if that is all of them, the run stops here with a notification
 7. **Initiate Restores** - If `recoveryStackNames` provided:
@@ -471,7 +522,7 @@ Restore Account: 222222222222
 Default Restore Region: us-east-1 (resources restored to original regions)
 Snapshot Date(s): 2026-08-29
 VPC Configurations:
-  - vpc-00000000000000001 in us-east-1 (3 subnets)
+  - vpc-00000000000000001 in us-east-1 (3 subnets, cross-region vault reads via Multi-Region Access Point)
 Total Duration: 0h 15m
 
 Job Summary:
