@@ -5,7 +5,7 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.3.0.cfa] 2026-10-27
 
 ### Added
 
@@ -23,6 +23,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Required when `vpcConfigs` uses names. Redeploy `cross-account-role.yaml` (or the
   StackSet) in the restore account before a name-based run. Accounts reached through
   `OrganizationAccountAccessRole` or `AWSControlTowerExecution` already have this access.
+
+## [1.3.0] - 2026-10-19
+
+### Added
+
+- **`LambdaExecutionRoleName` and `StepFunctionsRoleName` template parameters.** The two IAM
+  role names were fixed, so a second copy of the stack in the same account failed on them
+  even though every other resource is already named after the stack. Both default to the
+  previous names, so an existing deployment is unchanged. `management-account-role.yaml` takes
+  the same `LambdaExecutionRoleName`, with the same default, so the chain role can trust a
+  renamed Lambda role.
+
+### Changed
+
+- **Cross-region restores read the vault through an S3 Multi-Region Access Point by default.**
+  Every `vpcConfigs` entry now reaches Eon with `privateSubnetEnabled: true` unless the execution
+  input sets it to `false`. Before, the flag was off unless the input set it, so a cross-region
+  restore read the vault through the vault region's regional access point, which a restore server
+  in a private subnet can only reach through its NAT gateway, and every restored byte was billed
+  as NAT processing. Through the access point the traffic stays on a
+  `com.amazonaws.s3-global.accesspoint` interface endpoint where the restore VPC has one, and a
+  subnet with no internet route can restore cross-region at all. A VPC without that endpoint keeps
+  restoring through the NAT gateway as before. Same-region restores are unaffected, and nothing
+  lands under a different name, region or account, so an existing execution input runs unchanged.
+  A value other than `true`, `false` or `null` fails the `Configure VPC` step instead of quietly
+  choosing a path. The `Configure VPC` log and the completion notification's VPC lines now name
+  the path each VPC uses. See "Cross-Region Vault Reads" in the README.
+- **Every sized DynamoDB table is allocated at least 10 WCU**, up from 1. Proportional
+  allocation rounded a small table next to a very large one down to 1 WCU, and such a table
+  restored at a crawl. The floor is still a negligible share of the regional budget. Tables
+  reporting 0 bytes are unchanged: they get no allocation and Eon's own minimum applies.
 
 ## [1.2.1] - 2026-10-05
 
