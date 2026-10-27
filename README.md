@@ -87,14 +87,17 @@ creates those roles/policies/instance profile — including `iam:PassRole`, whic
 AWS requires to attach the node role to its instance profile), KMS (per-region
 keys + aliases),
 RDS (subnet groups + instance-class availability), S3 (create destination
-buckets, read recovery-bucket tags), EC2 (`DescribeVpcs`, `DescribeSubnets`,
+buckets, block public access on DynamoDB snapshot-export buckets, read
+recovery-bucket tags), EC2 (`DescribeVpcs`, `DescribeSubnets`,
 and `DescribeSecurityGroups` to resolve names in `vpcConfigs`, plus
 `DescribeInstanceTypeOfferings`), and DynamoDB (`DescribeTable`, `UpdateTable`,
 `TagResource`, `UntagResource`, `ListTagsOfResource` for in-place WCU scaling).
 
 The role does **not** carry data-plane restore permissions (`ec2:RunInstances`,
 `rds:RestoreDB*`, S3/DynamoDB writes). Those belong to Eon's `EonRestoreAccountRole` /
-`EonRestoreNodeRole`, which the bootstrap stack creates.
+`EonRestoreNodeRole`, which the bootstrap stack creates. A DynamoDB snapshot export
+needs that restore role to allow `s3:PutObject`, `s3:GetObject`, and `s3:ListBucket`
+on the export bucket; see [DynamoDB Restore Method](#dynamodb-restore-method).
 
 > **IAM scope note:** the `EonRestore*` grant lets this role create IAM principals
 > via the bootstrap stack — the broadest permission in the template. It is scoped
@@ -334,6 +337,7 @@ S3 bucket names are **globally unique** across all AWS accounts worldwide. This 
 | `resourceNamePrefix` | No | Prefix for restored resource names (null = use original names) |
 | `dynamodbRegionalWcuLimit` | No | Total WCU budget per region across all tables (default: 40000). See [DynamoDB WCU Allocation](#dynamodb-wcu-allocation) |
 | `dynamodbTableWcuMax` | No | Max WCU any single table can receive (default: 40000). Caps individual tables when the regional limit is raised |
+| `dynamodbRestoreMethod` | No | How DynamoDB tables are restored: `auto` (default), `import`, `capacity`, or `snapshot`. See [DynamoDB Restore Method](#dynamodb-restore-method) |
 | `vpcConfigs` | Yes | Network configuration per region. `vpc`, `subnetId`, and security group entries accept a resource ID or a name (the `Name` tag; a security group also matches its group name). Names are resolved to IDs in the restore account before bootstrap. Also creates KMS keys and RDS subnet groups |
 | `crossAccountRoleArn` | No | Custom role ARN or null for Organizations |
 | `restoreAccountName` | No | Display name in Eon (null = auto-generate) |
@@ -383,12 +387,13 @@ notification repeats it next to each VPC.
 
 ### DynamoDB Restore Method
 
-New DynamoDB tables are rebuilt one of two ways:
+DynamoDB tables are restored one of three ways:
 
 | Method | How it works | Capacity cost |
 |--------|--------------|---------------|
 | **ImportTable** (default where available) | Eon stages the snapshot as DynamoDB JSON in S3 and calls the AWS `ImportTable` API. AWS creates the table, loads it, and builds the GSIs in one pass. | None. The table is created with the source table's own billing mode and throughput. |
 | **Capacity-based** | Eon writes the items back through the DynamoDB write API at the provisioned WCU. | Consumes the regional write-throughput quota, so restore speed is bounded by it. |
+| **Snapshot export** | Eon writes the snapshot to an S3 bucket as DynamoDB JSON. No table is created. | None. |
 
 ImportTable is the faster path for anything large, and because it consumes no
 write capacity it leaves the regional WCU budget to the tables that still need it.
@@ -399,6 +404,7 @@ write capacity it leaves the regional WCU budget to the tables that still need i
 | `"auto"`, `null`, or the key omitted (default) | ImportTable for every table that can take it, capacity-based for the rest |
 | `"import"` | Force ImportTable. A table AWS cannot import fails at initiation instead of restoring a different way |
 | `"capacity"` | Force the write path for every table |
+| `"snapshot"` | Export every in-scope DynamoDB table to S3. See [Snapshot export](#snapshot-export-to-s3) |
 
 Under `"auto"` the workflow checks each snapshot before it submits anything, and
 the reasons for each fallback are printed in the `Initiate Restores` log and
@@ -423,11 +429,41 @@ Two AWS behaviours to expect on the import path:
 - **Tags are applied after the import completes**, because `TableCreationParameters` does not carry them.
 
 In-place restores into recovery-stack tables are always capacity-based: the table
-already exists, and `ImportTable` only creates new ones.
+already exists, and `ImportTable` only creates new ones. `"snapshot"` does not use
+in-place restore; a matching recovery-stack table is exported to S3 like any other.
+
+### Snapshot export to S3
+
+`"snapshot"` exports each in-scope DynamoDB table to S3 instead of rebuilding a table.
+Pick the tables with `resourceIds` (table names, Eon resource IDs, or a mix). An empty
+`resourceIds` exports every DynamoDB table in scope, and other resource types still
+restore unless `resourceTypes` limits the run.
+
+For each restore region the workflow creates `eon-restore-data-<restoreAccountId>-<region>`
+(for example `eon-restore-data-222222222222-us-east-1`) and reuses it when this account
+already owns it. The region is the one a new table would have been restored into:
+`restoreRegion` when that region is in `vpcConfigs`, otherwise the source region when
+that region is configured, otherwise the first VPC region. The bucket uses SSE-S3
+and blocks public access. Eon creates the prefix and writes DynamoDB JSON
+(`outputFormat: DYNAMODB_JSON`) under `{tableName}/`. If two tables in the same bucket
+share a name, the later one uses `{tableName}-{resourceId}/`.
+
+Eon writes the objects with `EonRestoreAccountRole`, the role the bootstrap stack
+installs. That role must allow `s3:PutObject`, `s3:GetObject`, and `s3:ListBucket` on
+the bucket. It already writes the buckets created for ordinary S3 restores, so the
+grant is expected to be present. This workflow does not change Eon's role. The
+cross-account orchestration role only creates the bucket and blocks public access;
+redeploy `cross-account-role.yaml` (or the StackSet) before a snapshot run that uses
+it. Accounts reached through `OrganizationAccountAccessRole` or
+`AWSControlTowerExecution` already have that access.
+
+Snapshot exports do not use write capacity or warm throughput, and they do not
+rebuild a table, so nothing appears in the DynamoDB console. The completion
+notification names the bucket and prefix.
 
 ### DynamoDB WCU Allocation
 
-When restoring DynamoDB tables, the workflow distributes Write Capacity Units (WCUs) across tables **per-region** to maximize restore throughput without exceeding account limits. This applies to capacity-based new table restores and to in-place restores (recovery stack tables). Tables going through [ImportTable](#dynamodb-restore-method) are left out of the allocation, since they never write through the DynamoDB API — counting them would take capacity away from the tables that do.
+When restoring DynamoDB tables, the workflow distributes Write Capacity Units (WCUs) across tables **per-region** to maximize restore throughput without exceeding account limits. This applies to capacity-based new table restores and to in-place restores (recovery stack tables). Tables going through [ImportTable](#dynamodb-restore-method) are left out of the allocation, since they never write through the DynamoDB API — counting them would take capacity away from the tables that do. [Snapshot exports](#snapshot-export-to-s3) are left out as well: they write to S3, not to a table.
 
 **How it works:**
 1. 95% of the regional WCU limit is used (default: 38,000 out of 40,000) to leave headroom

@@ -37,6 +37,7 @@ _TERMINAL_STATUSES = _SUCCESS_STATUSES | _PARTIAL_STATUSES | _FAILED_STATUSES | 
 _DYNAMODB_METHOD_LABELS = {
     "RESTORE_METHOD_IMPORT_TABLE": "ImportTable (import from S3)",
     "RESTORE_METHOD_CAPACITY_BASED": "capacity-based",
+    "snapshot": "snapshot export to S3",
 }
 
 
@@ -708,6 +709,12 @@ def send_completion_notification(job_summary: Dict[str, Any], timeout: bool) -> 
                     message_lines.append(
                         f"   Restore Method: {_DYNAMODB_METHOD_LABELS.get(restore_method, restore_method)}"
                     )
+                s3_bucket = restore_job.get("s3Bucket")
+                s3_prefix = restore_job.get("s3Prefix")
+                if s3_bucket:
+                    message_lines.append(f"   S3 Bucket: {s3_bucket}")
+                if s3_prefix:
+                    message_lines.append(f"   S3 Prefix: {s3_prefix}")
                 if wcu:
                     message_lines.append(f"   Write Capacity Units: {wcu:,}")
 

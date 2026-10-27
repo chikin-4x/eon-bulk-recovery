@@ -96,7 +96,7 @@ class TestRestoreMethodInput:
 
         assert result["totalJobs"] == 0
 
-    @pytest.mark.parametrize("value", ["AUTO", " Import ", "CAPACITY"])
+    @pytest.mark.parametrize("value", ["AUTO", " Import ", "CAPACITY", " Snapshot "])
     def test_case_and_whitespace_are_normalised(self, wiring, value):
         wiring(**importable())
 
@@ -466,3 +466,133 @@ class TestStateMachineInputContract:
 
         missing = referenced - set(example) - defaulted - {"inputDefaults"}
         assert not missing, f"state machine reads keys absent from the example input: {sorted(missing)}"
+
+
+class TestDynamoDBSnapshot:
+    def _capture_s3(self, monkeypatch):
+        clients = {}
+
+        def create(service, region, credentials=None):
+            assert service == "s3"
+            return clients.setdefault(region, MagicMock())
+
+        monkeypatch.setattr(ir, "create_boto3_client", create)
+        return clients
+
+    def test_skips_import_planning_and_wcu(self, wiring, monkeypatch):
+        client = wiring(restore_dynamodb_to_s3="job-s3")
+        s3 = self._capture_s3(monkeypatch)
+        event = dict(
+            BASE_EVENT,
+            dynamodbRestoreMethod="snapshot",
+            resourceSnapshots=[ddb_snapshot()],
+        )
+
+        result = handler(event, None)
+
+        assert client.calls_to("check_dynamodb_import_availability") == []
+        assert client.calls_to("list_restore_accounts") == []
+        assert client.calls_to("restore_dynamodb_table") == []
+        job = result["restoreJobs"][0]
+        assert job["restoreMethod"] == "snapshot"
+        assert job["restoreType"] == "SNAPSHOT_TO_S3"
+        assert job["s3Bucket"] == "eon-restore-data-222222222222-us-east-1"
+        assert job["s3Prefix"] == "orders/"
+        assert job["restoredRegion"] == "us-east-1"
+        assert "writeCapacityUnits" not in job
+        assert "warmThroughputTarget" not in job
+        call = client.calls_to("restore_dynamodb_to_s3")[0]
+        assert call["restore_account_id"] == "eon-acct"
+        assert call["region"] == "us-east-1"
+        assert call["s3_bucket"] == job["s3Bucket"]
+        assert call["s3_prefix"] == "orders/"
+        s3["us-east-1"].put_object.assert_not_called()
+        assert "CreateBucketConfiguration" not in s3["us-east-1"].create_bucket.call_args.kwargs
+
+    def test_one_bucket_per_restore_region(self, wiring, monkeypatch):
+        client = wiring(restore_dynamodb_to_s3="job-s3")
+        s3 = self._capture_s3(monkeypatch)
+        west = dict(VPC_CONFIGS[0], region="us-west-2", vpc="vpc-2")
+        event = dict(
+            BASE_EVENT,
+            restoreRegion=None,
+            dynamodbRestoreMethod="snapshot",
+            vpcConfigs=VPC_CONFIGS + [west],
+            resourceSnapshots=[
+                ddb_snapshot("res-a", "orders", region="us-east-1"),
+                ddb_snapshot("res-b", "users", region="us-west-2"),
+            ],
+        )
+
+        result = handler(event, None)
+
+        by_name = {job["resourceName"]: job for job in result["restoreJobs"]}
+        assert by_name["orders"]["s3Bucket"] == "eon-restore-data-222222222222-us-east-1"
+        assert by_name["orders"]["s3Prefix"] == "orders/"
+        assert by_name["users"]["s3Bucket"] == "eon-restore-data-222222222222-us-west-2"
+        assert by_name["users"]["s3Prefix"] == "users/"
+        assert s3["us-east-1"].create_bucket.call_count == 1
+        assert s3["us-west-2"].create_bucket.call_count == 1
+        assert s3["us-west-2"].create_bucket.call_args.kwargs["CreateBucketConfiguration"] == {
+            "LocationConstraint": "us-west-2"
+        }
+        for regional in s3.values():
+            regional.put_object.assert_not_called()
+        assert len(client.calls_to("restore_dynamodb_to_s3")) == 2
+
+    def test_a_repeated_table_name_in_one_bucket_is_disambiguated(self, wiring, monkeypatch):
+        wiring(restore_dynamodb_to_s3="job-s3")
+        self._capture_s3(monkeypatch)
+        event = dict(
+            BASE_EVENT,
+            dynamodbRestoreMethod="snapshot",
+            resourceSnapshots=[
+                ddb_snapshot("res-a", "orders", region="us-east-1"),
+                ddb_snapshot("res-b", "orders", region="eu-west-1"),
+            ],
+        )
+
+        result = handler(event, None)
+
+        prefixes = [job["s3Prefix"] for job in result["restoreJobs"]]
+        assert prefixes == ["orders/", "orders-res-b/"]
+        assert {job["s3Bucket"] for job in result["restoreJobs"]} == {
+            "eon-restore-data-222222222222-us-east-1"
+        }
+
+    def test_a_recovery_stack_match_does_not_restore_in_place(self, wiring, monkeypatch):
+        client = wiring(restore_dynamodb_to_s3="job-s3")
+        self._capture_s3(monkeypatch)
+        monkeypatch.setattr(
+            ir,
+            "discover_dynamodb_tables_from_stacks",
+            lambda **kwargs: {
+                "orders": {
+                    "tableName": "orders",
+                    "region": "us-east-1",
+                    "regions": ["us-east-1"],
+                    "stackName": "OrdersStack",
+                }
+            },
+        )
+        monkeypatch.setattr(ir, "discover_s3_buckets_from_stacks", lambda **kwargs: {})
+
+        def fail_scale(**kwargs):
+            raise AssertionError("snapshot export must not scale WCU")
+
+        monkeypatch.setattr(ir, "_scale_up_dynamodb_table_wcu", fail_scale)
+        event = dict(
+            BASE_EVENT,
+            dynamodbRestoreMethod="snapshot",
+            recoveryStackNames=["OrdersStack"],
+            resourceSnapshots=[ddb_snapshot()],
+        )
+
+        result = handler(event, None)
+
+        assert client.calls_to("restore_dynamodb_to_existing_table") == []
+        assert client.calls_to("check_dynamodb_import_availability") == []
+        job = result["restoreJobs"][0]
+        assert job["restoreType"] == "SNAPSHOT_TO_S3"
+        assert job["s3Prefix"] == "orders/"
+        assert "writeCapacityUnits" not in job

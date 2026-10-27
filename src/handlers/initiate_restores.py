@@ -32,11 +32,18 @@ RESTORE_METHOD_CAPACITY_BASED = "RESTORE_METHOD_CAPACITY_BASED"
 DYNAMODB_RESTORE_METHOD_AUTO = "auto"
 DYNAMODB_RESTORE_METHOD_IMPORT = "import"
 DYNAMODB_RESTORE_METHOD_CAPACITY = "capacity"
+DYNAMODB_RESTORE_METHOD_SNAPSHOT = "snapshot"
 DYNAMODB_RESTORE_METHOD_CHOICES = (
     DYNAMODB_RESTORE_METHOD_AUTO,
     DYNAMODB_RESTORE_METHOD_IMPORT,
     DYNAMODB_RESTORE_METHOD_CAPACITY,
+    DYNAMODB_RESTORE_METHOD_SNAPSHOT,
 )
+
+# Snapshot exports land in one bucket per restore account and region.
+# Eon writes DynamoDB JSON under a per-table prefix; this role only creates the bucket.
+SNAPSHOT_EXPORT_BUCKET_PREFIX = "eon-restore-data"
+SNAPSHOT_EXPORT_OUTPUT_FORMAT = "DYNAMODB_JSON"
 
 # ImportTable needs restore-account role 1.8.1 or newer (it grants the
 # dynamodb:ImportTable and S3 access-point permissions the import path uses).
@@ -315,7 +322,7 @@ def plan_dynamodb_restore_methods(
         eon_client: Authenticated Eon client
         dynamodb_candidates: New-table DynamoDB restores, each with resourceId,
             resourceName, restoredName and region (the region it is restored into)
-        requested_method: One of DYNAMODB_RESTORE_METHOD_CHOICES
+        requested_method: "auto", "import", or "capacity". Snapshot exports never reach this function.
         eon_restore_account_id: Eon-assigned restore account ID
         restore_account_id: AWS account ID of the restore account
 
@@ -1134,6 +1141,9 @@ class _RestoreContext:
     dynamodb_restore_methods: Dict[str, Dict[str, Any]]
     dynamodb_warm_throughput: bool
     s3_in_place_tag_key: str
+    dynamodb_snapshot_export: bool = False
+    snapshot_export_buckets_ready: set = field(default_factory=set)
+    snapshot_export_prefixes: Dict[str, set] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -1551,11 +1561,153 @@ def _restore_s3_new_bucket(
     return job_id, restored_resource_details
 
 
+def snapshot_export_bucket_name(restore_account_id: str, region: str) -> str:
+    """Bucket that receives a region's DynamoDB snapshot export."""
+    return f"{SNAPSHOT_EXPORT_BUCKET_PREFIX}-{restore_account_id}-{region}"
+
+
+def snapshot_export_prefix(table_name: str, resource_id: str, used_prefixes: set) -> str:
+    """
+    Prefix Eon writes under. The first table keeps ``{tableName}/``. A later table
+    with the same name in the same bucket (two source regions collapsed into one
+    restore region) gets ``{tableName}-{resourceId}/``.
+    """
+    prefix = f"{table_name}/"
+    if prefix in used_prefixes:
+        prefix = f"{table_name}-{resource_id}/"
+    used_prefixes.add(prefix)
+    return prefix
+
+
+def ensure_snapshot_export_bucket(
+    bucket_name: str,
+    region: str,
+    credentials: Optional[Dict[str, str]],
+) -> None:
+    """
+    Create the snapshot-export bucket, or reuse it when this account already owns it.
+
+    Encryption is SSE-S3 so Eon's restore role can write objects without a KMS
+    grant. Public access is blocked. This role does not write the prefix; Eon does.
+    """
+    s3_client = create_boto3_client("s3", region, credentials)
+
+    try:
+        if region == "us-east-1":
+            s3_client.create_bucket(Bucket=bucket_name)
+        else:
+            s3_client.create_bucket(
+                Bucket=bucket_name,
+                CreateBucketConfiguration={"LocationConstraint": region},
+            )
+        print(f"Created S3 bucket: {bucket_name}")
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        if code == "BucketAlreadyOwnedByYou":
+            print(f"S3 bucket {bucket_name} already exists")
+        elif code == "BucketAlreadyExists":
+            raise ValueError(
+                f"S3 bucket {bucket_name} is already owned by another account"
+            ) from e
+        else:
+            raise
+
+    s3_client.put_bucket_encryption(
+        Bucket=bucket_name,
+        ServerSideEncryptionConfiguration={
+            "Rules": [
+                {
+                    "ApplyServerSideEncryptionByDefault": {
+                        "SSEAlgorithm": "AES256",
+                    }
+                }
+            ]
+        },
+    )
+    s3_client.put_public_access_block(
+        Bucket=bucket_name,
+        PublicAccessBlockConfiguration={
+            "BlockPublicAcls": True,
+            "IgnorePublicAcls": True,
+            "BlockPublicPolicy": True,
+            "RestrictPublicBuckets": True,
+        },
+    )
+    s3_client.put_bucket_tagging(
+        Bucket=bucket_name,
+        Tagging={
+            "TagSet": [
+                {"Key": "ManagedBy", "Value": "EonBulkRecovery"},
+                {"Key": "Purpose", "Value": "DynamoDBSnapshotRestore"},
+            ]
+        },
+    )
+
+
+def _prepare_snapshot_export_bucket(ctx: _RestoreContext, region: str) -> str:
+    """Create the region's export bucket once per execution."""
+    bucket_name = snapshot_export_bucket_name(ctx.restore_account_id, region)
+    if bucket_name not in ctx.snapshot_export_buckets_ready:
+        ensure_snapshot_export_bucket(bucket_name, region, ctx.restore_account_credentials)
+        ctx.snapshot_export_buckets_ready.add(bucket_name)
+    return bucket_name
+
+
+def _restore_dynamodb_snapshot(
+    ctx: _RestoreContext,
+    resource_snapshot: Dict[str, Any],
+    target_region: Optional[str],
+) -> Optional[Tuple[str, dict]]:
+    """Export a DynamoDB snapshot to S3 instead of rebuilding the table."""
+    resource_id = resource_snapshot["resourceId"]
+    resource_name = resource_snapshot["resourceName"]
+    snapshot_id = resource_snapshot["snapshotId"]
+    source_region = resource_snapshot.get("region")
+
+    actual_region = resolve_target_region(target_region, ctx.vpc_configs_by_region, resource_name)
+
+    # recoveryStacksOnly still decides which tables are in scope. A stack match
+    # does not switch this path to an in-place table restore.
+    if ctx.recovery_stacks_only:
+        matched_stack_table = None
+        if ctx.recovery_stack_tables:
+            matched_stack_table = stack_table_match(ctx.recovery_stack_tables, resource_name, source_region)
+        if not matched_stack_table:
+            print(f"SKIPPING {resource_name} (DynamoDB) - recoveryStacksOnly mode, no matching stack table")
+            return None
+
+    bucket_name = _prepare_snapshot_export_bucket(ctx, actual_region)
+    used_prefixes = ctx.snapshot_export_prefixes.setdefault(bucket_name, set())
+    prefix = snapshot_export_prefix(resource_name, resource_id, used_prefixes)
+
+    print(f"DynamoDB snapshot export - region: {actual_region}, bucket: {bucket_name}, prefix: {prefix}")
+
+    job_id = ctx.eon_client.restore_dynamodb_to_s3(
+        resource_id=resource_id,
+        snapshot_id=snapshot_id,
+        restore_account_id=ctx.eon_restore_account_id,
+        region=actual_region,
+        s3_bucket=bucket_name,
+        s3_prefix=prefix,
+    )
+
+    return job_id, {
+        "restoredRegion": actual_region,
+        "restoreType": "SNAPSHOT_TO_S3",
+        "restoreMethod": DYNAMODB_RESTORE_METHOD_SNAPSHOT,
+        "s3Bucket": bucket_name,
+        "s3Prefix": prefix,
+    }
+
+
 def _initiate_dynamodb_restore(
     ctx: _RestoreContext,
     resource_snapshot: Dict[str, Any],
     target_region: Optional[str],
 ) -> Optional[Tuple[str, dict]]:
+    if ctx.dynamodb_snapshot_export:
+        return _restore_dynamodb_snapshot(ctx, resource_snapshot, target_region)
+
     resource_name = resource_snapshot["resourceName"]
     source_region = resource_snapshot.get("region")
 
@@ -1766,9 +1918,10 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         rdsSubnetGroupsByRegion: Dictionary mapping region to RDS subnet group name
         dynamodbRegionalWcuLimit: Regional WCU limit per region for DynamoDB (default 40000)
         dynamodbTableWcuMax: Max WCU any single table can receive (default 40000)
-        dynamodbRestoreMethod: How new DynamoDB tables are rebuilt — "auto" (default,
+        dynamodbRestoreMethod: How DynamoDB tables are restored — "auto" (default,
             ImportTable where the snapshot and restore account allow it, capacity-based
-            otherwise), "import" (force ImportTable), or "capacity" (force the write path)
+            otherwise), "import" (force ImportTable), "capacity" (force the write path),
+            or "snapshot" (export DynamoDB JSON to S3 instead of rebuilding a table)
         vpcConfigs: VPC configurations for the restore
         crossAccountRoleArn: ARN of cross-account role (optional)
         excludeEC2TagKeys: List of tag keys to exclude from EC2 instance tags (optional)
@@ -1912,37 +2065,47 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         print(f"DynamoDB: skipped {skipped_non_stack} tables not matching recovery stacks (recoveryStacksOnly mode)")
 
     # ---- Choose a restore method per new table ----
-    dynamodb_restore_methods = plan_dynamodb_restore_methods(
-        eon_client=eon_client,
-        dynamodb_candidates=[table for table in dynamodb_in_scope if not table["inPlace"]],
-        requested_method=dynamodb_restore_method,
-        eon_restore_account_id=eon_restore_account_id,
-        restore_account_id=restore_account_id,
-    )
+    # Snapshot exports write DynamoDB JSON to S3. They do not rebuild a table,
+    # so import planning and the WCU budget do not apply.
+    if dynamodb_restore_method == DYNAMODB_RESTORE_METHOD_SNAPSHOT:
+        table_count = sum(
+            1 for snapshot in resource_snapshots if snapshot.get("resourceType") == "AWS_DYNAMO_DB"
+        )
+        print(f"\nDynamoDB restore method: snapshot export to S3 for {table_count} tables")
+        dynamodb_restore_methods = {}
+        dynamodb_wcu_allocation = {}
+    else:
+        dynamodb_restore_methods = plan_dynamodb_restore_methods(
+            eon_client=eon_client,
+            dynamodb_candidates=[table for table in dynamodb_in_scope if not table["inPlace"]],
+            requested_method=dynamodb_restore_method,
+            eon_restore_account_id=eon_restore_account_id,
+            restore_account_id=restore_account_id,
+        )
 
-    # ---- Pre-compute DynamoDB WCU allocation ----
-    # ImportTable restores create the table from staged S3 data and never touch
-    # the account's write capacity, so they are left out of the budget — including
-    # them would starve the tables that do write through the DynamoDB API.
-    dynamodb_tables_by_region: Dict[str, List[Dict[str, Any]]] = {}
-    for table in dynamodb_in_scope:
-        planned = dynamodb_restore_methods.get(table["resourceId"], {})
-        if planned.get("method") == RESTORE_METHOD_IMPORT_TABLE:
-            continue
+        # ---- Pre-compute DynamoDB WCU allocation ----
+        # ImportTable restores create the table from staged S3 data and never touch
+        # the account's write capacity, so they are left out of the budget — including
+        # them would starve the tables that do write through the DynamoDB API.
+        dynamodb_tables_by_region: Dict[str, List[Dict[str, Any]]] = {}
+        for table in dynamodb_in_scope:
+            planned = dynamodb_restore_methods.get(table["resourceId"], {})
+            if planned.get("method") == RESTORE_METHOD_IMPORT_TABLE:
+                continue
 
-        dynamodb_tables_by_region.setdefault(table["region"], []).append({
-            "resourceId": table["resourceId"],
-            "resourceName": table["resourceName"],
-            "sizeBytes": table["sizeBytes"],
-        })
+            dynamodb_tables_by_region.setdefault(table["region"], []).append({
+                "resourceId": table["resourceId"],
+                "resourceName": table["resourceName"],
+                "sizeBytes": table["sizeBytes"],
+            })
 
-    dynamodb_wcu_allocation = calculate_dynamodb_wcu_allocation_by_region(
-        dynamodb_tables_by_region=dynamodb_tables_by_region,
-        regional_wcu_capacity=dynamodb_regional_wcu_limit,
-        utilization_percentage=0.95,
-        default_wcu_for_zero_size=0,
-        table_wcu_max=dynamodb_table_wcu_max,
-    )
+        dynamodb_wcu_allocation = calculate_dynamodb_wcu_allocation_by_region(
+            dynamodb_tables_by_region=dynamodb_tables_by_region,
+            regional_wcu_capacity=dynamodb_regional_wcu_limit,
+            utilization_percentage=0.95,
+            default_wcu_for_zero_size=0,
+            table_wcu_max=dynamodb_table_wcu_max,
+        )
 
     # ---- Build shared context ----
     ctx = _RestoreContext(
@@ -1963,6 +2126,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         dynamodb_restore_methods=dynamodb_restore_methods,
         dynamodb_warm_throughput=dynamodb_warm_throughput,
         s3_in_place_tag_key=s3_in_place_tag_key,
+        dynamodb_snapshot_export=dynamodb_restore_method == DYNAMODB_RESTORE_METHOD_SNAPSHOT,
     )
 
     # ---- Initiate restores ----

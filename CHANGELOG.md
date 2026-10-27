@@ -5,6 +5,25 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **`dynamodbRestoreMethod: "snapshot"`.** Exports each in-scope DynamoDB table to S3
+  as DynamoDB JSON via Eon's `restore-dynamodb-to-s3` endpoint, instead of rebuilding
+  a table. The workflow creates `eon-restore-data-<accountId>-<region>` in the restore
+  account (one bucket per restore region) and tells Eon the `{tableName}/` prefix.
+  Eon writes the objects. Select tables with `resourceIds`.
+
+### Changed
+
+- **The cross-account role can block public access on snapshot-export buckets.**
+  Redeploy `cross-account-role.yaml` (or the StackSet) before a snapshot run that
+  uses the custom role. Accounts reached through `OrganizationAccountAccessRole` or
+  `AWSControlTowerExecution` already have this access. `EonRestoreAccountRole` must
+  allow `s3:PutObject`, `s3:GetObject`, and `s3:ListBucket` on the bucket; that grant
+  is expected to exist already because the same role writes ordinary restore buckets.
+
 ## [1.3.0.cfa] 2026-10-27
 
 ### Added

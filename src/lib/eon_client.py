@@ -510,6 +510,46 @@ class EonClient:
         self._handle_response(response, "POST", url, payload)
         return response.json().get("jobId")
 
+    def restore_dynamodb_to_s3(
+        self,
+        resource_id: str,
+        snapshot_id: str,
+        restore_account_id: str,
+        region: str,
+        s3_bucket: str,
+        s3_prefix: str,
+    ) -> str:
+        """
+        Export a DynamoDB snapshot to S3 as DynamoDB JSON.
+
+        Eon writes the objects under ``s3_prefix``. The destination bucket must
+        already exist, and the restore account's role must allow ``s3:PutObject``,
+        ``s3:GetObject``, and ``s3:ListBucket`` on it.
+
+        Args:
+            resource_id: Eon-assigned resource ID
+            snapshot_id: Snapshot ID to export
+            restore_account_id: Eon-assigned restore account ID
+            region: Region of the destination bucket
+            s3_bucket: Destination bucket name
+            s3_prefix: Key prefix Eon writes under, including the trailing slash
+
+        Returns:
+            Job ID for the restore operation
+        """
+        url = f"{self.base_url}/projects/{self.project_id}/resources/{resource_id}/snapshots/{snapshot_id}/restore-dynamodb-to-s3"
+        payload = {
+            "restoreAccountId": restore_account_id,
+            "region": region,
+            "s3Bucket": s3_bucket,
+            "s3Prefix": s3_prefix,
+            "outputFormat": "DYNAMODB_JSON",
+        }
+
+        response = requests.post(url, json=payload, headers=self._get_headers())
+        self._handle_response(response, "POST", url, payload)
+        return response.json().get("jobId")
+
     def list_restore_accounts(
         self,
         provider_account_id: Optional[str] = None,

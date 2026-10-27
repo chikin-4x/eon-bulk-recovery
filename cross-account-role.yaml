@@ -21,14 +21,19 @@ Description: >-
 #                         EonRestore* IAM roles/policies), create per-region KMS
 #                         keys, create RDS DB subnet groups
 #   * initiate_restores-> discover recovery-stack tables/buckets, create new S3
-#                         destination buckets, validate EC2 instance-type /
-#                         RDS instance-class availability, scale DynamoDB WCU
+#                         destination buckets (including the DynamoDB snapshot
+#                         export bucket eon-restore-data-<accountId>-<region>),
+#                         validate EC2 instance-type / RDS instance-class
+#                         availability, scale DynamoDB WCU
 #   * monitor_jobs     -> set DynamoDB warm throughput, restore original WCU
 #
 # The actual data restore (ec2:RunInstances, rds:RestoreDB*, writing S3 objects,
-# DynamoDB ImportTable/BatchWriteItem, etc.) is performed by Eon's own
-# EonRestoreAccountRole / EonRestoreNodeRole — created by the bootstrap stack —
-# NOT by this role. That is why this role needs no data-plane restore permissions.
+# DynamoDB ImportTable/BatchWriteItem, DynamoDB snapshot export objects, etc.)
+# is performed by Eon's own EonRestoreAccountRole / EonRestoreNodeRole — created
+# by the bootstrap stack — NOT by this role. That is why this role needs no
+# data-plane restore permissions. A snapshot export requires that restore role
+# to allow s3:PutObject, s3:GetObject, and s3:ListBucket on the export bucket;
+# Eon's docs indicate that grant may already be present.
 # ---------------------------------------------------------------------------
 
 Metadata:
@@ -302,6 +307,17 @@ Resources:
                   - s3:GetBucketTagging              # recovery-stack bucket matching
                 Resource:
                   - !Sub 'arn:${AWS::Partition}:s3:::*'
+
+              # Snapshot DynamoDB exports land in eon-restore-data-<accountId>-<region>.
+              # This role creates the bucket (CreateBucket is above) and blocks
+              # public access. Eon writes the objects via EonRestoreAccountRole,
+              # so PutObject / GetObject / ListBucket are not granted here.
+              - Sid: DynamoDbSnapshotExportBuckets
+                Effect: Allow
+                Action:
+                  - s3:PutBucketPublicAccessBlock
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::eon-restore-data-${AWS::AccountId}-*'
 
               # -------------------------------------------------------------
               # EC2 — initiate picks a subnet whose AZ supports the source

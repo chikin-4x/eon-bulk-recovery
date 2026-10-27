@@ -3,6 +3,7 @@
 from unittest.mock import MagicMock
 
 import pytest
+from botocore.exceptions import ClientError
 
 from handlers import initiate_restores as ir
 from handlers.initiate_restores import (
@@ -784,3 +785,188 @@ class TestDispatch:
 
         with pytest.raises(ValueError, match="No KMS key available"):
             _initiate_dynamodb_restore(ctx, SNAPSHOT, "us-east-1")
+
+
+def s3_error(code):
+    return ClientError({"Error": {"Code": code, "Message": code}}, "CreateBucket")
+
+
+class TestSnapshotExportBucket:
+    BUCKET = "eon-restore-data-222222222222-us-east-1"
+
+    def _s3(self, monkeypatch):
+        client = MagicMock()
+        monkeypatch.setattr(ir, "create_boto3_client", lambda *args, **kwargs: client)
+        return client
+
+    def test_us_east_1_omits_the_location_constraint(self, monkeypatch):
+        s3 = self._s3(monkeypatch)
+
+        ir.ensure_snapshot_export_bucket(self.BUCKET, "us-east-1", CREDS)
+
+        s3.create_bucket.assert_called_once_with(Bucket=self.BUCKET)
+        algorithm = s3.put_bucket_encryption.call_args.kwargs["ServerSideEncryptionConfiguration"]
+        assert algorithm["Rules"][0]["ApplyServerSideEncryptionByDefault"]["SSEAlgorithm"] == "AES256"
+        assert s3.put_public_access_block.call_args.kwargs["PublicAccessBlockConfiguration"] == {
+            "BlockPublicAcls": True,
+            "IgnorePublicAcls": True,
+            "BlockPublicPolicy": True,
+            "RestrictPublicBuckets": True,
+        }
+        tags = {
+            tag["Key"]: tag["Value"]
+            for tag in s3.put_bucket_tagging.call_args.kwargs["Tagging"]["TagSet"]
+        }
+        assert tags == {"ManagedBy": "EonBulkRecovery", "Purpose": "DynamoDBSnapshotRestore"}
+        s3.put_object.assert_not_called()
+
+    def test_another_region_sends_the_location_constraint(self, monkeypatch):
+        s3 = self._s3(monkeypatch)
+
+        ir.ensure_snapshot_export_bucket(
+            "eon-restore-data-222222222222-eu-west-1", "eu-west-1", CREDS
+        )
+
+        assert s3.create_bucket.call_args.kwargs["CreateBucketConfiguration"] == {
+            "LocationConstraint": "eu-west-1"
+        }
+
+    def test_an_existing_bucket_is_reused_and_still_locked_down(self, monkeypatch):
+        s3 = self._s3(monkeypatch)
+        s3.create_bucket.side_effect = s3_error("BucketAlreadyOwnedByYou")
+
+        ir.ensure_snapshot_export_bucket(self.BUCKET, "us-east-1", CREDS)
+
+        s3.put_bucket_encryption.assert_called_once()
+        s3.put_public_access_block.assert_called_once()
+        s3.put_object.assert_not_called()
+
+    def test_a_bucket_owned_by_another_account_fails_before_configuration(self, monkeypatch):
+        s3 = self._s3(monkeypatch)
+        s3.create_bucket.side_effect = s3_error("BucketAlreadyExists")
+
+        with pytest.raises(ValueError, match="already owned by another account"):
+            ir.ensure_snapshot_export_bucket(self.BUCKET, "us-east-1", CREDS)
+
+        s3.put_bucket_encryption.assert_not_called()
+
+    def test_another_create_error_propagates(self, monkeypatch):
+        s3 = self._s3(monkeypatch)
+        s3.create_bucket.side_effect = s3_error("AccessDenied")
+
+        with pytest.raises(ClientError):
+            ir.ensure_snapshot_export_bucket(self.BUCKET, "us-east-1", CREDS)
+
+        s3.put_public_access_block.assert_not_called()
+
+
+class TestSnapshotExport:
+    def _s3(self, monkeypatch):
+        clients = {}
+
+        def create(service, region, credentials=None):
+            return clients.setdefault(region, MagicMock())
+
+        monkeypatch.setattr(ir, "create_boto3_client", create)
+        return clients
+
+    def test_the_first_prefix_is_the_table_name(self):
+        used = set()
+
+        assert ir.snapshot_export_prefix("orders", "res-1", used) == "orders/"
+        assert ir.snapshot_export_prefix("users", "res-2", used) == "users/"
+
+    def test_a_repeated_name_is_disambiguated_by_resource_id(self):
+        used = set()
+
+        assert ir.snapshot_export_prefix("orders", "res-1", used) == "orders/"
+        assert ir.snapshot_export_prefix("orders", "res-2", used) == "orders-res-2/"
+
+    def test_exports_to_s3_without_writing_the_prefix(
+        self, restore_context, fake_eon_client, monkeypatch
+    ):
+        s3 = self._s3(monkeypatch)
+        client = fake_eon_client(restore_dynamodb_to_s3="job-s3")
+        ctx = restore_context(eon_client=client, dynamodb_snapshot_export=True)
+
+        job_id, details = ir._restore_dynamodb_snapshot(ctx, SNAPSHOT, "us-east-1")
+
+        assert job_id == "job-s3"
+        assert details["s3Prefix"] == "orders/"
+        assert details["restoreMethod"] == "snapshot"
+        assert "writeCapacityUnits" not in details
+        assert "warmThroughputTarget" not in details
+        s3["us-east-1"].put_object.assert_not_called()
+        assert client.calls_to("restore_dynamodb_table") == []
+
+    def test_a_second_table_in_the_region_reuses_the_bucket(
+        self, restore_context, fake_eon_client, monkeypatch
+    ):
+        s3 = self._s3(monkeypatch)
+        client = fake_eon_client(restore_dynamodb_to_s3="job-s3")
+        ctx = restore_context(eon_client=client, dynamodb_snapshot_export=True)
+        second = dict(SNAPSHOT, resourceId="res-2", resourceName="users", snapshotId="snap-2")
+
+        ir._restore_dynamodb_snapshot(ctx, SNAPSHOT, "us-east-1")
+        ir._restore_dynamodb_snapshot(ctx, second, "us-east-1")
+
+        assert s3["us-east-1"].create_bucket.call_count == 1
+        prefixes = [call["s3_prefix"] for call in client.calls_to("restore_dynamodb_to_s3")]
+        assert prefixes == ["orders/", "users/"]
+
+    def test_a_stack_match_still_exports(self, restore_context, fake_eon_client, monkeypatch):
+        self._s3(monkeypatch)
+        client = fake_eon_client(restore_dynamodb_to_s3="job-s3")
+        ctx = restore_context(
+            eon_client=client,
+            dynamodb_snapshot_export=True,
+            recovery_stack_tables={
+                "orders": {"tableName": "orders", "region": "us-east-1", "regions": ["us-east-1"]}
+            },
+        )
+
+        def fail_scale(**kwargs):
+            raise AssertionError("snapshot export must not scale WCU")
+
+        monkeypatch.setattr(ir, "_scale_up_dynamodb_table_wcu", fail_scale)
+
+        _, details = _initiate_dynamodb_restore(ctx, SNAPSHOT, "us-east-1")
+
+        assert details["restoreType"] == "SNAPSHOT_TO_S3"
+        assert client.calls_to("restore_dynamodb_to_existing_table") == []
+
+    def test_stacks_only_skips_an_unmatched_table_before_creating_a_bucket(
+        self, restore_context, fake_eon_client, monkeypatch, capsys
+    ):
+        s3 = self._s3(monkeypatch)
+        client = fake_eon_client(restore_dynamodb_to_s3="job-s3")
+        ctx = restore_context(
+            eon_client=client,
+            dynamodb_snapshot_export=True,
+            recovery_stacks_only=True,
+        )
+
+        assert _initiate_dynamodb_restore(ctx, SNAPSHOT, "us-east-1") is None
+
+        assert s3 == {}
+        assert client.calls == []
+        assert "recoveryStacksOnly mode, no matching stack table" in capsys.readouterr().out
+
+    def test_stacks_only_with_a_match_still_exports(
+        self, restore_context, fake_eon_client, monkeypatch
+    ):
+        self._s3(monkeypatch)
+        client = fake_eon_client(restore_dynamodb_to_s3="job-s3")
+        ctx = restore_context(
+            eon_client=client,
+            dynamodb_snapshot_export=True,
+            recovery_stacks_only=True,
+            recovery_stack_tables={
+                "orders": {"tableName": "orders", "region": "us-east-1", "regions": ["us-east-1"]}
+            },
+        )
+
+        _, details = _initiate_dynamodb_restore(ctx, SNAPSHOT, "us-east-1")
+
+        assert details["s3Prefix"] == "orders/"
+        assert client.calls_to("restore_dynamodb_to_s3")

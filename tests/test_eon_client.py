@@ -425,6 +425,31 @@ class TestRestoreDynamoDBToExistingTable:
         )
 
 
+class TestRestoreDynamoDBToS3:
+    def test_posts_the_flat_export_body(self, client, token):
+        url = f"{API_V1}/projects/{EON_PROJECT_ID}/resources/{RESOURCE_ID}/snapshots/{SNAPSHOT_ID}/restore-dynamodb-to-s3"
+        token.post(url, json={"jobId": "job-s3"})
+
+        job_id = client.restore_dynamodb_to_s3(
+            resource_id=RESOURCE_ID,
+            snapshot_id=SNAPSHOT_ID,
+            restore_account_id=RESTORE_ACCOUNT_ID,
+            region="us-east-1",
+            s3_bucket="eon-restore-data-222222222222-us-east-1",
+            s3_prefix="orders/",
+        )
+
+        assert job_id == "job-s3"
+        assert token.calls[-1].request.url == url
+        assert last_body(token) == {
+            "restoreAccountId": RESTORE_ACCOUNT_ID,
+            "region": "us-east-1",
+            "s3Bucket": "eon-restore-data-222222222222-us-east-1",
+            "s3Prefix": "orders/",
+            "outputFormat": "DYNAMODB_JSON",
+        }
+
+
 class TestCheckDynamoDBImportAvailability:
     """
     The availability endpoint is not under /v1 (see openapi-index.yaml), which is

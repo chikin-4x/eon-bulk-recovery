@@ -571,3 +571,10 @@ class TestWorkflowContract:
                 "ec2:DescribeSecurityGroups",
             ):
                 assert action in text
+
+    def test_both_role_templates_can_block_public_access_on_snapshot_buckets(self):
+        for name in ("cross-account-role.yaml", "cross-account-role-stackset.yaml"):
+            text = (ROOT / name).read_text()
+            assert "Sid: DynamoDbSnapshotExportBuckets" in text
+            assert "s3:PutBucketPublicAccessBlock" in text
+            assert "eon-restore-data-${AWS::AccountId}-*" in text

@@ -578,6 +578,24 @@ class TestCompletionNotification:
         assert "Restore Method: capacity-based" in message
         assert "Write Capacity Units: 28,500" in message
 
+    def test_a_snapshot_export_reports_the_bucket_and_prefix(self, sns):
+        jobs = [
+            job(
+                restoreMethod="snapshot",
+                restoredName=None,
+                s3Bucket="eon-restore-data-222222222222-us-east-1",
+                s3Prefix="orders/",
+            )
+        ]
+
+        send_completion_notification(summary(restoreJobs=jobs), timeout=False)
+
+        message = published(sns)["Message"]
+        assert "Restore Method: snapshot export to S3" in message
+        assert "S3 Bucket: eon-restore-data-222222222222-us-east-1" in message
+        assert "S3 Prefix: orders/" in message
+        assert "Write Capacity Units" not in message
+
     def test_an_unknown_method_value_is_printed_as_is(self, sns):
         jobs = [job(restoreMethod="RESTORE_METHOD_SOMETHING_NEW")]
 
