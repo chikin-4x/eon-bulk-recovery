@@ -179,7 +179,8 @@ class EonClient:
         page_size: int = 100,
         resource_types: Optional[List[str]] = None,
         resource_ids: Optional[List[str]] = None,
-        provider_resource_ids: Optional[List[str]] = None
+        provider_resource_ids: Optional[List[str]] = None,
+        resource_names: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         List protected resources from a source account.
@@ -192,13 +193,15 @@ class EonClient:
             resource_ids: Restrict to these Eon-assigned resource IDs
             provider_resource_ids: Restrict to these cloud-provider resource IDs
                 (e.g. ["i-0f600a1b15b035105"])
+            resource_names: Restrict to these resource names. A DynamoDB table name
+                is a resource name, not a provider resource ID.
 
         Returns:
             Response containing resources list and pagination info
 
         Note:
-            Filters are combined with AND by the API. Pass either resource_ids or
-            provider_resource_ids in a given call, never both, or the two lists
+            Filters are combined with AND by the API. Pass only one of resource_ids,
+            provider_resource_ids, or resource_names in a given call, or the lists
             will intersect instead of union.
         """
         url = f"{self.base_url}/projects/{self.project_id}/resources"
@@ -245,6 +248,8 @@ class EonClient:
             payload["filters"]["id"] = {"in": list(resource_ids)}
         if provider_resource_ids:
             payload["filters"]["providerResourceId"] = {"in": list(provider_resource_ids)}
+        if resource_names:
+            payload["filters"]["resourceName"] = {"in": list(resource_names)}
 
         response = requests.post(url, json=payload, params=params, headers=self._get_headers())
         self._handle_response(response, "POST", url, payload)

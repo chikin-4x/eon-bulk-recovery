@@ -54,18 +54,21 @@ def build_resource_id_queries(resource_ids: Optional[List[str]]) -> List[Dict[st
     """
     Turn a caller-supplied resource ID list into the API queries that will find them.
 
-    Callers copy IDs from wherever is convenient — the Eon console shows UUIDs, the
-    AWS console shows things like `i-0f600a1b15b035105` or a bucket name — so the
-    input accepts either. Shape alone cannot tell them apart: DynamoDB's
-    `providerResourceId` is itself a UUID. What differs is what each filter accepts.
+    Callers copy identifiers from wherever is convenient — the Eon console shows
+    UUIDs, the AWS console shows things like `i-0f600a1b15b035105`, a bucket name,
+    or a DynamoDB table name. Shape alone cannot route them: DynamoDB's
+    `providerResourceId` is the table's AWS ID, itself a UUID, while the name a
+    person copies is `resourceName`. What differs is what each filter accepts.
 
-    - `providerResourceId` is matched as a plain string, so every supplied ID can
-      go through it safely.
+    - `providerResourceId` is matched as a plain string, so every supplied value
+      can go through it safely.
+    - `resourceName` is also a plain string. A DynamoDB table name only matches
+      here. Every supplied value is queried this way too.
     - `id` is parsed as a UUID server-side and returns HTTP 500 on anything else,
       so only UUID-shaped values may be sent to it.
 
-    Hence: query every ID as a provider ID, and additionally query the UUID-shaped
-    ones as Eon IDs. Results are unioned by the caller.
+    The three queries are separate because the API ANDs filters on one request.
+    Results are unioned by the caller.
     """
     if not resource_ids:
         return []
@@ -86,6 +89,8 @@ def build_resource_id_queries(resource_ids: Optional[List[str]]) -> List[Dict[st
     queries = [{"provider_resource_ids": all_ids}]
     if uuid_ids:
         queries.append({"resource_ids": uuid_ids})
+    # Table names (and any other display name) never match providerResourceId.
+    queries.append({"resource_names": all_ids})
     return queries
 
 
@@ -122,7 +127,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             (default: every supported type)
         resourceIds: Optional list of specific resources to restrict the run to.
             Accepts Eon resource IDs (UUIDs), cloud provider resource IDs
-            (e.g. `i-0f600a1b15b035105`, a bucket or table name), or a mix.
+            (e.g. `i-0f600a1b15b035105`, a bucket name), resource names (a DynamoDB
+            table name), or a mix.
 
     Returns:
         resources: List of protected resources with their details
@@ -178,6 +184,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         for resource in all_resources:
             matched.add(resource.get("id"))
             matched.add(resource.get("providerResourceId"))
+            matched.add(resource.get("resourceName"))
         requested_ids_not_found = [rid for rid in requested_resource_ids if rid not in matched]
         if requested_ids_not_found:
             print(f"WARNING: {len(requested_ids_not_found)} requested resource ID(s) matched no "

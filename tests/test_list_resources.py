@@ -43,22 +43,25 @@ class TestBuildResourceIdQueries:
     def test_no_ids_means_no_queries(self, ids):
         assert build_resource_id_queries(ids) == []
 
-    def test_non_uuid_ids_only_go_to_the_provider_filter(self):
-        assert build_resource_id_queries(["i-0f600a1b15b035105", "my-bucket"]) == [
-            {"provider_resource_ids": ["i-0f600a1b15b035105", "my-bucket"]}
+    def test_non_uuid_ids_go_to_the_provider_and_name_filters(self):
+        assert build_resource_id_queries(["i-0f600a1b15b035105", "orders"]) == [
+            {"provider_resource_ids": ["i-0f600a1b15b035105", "orders"]},
+            {"resource_names": ["i-0f600a1b15b035105", "orders"]},
         ]
 
-    def test_uuid_ids_are_queried_both_ways(self):
+    def test_uuid_ids_are_queried_every_way(self):
         """A DynamoDB providerResourceId is itself a UUID, so shape cannot route it."""
         assert build_resource_id_queries([UUID]) == [
             {"provider_resource_ids": [UUID]},
             {"resource_ids": [UUID]},
+            {"resource_names": [UUID]},
         ]
 
     def test_mixed_input_splits_correctly(self):
-        assert build_resource_id_queries([UUID, "my-bucket"]) == [
-            {"provider_resource_ids": [UUID, "my-bucket"]},
+        assert build_resource_id_queries([UUID, "orders"]) == [
+            {"provider_resource_ids": [UUID, "orders"]},
             {"resource_ids": [UUID]},
+            {"resource_names": [UUID, "orders"]},
         ]
 
     def test_uuid_matching_is_case_insensitive(self):
@@ -66,12 +69,14 @@ class TestBuildResourceIdQueries:
 
     def test_blank_entries_are_dropped(self):
         assert build_resource_id_queries(["  ", "my-bucket", ""]) == [
-            {"provider_resource_ids": ["my-bucket"]}
+            {"provider_resource_ids": ["my-bucket"]},
+            {"resource_names": ["my-bucket"]},
         ]
 
     def test_ids_are_stripped(self):
         assert build_resource_id_queries(["  my-bucket  "]) == [
-            {"provider_resource_ids": ["my-bucket"]}
+            {"provider_resource_ids": ["my-bucket"]},
+            {"resource_names": ["my-bucket"]},
         ]
 
 
@@ -197,18 +202,22 @@ class TestHandler:
     def test_id_scope_unions_the_two_queries(self, eon_credentials, fake_eon_client, patch_eon_client):
         by_provider = {"resources": [resource(id="a", providerResourceId="my-bucket")]}
         by_id = {"resources": [resource(id=UUID, providerResourceId="ddb-table")]}
+        by_name = {"resources": [resource(id="tbl", resourceName="orders", resourceType="AWS_DYNAMO_DB")]}
         client = patch_eon_client(
-            "handlers.list_resources", fake_eon_client(list_resources=[by_provider, by_id])
+            "handlers.list_resources",
+            fake_eon_client(list_resources=[by_provider, by_id, by_name]),
         )
 
         result = list_resources.handler(
-            {"sourceAccountId": "333333333333", "resourceIds": [UUID, "my-bucket"]}, None
+            {"sourceAccountId": "333333333333", "resourceIds": [UUID, "my-bucket", "orders"]}, None
         )
 
-        assert [r["id"] for r in result["resources"]] == ["a", UUID]
+        assert [r["id"] for r in result["resources"]] == ["a", UUID, "tbl"]
         calls = client.calls_to("list_resources")
-        assert calls[0]["provider_resource_ids"] == [UUID, "my-bucket"]
+        assert calls[0]["provider_resource_ids"] == [UUID, "my-bucket", "orders"]
         assert calls[1]["resource_ids"] == [UUID]
+        assert calls[2]["resource_names"] == [UUID, "my-bucket", "orders"]
+        assert result["requestedResourceIdsNotFound"] == []
 
     def test_a_resource_matched_by_both_queries_appears_once(
         self, eon_credentials, fake_eon_client, patch_eon_client
@@ -216,7 +225,7 @@ class TestHandler:
         same = resource(id=UUID, providerResourceId=UUID)
         patch_eon_client(
             "handlers.list_resources",
-            fake_eon_client(list_resources=[{"resources": [same]}, {"resources": [same]}]),
+            fake_eon_client(list_resources=[{"resources": [same]}, {"resources": [same]}, {"resources": [same]}]),
         )
 
         result = list_resources.handler(
@@ -230,7 +239,8 @@ class TestHandler:
     ):
         found = {"resources": [resource(id=UUID, providerResourceId="my-bucket")]}
         patch_eon_client(
-            "handlers.list_resources", fake_eon_client(list_resources=[found, {"resources": []}])
+            "handlers.list_resources",
+            fake_eon_client(list_resources=[found, {"resources": []}, {"resources": []}]),
         )
 
         result = list_resources.handler(
@@ -244,13 +254,44 @@ class TestHandler:
         self, eon_credentials, fake_eon_client, patch_eon_client
     ):
         found = {"resources": [resource(id=OTHER_UUID, providerResourceId="my-bucket")]}
-        patch_eon_client("handlers.list_resources", fake_eon_client(list_resources=[found]))
+        patch_eon_client(
+            "handlers.list_resources",
+            fake_eon_client(list_resources=[found, {"resources": []}]),
+        )
 
         result = list_resources.handler(
             {"sourceAccountId": "333333333333", "resourceIds": ["my-bucket"]}, None
         )
 
         assert result["requestedResourceIdsNotFound"] == []
+
+    def test_a_dynamodb_table_name_matches_when_the_provider_id_does_not(
+        self, eon_credentials, fake_eon_client, patch_eon_client
+    ):
+        """The name is resourceName. providerResourceId is the table's AWS ID."""
+        table = resource(
+            id=OTHER_UUID,
+            resourceName="orders",
+            resourceType="AWS_DYNAMO_DB",
+            providerResourceId=UUID,
+        )
+        client = patch_eon_client(
+            "handlers.list_resources",
+            fake_eon_client(list_resources=[{"resources": []}, {"resources": [table]}]),
+        )
+
+        result = list_resources.handler(
+            {"sourceAccountId": "333333333333", "resourceIds": ["orders", "missing-table"]},
+            None,
+        )
+
+        assert [r["resourceName"] for r in result["resources"]] == ["orders"]
+        assert result["requestedResourceIdsNotFound"] == ["missing-table"]
+        calls = client.calls_to("list_resources")
+        assert calls[0]["provider_resource_ids"] == ["orders", "missing-table"]
+        assert calls[1]["resource_names"] == ["orders", "missing-table"]
+        assert "resource_ids" not in calls[0]
+        assert "resource_ids" not in calls[1]
 
     def test_an_unsupported_type_fails_the_step(
         self, eon_credentials, fake_eon_client, patch_eon_client

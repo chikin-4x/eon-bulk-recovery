@@ -272,13 +272,15 @@ resource and terminates in the `No Snapshots Found` state.
 unrecognised type fails the run at the `List Resources` step rather than quietly
 restoring nothing.
 
-`resourceIds` limits the run to specific resources. It accepts Eon resource IDs
-(the UUIDs shown in the Eon console), cloud provider resource IDs (`i-…`, a
-bucket or table name), or a mix — each is routed to the matching filter and the
-results are unioned. Any ID that matches nothing is logged as a warning, so a
-typo doesn't read as a resource with no backups. Both filters are applied
-server-side by the Eon API, which also keeps the Step Functions payload under its
-256 KB limit on large accounts.
+`resourceIds` limits the run to specific resources. Each value is matched against
+the Eon resource ID (the UUID in the Eon console), the cloud provider resource ID
+(`i-…`, an S3 bucket name, a DynamoDB table's AWS ID), and the resource name, and
+the results are unioned. A DynamoDB table name is the resource name: the table's
+`providerResourceId` is a UUID, so the name only matches the name filter. Any
+value that matches nothing is logged as a warning, so a typo doesn't read as a
+resource with no backups. The filters are applied server-side by the Eon API,
+which also keeps the Step Functions payload under its 256 KB limit on large
+accounts.
 
 **Tag exclusion** — add to the minimal example above:
 ```json
@@ -333,7 +335,7 @@ S3 bucket names are **globally unique** across all AWS accounts worldwide. This 
 | `restoreRegion` | No | Force all resources to this region (null = use source regions) |
 | `snapshotDate` | No | `"latest"` / `null` for each resource's most recent snapshot, or `YYYY-MM-DD` to pin the run to one day |
 | `resourceTypes` | No | Restrict the run to these Eon resource types: `AWS_EC2`, `AWS_RDS`, `AWS_S3`, `AWS_DYNAMO_DB` (default: `[]` = all) |
-| `resourceIds` | No | Restrict the run to specific resources. Accepts Eon resource IDs (UUIDs), provider resource IDs (`i-…`, bucket/table names), or a mix (default: `[]` = all) |
+| `resourceIds` | No | Restrict the run to specific resources. Each value is matched against the Eon resource ID, the provider resource ID (`i-…`, a bucket name, a DynamoDB table's AWS ID), and the resource name (a DynamoDB table name). A mix is fine (default: `[]` = all) |
 | `resourceNamePrefix` | No | Prefix for restored resource names (null = use original names) |
 | `dynamodbRegionalWcuLimit` | No | Total WCU budget per region across all tables (default: 40000). See [DynamoDB WCU Allocation](#dynamodb-wcu-allocation) |
 | `dynamodbTableWcuMax` | No | Max WCU any single table can receive (default: 40000). Caps individual tables when the regional limit is raised |

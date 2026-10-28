@@ -256,6 +256,7 @@ class TestListResources:
         assert body["sorts"] == [{"field": "resourceName", "order": "ASC"}]
         assert "id" not in body["filters"]
         assert "providerResourceId" not in body["filters"]
+        assert "resourceName" not in body["filters"]
 
     def test_scoping_filters_are_applied_server_side(self, client, token):
         token.post(f"{API_V1}/projects/{EON_PROJECT_ID}/resources", json={"resources": []})
@@ -271,6 +272,17 @@ class TestListResources:
         assert filters["resourceType"] == {"in": ["AWS_EC2"]}
         assert filters["id"] == {"in": [RESOURCE_ID]}
         assert filters["providerResourceId"] == {"in": ["i-0f600a1b15b035105"]}
+        assert "resourceName" not in filters
+
+    def test_a_resource_name_filter_is_its_own_field(self, client, token):
+        token.post(f"{API_V1}/projects/{EON_PROJECT_ID}/resources", json={"resources": []})
+
+        client.list_resources(source_account_id="333333333333", resource_names=["orders"])
+
+        filters = last_body(token)["filters"]
+        assert filters["resourceName"] == {"in": ["orders"]}
+        assert "id" not in filters
+        assert "providerResourceId" not in filters
 
     def test_page_token_is_a_query_parameter(self, client, token):
         token.post(f"{API_V1}/projects/{EON_PROJECT_ID}/resources", json={"resources": []})

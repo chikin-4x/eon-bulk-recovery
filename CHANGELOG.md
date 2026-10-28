@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   account (one bucket per restore region) and tells Eon the `{tableName}/` prefix.
   Eon writes the objects. Select tables with `resourceIds`.
 
+### Fixed
+
+- **`resourceIds` matches a resource name.** A DynamoDB table name is `resourceName`,
+  not `providerResourceId` (that field is the table's AWS ID, a UUID), so putting a
+  table name in `resourceIds` matched nothing. Each supplied value is now also
+  queried as a resource name, and the results are unioned with the ID matches.
+
 ### Changed
 
 - **The cross-account role can block public access on snapshot-export buckets.**
