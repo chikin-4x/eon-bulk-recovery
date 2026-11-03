@@ -33,6 +33,34 @@ _RUNNING_STATUSES = {"JOB_PENDING", "JOB_RUNNING"}
 # have its temporarily-elevated WCU rolled back, not left stuck.
 _TERMINAL_STATUSES = _SUCCESS_STATUSES | _PARTIAL_STATUSES | _FAILED_STATUSES | _SKIPPED_STATUSES
 
+
+def _job_exceeded_poll_limit(job: Dict[str, Any], status: str, iteration: int, max_iterations: int) -> bool:
+    """
+    True when this job is still running and has used its own poll budget.
+
+    Jobs that started with the run have no stamp and are measured from iteration 0.
+    A queued snapshot export is stamped with the iteration it entered monitoring,
+    so earlier tables do not consume its 60 hours. A finished job does not time
+    the run out.
+    """
+    if status in _TERMINAL_STATUSES or status == "FAILED_TO_INITIATE":
+        return False
+    started = int(job.get("monitorStartedIteration") or 0)
+    return iteration - started >= max_iterations
+
+
+def _snapshot_export_in_flight(job: Dict[str, Any], status: str) -> bool:
+    """
+    True when this snapshot export has not reached a terminal Eon status.
+
+    A status lookup that fails stays in flight, so a blip cannot start a second
+    export. A job that never received an id is already finished and does not
+    hold the queue.
+    """
+    if job.get("restoreType") != "SNAPSHOT_TO_S3" or not job.get("jobId"):
+        return False
+    return status not in _TERMINAL_STATUSES
+
 # How each DynamoDB restore method reads in the completion notification.
 _DYNAMODB_METHOD_LABELS = {
     "RESTORE_METHOD_IMPORT_TABLE": "ImportTable (import from S3)",
@@ -248,14 +276,20 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         vpcConfigs: VPC configurations used
         crossAccountRoleArn: ARN of cross-account role for DynamoDB WCU restoration (optional)
         startTime: ISO timestamp when monitoring started
+        pendingDynamodbSnapshots: DynamoDB snapshot exports not started yet
+        snapshotExportPrefixes: Prefixes already chosen, keyed by bucket
 
     Returns:
-        allComplete: Boolean indicating if all jobs are complete
+        allComplete: True when nothing is running and the snapshot queue is empty
+        startNextSnapshot: True when the queue has another export and none is in flight
+        timedOut: True when an in-flight job has used its own poll budget
         jobStatuses: Current status of all jobs
         completedJobs: Count of completed jobs
         failedJobs: Count of failed jobs
         runningJobs: Count of still-running jobs
         iteration: Incremented iteration count
+        pendingDynamodbSnapshots: The queue, unchanged
+        snapshotExportPrefixes: The prefix map, unchanged
     """
     restore_jobs = event["restoreJobs"]
     iteration = event.get("iteration", 0)
@@ -293,7 +327,15 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         except Exception as e:
             print(f"WARNING: Could not obtain cross-account credentials for WCU restoration: {e}")
 
+    pending_dynamodb_snapshots = list(event.get("pendingDynamodbSnapshots") or [])
+    snapshot_export_prefixes = event.get("snapshotExportPrefixes") or {}
+
     print(f"Monitoring {len(restore_jobs)} restore jobs (iteration {iteration})")
+    if pending_dynamodb_snapshots:
+        print(
+            f"{len(pending_dynamodb_snapshots)} DynamoDB snapshot export(s) "
+            f"waiting for the in-flight export to finish"
+        )
 
     # Track job statuses
     completed_count = 0
@@ -305,6 +347,8 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     wcu_restoration_failures = list(event.get("wcuRestorationFailures", []))
 
     job_statuses = []
+    in_flight_snapshot = False
+    timed_out = False
 
     for job in restore_jobs:
         job_id = job.get("jobId")
@@ -326,6 +370,12 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 "resourceType": job.get("resourceType"),
                 "currentStatus": "FAILED_TO_INITIATE"
             })
+            timed_out = timed_out or _job_exceeded_poll_limit(
+                job, "FAILED_TO_INITIATE", iteration, max_iterations
+            )
+            in_flight_snapshot = in_flight_snapshot or _snapshot_export_in_flight(
+                job, "FAILED_TO_INITIATE"
+            )
             continue
 
         try:
@@ -400,6 +450,10 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
             job_statuses.append(job_status_record)
 
             print(f"Job {job_id} ({job.get('resourceName')}): {status}")
+            timed_out = timed_out or _job_exceeded_poll_limit(
+                job, status, iteration, max_iterations
+            )
+            in_flight_snapshot = in_flight_snapshot or _snapshot_export_in_flight(job, status)
 
         except Exception as e:
             print(f"ERROR: Failed to get status for job {job_id}: {str(e)}")
@@ -413,9 +467,20 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 "currentStatus": "ERROR_CHECKING_STATUS",
                 "statusMessage": str(e)
             })
+            timed_out = timed_out or _job_exceeded_poll_limit(
+                job, "ERROR_CHECKING_STATUS", iteration, max_iterations
+            )
+            # A failed lookup is not a finished export. Hold the queue.
+            in_flight_snapshot = in_flight_snapshot or _snapshot_export_in_flight(
+                job, "ERROR_CHECKING_STATUS"
+            )
 
-    all_complete = (running_count == 0)
-    timed_out = iteration >= max_iterations
+    # The queue is part of the run. Completion waits until it is empty, and the
+    # poll budget belongs to each in-flight job rather than to the whole chain.
+    all_complete = running_count == 0 and not pending_dynamodb_snapshots
+    start_next_snapshot = bool(pending_dynamodb_snapshots) and not in_flight_snapshot and not timed_out
+    if start_next_snapshot:
+        print("In-flight DynamoDB snapshot export has finished; the next one can start")
 
     rejected_note = f" (of which {rejected_count} rejected)" if rejected_count else ""
     print(f"Job summary: {completed_count} completed, {failed_count} failed{rejected_note}, "
@@ -424,10 +489,14 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     result = {
         "restoreJobs": restore_jobs,  # Pass through for next iteration
         "allComplete": all_complete,
-        # Set once monitoring hits the max-iteration ceiling. The state machine's
-        # "Check If Complete" Choice routes to a terminal state on this flag, so the
-        # monitor loop stops (and the timeout notification below fires exactly once)
-        # instead of re-polling and re-notifying every 5 minutes indefinitely.
+        # The state machine starts the next DynamoDB snapshot export on this flag.
+        # It stays false while one export is in flight, the queue is empty, or an
+        # in-flight job has already used its poll budget.
+        "startNextSnapshot": start_next_snapshot,
+        # Set when an in-flight job has been polled for MAX_MONITORING_ITERATIONS.
+        # The state machine's "Check If Complete" Choice routes to a terminal state
+        # on this flag, so the monitor loop stops (and the timeout notification
+        # below fires exactly once) instead of re-polling and re-notifying.
         "timedOut": timed_out,
         "jobStatuses": job_statuses,
         "completedJobs": completed_count,
@@ -449,7 +518,11 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         # resources that were in scope but had no snapshot to restore from.
         "resourcesWithoutSnapshots": resources_without_snapshots,
         "resourcesWithoutSnapshotsCount": resources_without_snapshots_count,
-        "startTime": start_time
+        "startTime": start_time,
+        # Carried until the state machine pops the next export. allComplete stays
+        # false while this list has anything in it, so the notification waits.
+        "pendingDynamodbSnapshots": pending_dynamodb_snapshots,
+        "snapshotExportPrefixes": snapshot_export_prefixes,
     }
 
     # On timeout, restore WCU for any in-place jobs still running (don't leave elevated WCU)
@@ -530,7 +603,11 @@ def send_completion_notification(job_summary: Dict[str, Any], timeout: bool) -> 
 
     if timeout:
         subject = "Eon Bulk Recovery - TIMEOUT"
-        status_summary = f"⚠️ Monitoring timed out after {job_summary['iteration']} iterations"
+        poll_limit = os.environ.get("MAX_MONITORING_ITERATIONS", "720")
+        status_summary = (
+            f"⚠️ An in-flight restore was still running after its {poll_limit}-poll limit "
+            f"(poll {job_summary['iteration']} of this run)"
+        )
     elif failed_jobs == 0 and partial_jobs == 0 and skipped_jobs == 0 and no_snapshot_count == 0:
         subject = "Eon Bulk Recovery - SUCCESS"
         status_summary = f"✅ All {total_jobs} restore jobs completed successfully"

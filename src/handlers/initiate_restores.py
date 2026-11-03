@@ -1566,6 +1566,19 @@ def snapshot_export_bucket_name(restore_account_id: str, region: str) -> str:
     return f"{SNAPSHOT_EXPORT_BUCKET_PREFIX}-{restore_account_id}-{region}"
 
 
+def _snapshot_export_prefixes_from_event(raw: Optional[Dict[str, Any]]) -> Dict[str, set]:
+    """Rebuild the per-bucket prefix sets carried between sequential exports."""
+    prefixes: Dict[str, set] = {}
+    for bucket, used in (raw or {}).items():
+        prefixes[str(bucket)] = set(used or [])
+    return prefixes
+
+
+def _snapshot_export_prefixes_to_event(prefixes: Dict[str, set]) -> Dict[str, List[str]]:
+    """JSON-safe form of the prefix sets. Sorted so a retried call stays readable."""
+    return {bucket: sorted(used) for bucket, used in prefixes.items()}
+
+
 def snapshot_export_prefix(table_name: str, resource_id: str, used_prefixes: set) -> str:
     """
     Prefix Eon writes under. The first table keeps ``{tableName}/``. A later table
@@ -1928,10 +1941,19 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         recoveryStackNames: List of CloudFormation stack names to check for pre-created DynamoDB tables (optional)
         recoveryStacksOnly: If true, only restore resources matching a stack table/bucket (optional, default false)
         s3InPlaceTagKey: Tag key for matching S3 buckets for in-place restore (default: "eon_functional_id")
+        existingRestoreJobs: Jobs already started. Prepended to this call's jobs when
+            the state machine comes back for the next DynamoDB snapshot export.
+        snapshotExportPrefixes: Bucket name to prefixes already chosen by earlier
+            snapshot exports, so a later table with the same name is disambiguated.
+        monitorStartedIteration: When present, stamped onto jobs this call starts.
+            The monitor treats a missing stamp as iteration 0, so only the follow-up
+            call sets it — that is when a queued export's own 60-hour clock starts.
 
     Returns:
-        restoreJobs: List of initiated restore jobs with job IDs
-        totalJobs: Total number of jobs initiated
+        restoreJobs: Jobs started so far, including existingRestoreJobs
+        totalJobs: Total number of jobs in restoreJobs
+        pendingDynamodbSnapshots: DynamoDB tables whose snapshot export has not started
+        snapshotExportPrefixes: Prefixes chosen so far, keyed by bucket name
     """
     # ---- Parse event ----
     resource_snapshots = event["resourceSnapshots"]
@@ -2127,13 +2149,22 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         dynamodb_warm_throughput=dynamodb_warm_throughput,
         s3_in_place_tag_key=s3_in_place_tag_key,
         dynamodb_snapshot_export=dynamodb_restore_method == DYNAMODB_RESTORE_METHOD_SNAPSHOT,
+        snapshot_export_prefixes=_snapshot_export_prefixes_from_event(
+            event.get("snapshotExportPrefixes")
+        ),
     )
 
     # ---- Initiate restores ----
     print(f"\nInitiating restore jobs for {len(resource_snapshots)} snapshots")
     print(f"VPC configurations available in regions: {list(vpc_configs_by_region.keys())}")
 
-    restore_jobs = []
+    # One DynamoDB snapshot export at a time. The restore server behind an export
+    # holds EC2 capacity until the Eon job is terminal, so further tables wait
+    # for the state machine to call this step again. Other resource types still
+    # start in this call, alongside that single export.
+    snapshot_slot_used = False
+    pending_dynamodb_snapshots = []
+    new_jobs = []
 
     for resource_snapshot in resource_snapshots:
         resource_id = resource_snapshot["resourceId"]
@@ -2145,14 +2176,27 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
         target_region = restore_region if restore_region else source_region
 
-        print(f"Initiating restore for {resource_type}: {resource_name} (source region: {source_region}, target region: {target_region})")
-
         # In recoveryStacksOnly mode, skip resource types that don't come from stacks
         if recovery_stacks_only and resource_type in ("AWS_EC2", "AWS_RDS"):
             print(f"SKIPPING {resource_name} ({resource_type}) - recoveryStacksOnly mode, no stack matching for this type")
             continue
 
+        if (
+            ctx.dynamodb_snapshot_export
+            and resource_type == "AWS_DYNAMO_DB"
+            and snapshot_slot_used
+        ):
+            pending_dynamodb_snapshots.append(resource_snapshot)
+            print(
+                f"Deferring DynamoDB snapshot export for {resource_name} "
+                f"until the in-flight export finishes"
+            )
+            continue
+
+        print(f"Initiating restore for {resource_type}: {resource_name} (source region: {source_region}, target region: {target_region})")
+
         restore_fn = _RESTORE_DISPATCH.get(resource_type)
+        consumed_snapshot_slot = False
 
         try:
             result = None
@@ -2160,8 +2204,14 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 result = restore_fn(ctx, resource_snapshot, target_region)
 
             if result is None and restore_fn:
-                # Resource was intentionally skipped (e.g. recoveryStacksOnly)
+                # Resource was intentionally skipped (e.g. recoveryStacksOnly).
+                # A skipped table does not count as the one export this call may start.
                 continue
+
+            # An attempt counts even when Eon returns no job id or the call raises.
+            # The failure is terminal, so the next poll is free to start the following table.
+            if ctx.dynamodb_snapshot_export and resource_type == "AWS_DYNAMO_DB":
+                consumed_snapshot_slot = True
 
             job_id = None
             restored_resource_details = {}
@@ -2169,7 +2219,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 job_id, restored_resource_details = result
 
             if job_id:
-                restore_jobs.append({
+                new_jobs.append({
                     "jobId": job_id,
                     "resourceId": resource_id,
                     "resourceName": resource_name,
@@ -2190,7 +2240,9 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
         except Exception as e:
             print(f"ERROR: Failed to initiate restore for {resource_name}: {str(e)}")
-            restore_jobs.append({
+            if ctx.dynamodb_snapshot_export and resource_type == "AWS_DYNAMO_DB":
+                consumed_snapshot_slot = True
+            new_jobs.append({
                 "jobId": None,
                 "resourceId": resource_id,
                 "resourceName": resource_name,
@@ -2201,13 +2253,30 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
                 "status": "FAILED_TO_INITIATE",
                 "error": str(e)
             })
-            continue
 
-    print(f"Successfully initiated {len([j for j in restore_jobs if j['jobId']])} restore jobs")
+        if consumed_snapshot_slot:
+            snapshot_slot_used = True
+
+    # Only the follow-up call sets this. Jobs from the first call leave it unset,
+    # and the monitor treats that as "started at iteration 0".
+    if "monitorStartedIteration" in event:
+        for job in new_jobs:
+            job["monitorStartedIteration"] = event["monitorStartedIteration"]
+
+    restore_jobs = list(event.get("existingRestoreJobs") or []) + new_jobs
+
+    print(f"Successfully initiated {len([j for j in new_jobs if j.get('jobId')])} restore jobs")
+    if pending_dynamodb_snapshots:
+        print(
+            f"Deferred {len(pending_dynamodb_snapshots)} DynamoDB snapshot export(s) "
+            f"until the in-flight export finishes"
+        )
 
     return {
         "restoreJobs": restore_jobs,
         "totalJobs": len(restore_jobs),
-        "successfulJobs": len([j for j in restore_jobs if j["jobId"]]),
-        "failedJobs": len([j for j in restore_jobs if not j["jobId"]])
+        "successfulJobs": len([j for j in restore_jobs if j.get("jobId")]),
+        "failedJobs": len([j for j in restore_jobs if not j.get("jobId")]),
+        "pendingDynamodbSnapshots": pending_dynamodb_snapshots,
+        "snapshotExportPrefixes": _snapshot_export_prefixes_to_event(ctx.snapshot_export_prefixes),
     }

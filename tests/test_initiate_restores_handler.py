@@ -467,6 +467,42 @@ class TestStateMachineInputContract:
         missing = referenced - set(example) - defaulted - {"inputDefaults"}
         assert not missing, f"state machine reads keys absent from the example input: {sorted(missing)}"
 
+    def test_snapshot_exports_wait_for_the_previous_one_to_finish(self):
+        asl = json.loads(self.ASL.read_text())
+        choice = asl["States"]["Check If Complete"]
+
+        assert [item["Next"] for item in choice["Choices"]] == [
+            "Monitoring Timed Out",
+            "Initiate Next DynamoDB Snapshot",
+            "All Jobs Complete",
+        ]
+        assert choice["Choices"][1]["Variable"] == "$.monitoringState.startNextSnapshot"
+        assert choice["Default"] == "Wait For Jobs"
+
+        nxt = asl["States"]["Initiate Next DynamoDB Snapshot"]
+        assert nxt["Parameters"]["step"] == "initiate_restores"
+        assert nxt["Parameters"]["resourceSnapshots.$"] == "$.monitoringState.pendingDynamodbSnapshots"
+        assert nxt["Parameters"]["existingRestoreJobs.$"] == "$.monitoringState.restoreJobs"
+        assert nxt["Parameters"]["snapshotExportPrefixes.$"] == "$.monitoringState.snapshotExportPrefixes"
+        assert nxt["Parameters"]["monitorStartedIteration.$"] == "$.monitoringState.iteration"
+        assert nxt["Parameters"]["dynamodbRestoreMethod.$"] == "$.dynamodbRestoreMethod"
+        assert nxt["Next"] == "Apply Next Snapshot"
+        assert nxt["Catch"][0]["Next"] == "Initiate Next Snapshot Failed"
+
+        apply = asl["States"]["Apply Next Snapshot"]
+        assert apply["Next"] == "Monitor Jobs"
+        assert apply["Parameters"]["restoreJobs.$"] == "$.nextSnapshotResult.restoreJobs"
+        assert apply["Parameters"]["pendingDynamodbSnapshots.$"] == (
+            "$.nextSnapshotResult.pendingDynamodbSnapshots"
+        )
+        assert apply["ResultPath"] == "$.monitoringState"
+
+        monitoring = asl["States"]["Initialize Monitoring"]["Parameters"]
+        assert monitoring["pendingDynamodbSnapshots.$"] == "$.restoreJobsResult.pendingDynamodbSnapshots"
+        assert monitoring["snapshotExportPrefixes.$"] == "$.restoreJobsResult.snapshotExportPrefixes"
+        assert "pendingDynamodbSnapshots.$" in asl["States"]["Monitor Jobs"]["Parameters"]
+        assert "snapshotExportPrefixes.$" in asl["States"]["Monitor Jobs"]["Parameters"]
+
 
 class TestDynamoDBSnapshot:
     def _capture_s3(self, monkeypatch):
@@ -499,6 +535,11 @@ class TestDynamoDBSnapshot:
         assert job["s3Bucket"] == "eon-restore-data-222222222222-us-east-1"
         assert job["s3Prefix"] == "orders/"
         assert job["restoredRegion"] == "us-east-1"
+        assert result["pendingDynamodbSnapshots"] == []
+        assert result["snapshotExportPrefixes"] == {
+            "eon-restore-data-222222222222-us-east-1": ["orders/"]
+        }
+        assert "monitorStartedIteration" not in job
         assert "writeCapacityUnits" not in job
         assert "warmThroughputTarget" not in job
         call = client.calls_to("restore_dynamodb_to_s3")[0]
@@ -524,13 +565,26 @@ class TestDynamoDBSnapshot:
             ],
         )
 
-        result = handler(event, None)
+        first = handler(event, None)
+
+        assert [job["resourceName"] for job in first["restoreJobs"]] == ["orders"]
+        assert [snap["resourceName"] for snap in first["pendingDynamodbSnapshots"]] == ["users"]
+        assert s3["us-east-1"].create_bucket.call_count == 1
+        assert "us-west-2" not in s3
+
+        result = handler(dict(
+            event,
+            resourceSnapshots=first["pendingDynamodbSnapshots"],
+            snapshotExportPrefixes=first["snapshotExportPrefixes"],
+            existingRestoreJobs=first["restoreJobs"],
+        ), None)
 
         by_name = {job["resourceName"]: job for job in result["restoreJobs"]}
         assert by_name["orders"]["s3Bucket"] == "eon-restore-data-222222222222-us-east-1"
         assert by_name["orders"]["s3Prefix"] == "orders/"
         assert by_name["users"]["s3Bucket"] == "eon-restore-data-222222222222-us-west-2"
         assert by_name["users"]["s3Prefix"] == "users/"
+        assert result["pendingDynamodbSnapshots"] == []
         assert s3["us-east-1"].create_bucket.call_count == 1
         assert s3["us-west-2"].create_bucket.call_count == 1
         assert s3["us-west-2"].create_bucket.call_args.kwargs["CreateBucketConfiguration"] == {
@@ -552,12 +606,30 @@ class TestDynamoDBSnapshot:
             ],
         )
 
-        result = handler(event, None)
+        first = handler(event, None)
+
+        assert [job["s3Prefix"] for job in first["restoreJobs"]] == ["orders/"]
+        assert [snap["resourceId"] for snap in first["pendingDynamodbSnapshots"]] == ["res-b"]
+        assert "monitorStartedIteration" not in first["restoreJobs"][0]
+
+        result = handler(dict(
+            event,
+            resourceSnapshots=first["pendingDynamodbSnapshots"],
+            snapshotExportPrefixes=first["snapshotExportPrefixes"],
+            existingRestoreJobs=first["restoreJobs"],
+            monitorStartedIteration=4,
+        ), None)
 
         prefixes = [job["s3Prefix"] for job in result["restoreJobs"]]
         assert prefixes == ["orders/", "orders-res-b/"]
         assert {job["s3Bucket"] for job in result["restoreJobs"]} == {
             "eon-restore-data-222222222222-us-east-1"
+        }
+        assert result["pendingDynamodbSnapshots"] == []
+        assert "monitorStartedIteration" not in result["restoreJobs"][0]
+        assert result["restoreJobs"][1]["monitorStartedIteration"] == 4
+        assert result["snapshotExportPrefixes"] == {
+            "eon-restore-data-222222222222-us-east-1": ["orders-res-b/", "orders/"]
         }
 
     def test_a_recovery_stack_match_does_not_restore_in_place(self, wiring, monkeypatch):
@@ -596,3 +668,100 @@ class TestDynamoDBSnapshot:
         assert job["restoreType"] == "SNAPSHOT_TO_S3"
         assert job["s3Prefix"] == "orders/"
         assert "writeCapacityUnits" not in job
+
+    def test_only_the_first_table_starts_and_the_rest_stay_queued(self, wiring, monkeypatch):
+        client = wiring(restore_dynamodb_to_s3="job-s3")
+        self._capture_s3(monkeypatch)
+
+        def ec2_restore(ctx, resource_snapshot, target_region):
+            return "job-ec2", {"restoreType": "NEW_INSTANCE"}
+
+        monkeypatch.setitem(ir._RESTORE_DISPATCH, "AWS_EC2", ec2_restore)
+        event = dict(
+            BASE_EVENT,
+            dynamodbRestoreMethod="snapshot",
+            resourceSnapshots=[
+                ddb_snapshot("res-a", "orders"),
+                dict(ddb_snapshot("res-ec2", "web"), resourceType="AWS_EC2"),
+                ddb_snapshot("res-b", "users"),
+            ],
+        )
+
+        result = handler(event, None)
+
+        assert [job["resourceName"] for job in result["restoreJobs"]] == ["orders", "web"]
+        assert [snap["resourceName"] for snap in result["pendingDynamodbSnapshots"]] == ["users"]
+        assert len(client.calls_to("restore_dynamodb_to_s3")) == 1
+
+    def test_a_failed_export_does_not_start_the_next_table(self, wiring, monkeypatch):
+        def boom(**_kwargs):
+            raise RuntimeError("quota")
+
+        client = wiring(restore_dynamodb_to_s3=boom)
+        self._capture_s3(monkeypatch)
+        event = dict(
+            BASE_EVENT,
+            dynamodbRestoreMethod="snapshot",
+            resourceSnapshots=[
+                ddb_snapshot("res-a", "orders"),
+                ddb_snapshot("res-b", "users"),
+            ],
+        )
+
+        result = handler(event, None)
+
+        assert result["restoreJobs"][0]["status"] == "FAILED_TO_INITIATE"
+        assert result["restoreJobs"][0]["resourceName"] == "orders"
+        assert [snap["resourceName"] for snap in result["pendingDynamodbSnapshots"]] == ["users"]
+        assert len(client.calls_to("restore_dynamodb_to_s3")) == 1
+
+    def test_an_out_of_scope_table_does_not_take_the_snapshot_slot(self, wiring, monkeypatch):
+        client = wiring(restore_dynamodb_to_s3="job-s3")
+        self._capture_s3(monkeypatch)
+        monkeypatch.setattr(
+            ir,
+            "discover_dynamodb_tables_from_stacks",
+            lambda **kwargs: {
+                "users": {
+                    "tableName": "users",
+                    "region": "us-east-1",
+                    "regions": ["us-east-1"],
+                    "stackName": "OrdersStack",
+                }
+            },
+        )
+        monkeypatch.setattr(ir, "discover_s3_buckets_from_stacks", lambda **kwargs: {})
+        event = dict(
+            BASE_EVENT,
+            dynamodbRestoreMethod="snapshot",
+            recoveryStackNames=["OrdersStack"],
+            recoveryStacksOnly=True,
+            resourceSnapshots=[
+                ddb_snapshot("res-a", "orders"),
+                ddb_snapshot("res-b", "users"),
+                ddb_snapshot("res-c", "payments"),
+            ],
+        )
+
+        result = handler(event, None)
+
+        assert [job["resourceName"] for job in result["restoreJobs"]] == ["users"]
+        assert [snap["resourceName"] for snap in result["pendingDynamodbSnapshots"]] == ["payments"]
+        assert len(client.calls_to("restore_dynamodb_to_s3")) == 1
+
+    def test_other_restore_methods_still_start_every_table(self, wiring):
+        wiring(restore_dynamodb_table="job-1")
+        event = dict(
+            BASE_EVENT,
+            dynamodbRestoreMethod="capacity",
+            resourceSnapshots=[
+                ddb_snapshot("res-a", "orders"),
+                ddb_snapshot("res-b", "users"),
+            ],
+        )
+
+        result = handler(event, None)
+
+        assert [job["resourceName"] for job in result["restoreJobs"]] == ["orders", "users"]
+        assert result["pendingDynamodbSnapshots"] == []
+        assert result["snapshotExportPrefixes"] == {}

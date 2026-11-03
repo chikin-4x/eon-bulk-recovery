@@ -406,7 +406,7 @@ write capacity it leaves the regional WCU budget to the tables that still need i
 | `"auto"`, `null`, or the key omitted (default) | ImportTable for every table that can take it, capacity-based for the rest |
 | `"import"` | Force ImportTable. A table AWS cannot import fails at initiation instead of restoring a different way |
 | `"capacity"` | Force the write path for every table |
-| `"snapshot"` | Export every in-scope DynamoDB table to S3. See [Snapshot export](#snapshot-export-to-s3) |
+| `"snapshot"` | Export every in-scope DynamoDB table to S3, one table at a time. See [Snapshot export](#snapshot-export-to-s3) |
 
 Under `"auto"` the workflow checks each snapshot before it submits anything, and
 the reasons for each fallback are printed in the `Initiate Restores` log and
@@ -449,6 +449,18 @@ that region is configured, otherwise the first VPC region. The bucket uses SSE-S
 and blocks public access. Eon creates the prefix and writes DynamoDB JSON
 (`outputFormat: DYNAMODB_JSON`) under `{tableName}/`. If two tables in the same bucket
 share a name, the later one uses `{tableName}-{resourceId}/`.
+
+Multiple tables are exported one at a time. Each export runs on an Eon restore
+server, and overlapping those servers trips EC2 quotas. The workflow starts the
+first table together with any EC2, RDS, and S3 restores in the same run, and
+leaves the other tables queued. The next table starts only after the in-flight
+export's Eon job reaches a terminal status (`JOB_COMPLETED`, `JOB_FAILED`,
+`JOB_CANCELED`, `JOB_REJECTED`, `JOB_PARTIAL`, or `JOB_SKIPPED`). The monitor
+polls every 5 minutes, so the gap after a finished export is at most one poll.
+A table that fails to start does not hold the queue. Each in-flight job has its
+own 60-hour limit (720 polls). Time spent on earlier tables does not count
+against a later one, and a job that is still running at that limit stops the
+execution without starting whatever remains in the queue.
 
 Eon writes the objects with `EonRestoreAccountRole`, the role the bootstrap stack
 installs. That role must allow `s3:PutObject`, `s3:GetObject`, and `s3:ListBucket` on
@@ -543,7 +555,7 @@ fails loudly rather than reaching an account.
    - **DynamoDB**: Queries stacks for `AWS::DynamoDB::Table` and `AWS::DynamoDB::GlobalTable` resources, uses in-place restore for matches (by table name + region), temporarily scales up WCU
    - **S3**: Queries stacks for `AWS::S3::Bucket` resources, uses in-place restore for matches (by `s3InPlaceTagKey` tag, default `eon_functional_id`)
    - Otherwise: Creates new tables with allocated WCUs (38k per region = 95% of 40k) and new S3 buckets with hash suffixes
-8. **Monitor** - Polls until completion (default: 60 hours max), restores DynamoDB WCU to original settings as each in-place restore completes
+8. **Monitor** - Polls every 5 minutes. Each in-flight job can run for 60 hours; when a DynamoDB snapshot export reaches a terminal status the next queued table starts. Restores DynamoDB WCU to original settings as each in-place restore completes. One notification is sent when the queue is empty and nothing is still running, or when an in-flight job hits its 60-hour limit
 
 Example completion notification:
 

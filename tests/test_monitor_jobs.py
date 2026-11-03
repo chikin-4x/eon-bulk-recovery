@@ -519,6 +519,7 @@ class TestCompletionNotification:
         send_completion_notification(summary(runningJobs=1), timeout=True)
 
         assert published(sns)["Subject"] == "Eon Bulk Recovery - TIMEOUT"
+        assert "720-poll limit" in published(sns)["Message"]
 
     def test_all_jobs_failing_is_reported_as_failure(self, sns):
         send_completion_notification(
@@ -1059,3 +1060,151 @@ class TestRejectedJobs:
 
         assert published(sns)["Subject"] == "Eon Bulk Recovery - FAILURE"
         assert "rejected before starting" not in published(sns)["Message"].split("Job Summary")[0]
+
+
+class TestDynamoDBSnapshotQueue:
+    """Snapshot exports start one at a time. The queue is part of completion."""
+
+    def _sent(self, monkeypatch):
+        sent = []
+        monkeypatch.setattr(
+            mj, "send_completion_notification", lambda summary, timeout: sent.append(timeout)
+        )
+        return sent
+
+    def test_an_in_flight_export_holds_the_queue(self, monitored, monkeypatch):
+        monitored(get_restore_job=status_response("JOB_RUNNING"))
+        sent = self._sent(monkeypatch)
+        pending = [{"resourceName": "users"}]
+        prefixes = {"eon-restore-data-222222222222-us-east-1": ["orders/"]}
+
+        result = handler({
+            "restoreJobs": [job(restoreType="SNAPSHOT_TO_S3")],
+            "iteration": 0,
+            "pendingDynamodbSnapshots": pending,
+            "snapshotExportPrefixes": prefixes,
+        }, None)
+
+        assert result["startNextSnapshot"] is False
+        assert result["allComplete"] is False
+        assert result["timedOut"] is False
+        assert result["pendingDynamodbSnapshots"] == pending
+        assert result["snapshotExportPrefixes"] == prefixes
+        assert sent == []
+
+    def test_a_finished_export_releases_the_queue_without_notifying(self, monitored, monkeypatch, capsys):
+        monitored(get_restore_job=status_response("JOB_COMPLETED"))
+        sent = self._sent(monkeypatch)
+
+        result = handler({
+            "restoreJobs": [job(restoreType="SNAPSHOT_TO_S3")],
+            "iteration": 3,
+            "pendingDynamodbSnapshots": [{"resourceName": "users"}],
+        }, None)
+
+        assert result["startNextSnapshot"] is True
+        assert result["allComplete"] is False
+        assert result["timedOut"] is False
+        assert sent == []
+        assert "the next one can start" in capsys.readouterr().out
+
+    def test_an_empty_queue_still_notifies_once(self, monitored, monkeypatch):
+        monitored(get_restore_job=status_response("JOB_COMPLETED"))
+        sent = self._sent(monkeypatch)
+
+        result = handler({"restoreJobs": [job()], "iteration": 0}, None)
+
+        assert result["allComplete"] is True
+        assert result["startNextSnapshot"] is False
+        assert result["pendingDynamodbSnapshots"] == []
+        assert result["snapshotExportPrefixes"] == {}
+        assert sent == [False]
+
+    def test_a_jobs_own_age_times_the_run_out(self, monitored, monkeypatch):
+        monkeypatch.setenv("MAX_MONITORING_ITERATIONS", "5")
+        monitored(get_restore_job=status_response("JOB_RUNNING"))
+        sent = self._sent(monkeypatch)
+        queued = {
+            "restoreJobs": [job(restoreType="SNAPSHOT_TO_S3", monitorStartedIteration=10)],
+            "pendingDynamodbSnapshots": [{"resourceName": "users"}],
+        }
+
+        young = handler(dict(queued, iteration=14), None)
+        assert young["timedOut"] is False
+        assert young["startNextSnapshot"] is False
+
+        aged = handler(dict(queued, iteration=15), None)
+        assert aged["timedOut"] is True
+        assert aged["startNextSnapshot"] is False
+        assert sent == [True]
+
+    def test_a_finished_job_does_not_time_out_past_the_old_global_cap(self, monitored, monkeypatch):
+        monkeypatch.setenv("MAX_MONITORING_ITERATIONS", "5")
+        monitored(get_restore_job=status_response("JOB_COMPLETED"))
+        sent = self._sent(monkeypatch)
+
+        result = handler({
+            "restoreJobs": [job(monitorStartedIteration=0)],
+            "iteration": 5,
+        }, None)
+
+        assert result["timedOut"] is False
+        assert result["allComplete"] is True
+        assert sent == [False]
+
+    def test_a_status_lookup_error_holds_the_queue(self, monitored, monkeypatch):
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("API down")
+
+        monitored(get_restore_job=boom)
+        sent = self._sent(monkeypatch)
+
+        result = handler({
+            "restoreJobs": [job(restoreType="SNAPSHOT_TO_S3")],
+            "iteration": 0,
+            "pendingDynamodbSnapshots": [{"resourceName": "users"}],
+        }, None)
+
+        assert result["startNextSnapshot"] is False
+        assert result["runningJobs"] == 1
+        assert result["jobStatuses"][0]["currentStatus"] == "ERROR_CHECKING_STATUS"
+        assert sent == []
+
+    def test_a_failed_initiation_does_not_hold_the_queue(self, monitored, monkeypatch):
+        monitored()
+        sent = self._sent(monkeypatch)
+
+        result = handler({
+            "restoreJobs": [job(job_id=None, restoreType="SNAPSHOT_TO_S3")],
+            "iteration": 0,
+            "pendingDynamodbSnapshots": [{"resourceName": "users"}],
+        }, None)
+
+        assert result["startNextSnapshot"] is True
+        assert result["allComplete"] is False
+        assert result["failedJobs"] == 1
+        assert sent == []
+
+    def test_a_stuck_non_snapshot_job_stops_the_queue(self, monitored, monkeypatch):
+        monkeypatch.setenv("MAX_MONITORING_ITERATIONS", "5")
+
+        def statuses(job_id):
+            status = "JOB_RUNNING" if job_id == "job-ec2" else "JOB_COMPLETED"
+            return status_response(status)
+
+        monitored(get_restore_job=statuses)
+        sent = self._sent(monkeypatch)
+
+        result = handler({
+            "restoreJobs": [
+                job("job-ec2", resourceType="AWS_EC2", restoreType="NEW_INSTANCE"),
+                job("job-s3", restoreType="SNAPSHOT_TO_S3"),
+            ],
+            "iteration": 5,
+            "pendingDynamodbSnapshots": [{"resourceName": "users"}],
+        }, None)
+
+        assert result["timedOut"] is True
+        assert result["startNextSnapshot"] is False
+        assert result["runningJobs"] == 1
+        assert sent == [True]

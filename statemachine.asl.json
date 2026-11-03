@@ -269,7 +269,7 @@
     "Initiate Restores": {
       "Type": "Task",
       "Resource": "${InitiateRestoresFunctionArn}",
-      "Comment": "Initiate restore jobs for all snapshots",
+      "Comment": "Initiate restore jobs. A DynamoDB snapshot export starts one table; further tables wait until that job is terminal. Other resource types start together.",
       "Parameters": {
         "step": "initiate_restores",
         "resourceSnapshots.$": "$.snapshotsResult.resourceSnapshots",
@@ -331,7 +331,9 @@
         "wcuRestorationFailures": [],
         "resourcesWithoutSnapshots.$": "$.snapshotsResult.resourcesWithoutSnapshots",
         "resourcesWithoutSnapshotsCount.$": "$.snapshotsResult.resourcesWithoutSnapshotsCount",
-        "startTime.$": "$$.State.EnteredTime"
+        "startTime.$": "$$.State.EnteredTime",
+        "pendingDynamodbSnapshots.$": "$.restoreJobsResult.pendingDynamodbSnapshots",
+        "snapshotExportPrefixes.$": "$.restoreJobsResult.snapshotExportPrefixes"
       },
       "ResultPath": "$.monitoringState",
       "Next": "Monitor Jobs"
@@ -352,7 +354,9 @@
         "wcuRestorationFailures.$": "$.monitoringState.wcuRestorationFailures",
         "resourcesWithoutSnapshots.$": "$.monitoringState.resourcesWithoutSnapshots",
         "resourcesWithoutSnapshotsCount.$": "$.monitoringState.resourcesWithoutSnapshotsCount",
-        "startTime.$": "$.monitoringState.startTime"
+        "startTime.$": "$.monitoringState.startTime",
+        "pendingDynamodbSnapshots.$": "$.monitoringState.pendingDynamodbSnapshots",
+        "snapshotExportPrefixes.$": "$.monitoringState.snapshotExportPrefixes"
       },
       "ResultPath": "$.monitoringState",
       "Retry": [
@@ -384,20 +388,100 @@
     },
     "Check If Complete": {
       "Type": "Choice",
-      "Comment": "Determine if all jobs are complete, if monitoring has timed out, or if we should keep polling",
+      "Comment": "Stop on a per-job timeout, start the next DynamoDB snapshot export once the in-flight one is terminal, succeed when nothing is running and the queue is empty, otherwise keep polling",
       "Choices": [
-        {
-          "Variable": "$.monitoringState.allComplete",
-          "BooleanEquals": true,
-          "Next": "All Jobs Complete"
-        },
         {
           "Variable": "$.monitoringState.timedOut",
           "BooleanEquals": true,
           "Next": "Monitoring Timed Out"
+        },
+        {
+          "Variable": "$.monitoringState.startNextSnapshot",
+          "BooleanEquals": true,
+          "Next": "Initiate Next DynamoDB Snapshot"
+        },
+        {
+          "Variable": "$.monitoringState.allComplete",
+          "BooleanEquals": true,
+          "Next": "All Jobs Complete"
         }
       ],
       "Default": "Wait For Jobs"
+    },
+    "Initiate Next DynamoDB Snapshot": {
+      "Type": "Task",
+      "Resource": "${InitiateRestoresFunctionArn}",
+      "Comment": "Start the next queued DynamoDB snapshot export. The previous export has reached a terminal Eon status, so its restore server is no longer holding EC2 capacity.",
+      "Parameters": {
+        "step": "initiate_restores",
+        "resourceSnapshots.$": "$.monitoringState.pendingDynamodbSnapshots",
+        "existingRestoreJobs.$": "$.monitoringState.restoreJobs",
+        "snapshotExportPrefixes.$": "$.monitoringState.snapshotExportPrefixes",
+        "monitorStartedIteration.$": "$.monitoringState.iteration",
+        "eonRestoreAccountId.$": "$.connectResult.eonRestoreAccountId",
+        "restoreAccountId.$": "$.restoreAccountId",
+        "restoreRegion.$": "$.restoreRegion",
+        "kmsKeyArnsByRegion.$": "$.bootstrapResult.kmsKeyArnsByRegion",
+        "rdsSubnetGroupsByRegion.$": "$.bootstrapResult.rdsSubnetGroupsByRegion",
+        "dynamodbRegionalWcuLimit.$": "$.dynamodbRegionalWcuLimit",
+        "dynamodbTableWcuMax.$": "$.dynamodbTableWcuMax",
+        "dynamodbRestoreMethod.$": "$.dynamodbRestoreMethod",
+        "resourceNamePrefix.$": "$.resourceNamePrefix",
+        "vpcConfigs.$": "$.vpcConfigs",
+        "crossAccountRoleArn.$": "$.crossAccountRoleArn",
+        "excludeEC2TagKeys.$": "$.excludeEC2TagKeys",
+        "recoveryStackNames.$": "$.recoveryStackNames",
+        "recoveryStacksOnly.$": "$.recoveryStacksOnly",
+        "s3InPlaceTagKey.$": "$.s3InPlaceTagKey"
+      },
+      "ResultPath": "$.nextSnapshotResult",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": "$.error",
+          "Next": "Initiate Next Snapshot Failed"
+        }
+      ],
+      "Next": "Apply Next Snapshot"
+    },
+    "Initiate Next Snapshot Failed": {
+      "Type": "Fail",
+      "Error": "InitiateNextSnapshotFailed",
+      "Cause": "Failed to initiate the next DynamoDB snapshot export"
+    },
+    "Apply Next Snapshot": {
+      "Type": "Pass",
+      "Comment": "Append the export just started and keep the remaining queue on the monitoring state. The iteration is the one the next poll will receive, which is the new job's monitorStartedIteration.",
+      "Parameters": {
+        "restoreJobs.$": "$.nextSnapshotResult.restoreJobs",
+        "pendingDynamodbSnapshots.$": "$.nextSnapshotResult.pendingDynamodbSnapshots",
+        "snapshotExportPrefixes.$": "$.nextSnapshotResult.snapshotExportPrefixes",
+        "iteration.$": "$.monitoringState.iteration",
+        "sourceAccountId.$": "$.monitoringState.sourceAccountId",
+        "restoreAccountId.$": "$.monitoringState.restoreAccountId",
+        "restoreRegion.$": "$.monitoringState.restoreRegion",
+        "vpcConfigs.$": "$.monitoringState.vpcConfigs",
+        "crossAccountRoleArn.$": "$.monitoringState.crossAccountRoleArn",
+        "wcuRestorationFailures.$": "$.monitoringState.wcuRestorationFailures",
+        "resourcesWithoutSnapshots.$": "$.monitoringState.resourcesWithoutSnapshots",
+        "resourcesWithoutSnapshotsCount.$": "$.monitoringState.resourcesWithoutSnapshotsCount",
+        "startTime.$": "$.monitoringState.startTime"
+      },
+      "ResultPath": "$.monitoringState",
+      "Next": "Monitor Jobs"
     },
     "Wait For Jobs": {
       "Type": "Wait",
@@ -412,7 +496,7 @@
     "Monitoring Timed Out": {
       "Type": "Fail",
       "Error": "MonitoringTimedOut",
-      "Cause": "Monitoring reached the maximum iteration limit (MAX_MONITORING_ITERATIONS) with jobs still running. A timeout notification has been sent; check the Eon console for the final status of any still-running jobs."
+      "Cause": "An in-flight restore job was still running after MAX_MONITORING_ITERATIONS polls (60 hours). Queued DynamoDB snapshot exports were not started. A timeout notification has been sent; check the Eon console for the final status of any still-running jobs."
     }
   }
 }
